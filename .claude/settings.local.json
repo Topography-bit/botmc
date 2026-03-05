@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ide__getDiagnostics",
+      "Bash(unzip:*)",
+      "Bash(./gradlew build:*)",
+      "Bash(jar tf:*)",
+      "Bash(python:*)",
+      "Bash(\"/c/Program Files/Java/jdk-25.0.2/bin/javap\":*)",
+      "Bash(where javap:*)",
+      "Bash(python3:*)",
+      "Bash(where:*)",
+      "Bash(/c/Python/python.exe:*)",
+      "Bash(pip show:)",
+      "Bash(pip install:*)",
+      "Bash(mkdir:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python:*)",
+      "Bash(wc:*)",
+      "Bash(\"$JAVA_HOME/bin/jar\" tf:*)",
+      "Bash(java:*)",
+      "Bash(\"/c/Program Files/Common Files/Oracle/Java/javapath/jar\" tf:*)",
+      "Bash(xargs unzip:*)",
+      "Read(//mnt/c/Users/Ghost/Videos/**)",
+      "Bash(./gradlew.bat compileJava)"
+    ]
+  }
+}

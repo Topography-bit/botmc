@@ -1,0 +1,18 @@
+
+{
+	"required": true,
+	"package": "macro.topography.mixin.client",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"ActionBarMixin",
+		"MouseDeltaMixin",
+		"ClientConnectionMixin",
+		"MultiplayerScreenMixin",
+		"ClientPlayNetworkHandlerMixin",
+		"MinecraftClientInvoker",
+		"GameRendererMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

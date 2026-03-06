@@ -9,6 +9,7 @@ import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.chunk.WorldChunk;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -31,11 +32,19 @@ public class Pathfinder {
     private static final int MAX_FALL = 40;
     private static final int CACHE_RADIUS = 80;
     private static final double MAX_PATHFIND_DIST = 50.0; // intermediate goal distance
+    private static final int MAX_CACHE_AREA = 250 * 250;
+    private static final double WALL_PROXIMITY_COST = 0.45;
+    private static final int WALL_COST_RADIUS = 2;
+    private static final float WALL_REPLAN_THRESH = 0.08f;
+    private static final float VERTICAL_REPLAN_THRESH = 0.15f;
+    private static final float POS_ANOMALY_RESET_THRESH = 0.15f;
 
     /* ── waypoint management ──────────────────────────────────────── */
     private static final double ADVANCE_RADIUS = 1.5;
     private static final double FINAL_RADIUS = 0.3;
     private static final double WAYPOINT_PROGRESS_EPS_SQ = 0.05;
+    public static final int PATH_HORIZON_POINTS = 5;
+    public static final int PATH_FEATURE_COUNT = PATH_HORIZON_POINTS * 3;
 
     /* ── async control ────────────────────────────────────────────── */
     private static final int RECALC_COOLDOWN = 20;
@@ -57,6 +66,10 @@ public class Pathfinder {
     private static LivingEntity targetMob = null;        // real mob for hitbox (can be null)
     private static ArmorStandEntity targetNameTag = null; // name tag for position
     private static int activeTargetMode = 0;
+    private static float lastDistToWall = 1f;
+    private static float lastVerticalClearance = 1f;
+    private static float lastStressLevel = 0f;
+    private static float lastPosAnomaly = 0f;
 
     /* ================================================================
      *  BLOCK CACHE — snapshot on main thread, read safely from async
@@ -65,55 +78,63 @@ public class Pathfinder {
     private static class BlockCache {
         private final Map<Long, Boolean> solidMap = new ConcurrentHashMap<>();
 
-        /** Build cache on MAIN THREAD around a region. */
-        static BlockCache snapshot(ClientWorld world, BlockPos center, int radius) {
-            BlockCache cache = new BlockCache();
-            int cx = center.getX(), cy = center.getY(), cz = center.getZ();
-            for (int x = cx - radius; x <= cx + radius; x++) {
-                for (int z = cz - radius; z <= cz + radius; z++) {
-                    for (int y = Math.max(-64, cy - MAX_FALL - 5); y <= cy + 20; y++) {
-                        BlockPos bp = new BlockPos(x, y, z);
-                        try {
-                            BlockState state = world.getBlockState(bp);
-                            boolean solid = !state.getCollisionShape(world, bp).isEmpty();
-                            cache.solidMap.put(packPos(x, y, z), solid);
-                        } catch (Exception e) {
-                            cache.solidMap.put(packPos(x, y, z), false);
-                        }
-                    }
-                }
-            }
-            return cache;
-        }
-
-        /** Expand cache toward goal if needed. */
-        static BlockCache snapshotBetween(ClientWorld world, BlockPos start, BlockPos goal) {
-            BlockCache cache = new BlockCache();
+        /** Build cache in worker thread by scanning loaded chunks in target area. */
+        static BlockCache snapshotBetweenChunks(ClientWorld world, BlockPos start, BlockPos goal) {
             int minX = Math.min(start.getX(), goal.getX()) - 10;
             int maxX = Math.max(start.getX(), goal.getX()) + 10;
             int minZ = Math.min(start.getZ(), goal.getZ()) - 10;
             int maxZ = Math.max(start.getZ(), goal.getZ()) + 10;
             int minY = Math.max(-64, Math.min(start.getY(), goal.getY()) - MAX_FALL - 5);
             int maxY = Math.max(start.getY(), goal.getY()) + 20;
-            // Clamp to reasonable size
-            if ((maxX - minX) * (maxZ - minZ) > 250 * 250) {
-                // Too large, just cache around start
-                return snapshot(world, start, CACHE_RADIUS);
+
+            if ((maxX - minX) * (maxZ - minZ) > MAX_CACHE_AREA) {
+                minX = start.getX() - CACHE_RADIUS;
+                maxX = start.getX() + CACHE_RADIUS;
+                minZ = start.getZ() - CACHE_RADIUS;
+                maxZ = start.getZ() + CACHE_RADIUS;
+                minY = Math.max(-64, start.getY() - MAX_FALL - 5);
+                maxY = start.getY() + 20;
             }
-            for (int x = minX; x <= maxX; x++) {
-                for (int z = minZ; z <= maxZ; z++) {
-                    for (int y = minY; y <= maxY; y++) {
-                        BlockPos bp = new BlockPos(x, y, z);
-                        try {
-                            BlockState state = world.getBlockState(bp);
-                            boolean solid = !state.getCollisionShape(world, bp).isEmpty();
-                            cache.solidMap.put(packPos(x, y, z), solid);
-                        } catch (Exception e) {
-                            cache.solidMap.put(packPos(x, y, z), false);
+
+            BlockCache cache = new BlockCache();
+            BlockPos.Mutable mutable = new BlockPos.Mutable();
+            int minChunkX = Math.floorDiv(minX, 16);
+            int maxChunkX = Math.floorDiv(maxX, 16);
+            int minChunkZ = Math.floorDiv(minZ, 16);
+            int maxChunkZ = Math.floorDiv(maxZ, 16);
+
+            for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+                for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                    WorldChunk chunk;
+                    try {
+                        chunk = world.getChunk(chunkX, chunkZ);
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    if (chunk == null || chunk.isEmpty()) continue;
+
+                    int chunkMinX = Math.max(minX, chunkX << 4);
+                    int chunkMaxX = Math.min(maxX, (chunkX << 4) + 15);
+                    int chunkMinZ = Math.max(minZ, chunkZ << 4);
+                    int chunkMaxZ = Math.min(maxZ, (chunkZ << 4) + 15);
+
+                    for (int x = chunkMinX; x <= chunkMaxX; x++) {
+                        for (int z = chunkMinZ; z <= chunkMaxZ; z++) {
+                            for (int y = minY; y <= maxY; y++) {
+                                mutable.set(x, y, z);
+                                try {
+                                    BlockState state = chunk.getBlockState(mutable);
+                                    boolean solid = !state.getCollisionShape(world, mutable).isEmpty();
+                                    cache.solidMap.put(packPos(x, y, z), solid);
+                                } catch (Exception e) {
+                                    cache.solidMap.put(packPos(x, y, z), false);
+                                }
+                            }
                         }
                     }
                 }
             }
+
             return cache;
         }
 
@@ -144,24 +165,35 @@ public class Pathfinder {
      * ============================================================== */
 
     public static void update(MinecraftClient client, ClientPlayerEntity player,
-                              int targetMode, int currentMode) {
+                              int targetMode, int currentMode,
+                              float distToWall, float verticalClearance,
+                              float stressLevel, float posAnomaly) {
         if (client.world == null || player == null) return;
 
         activeTargetMode = targetMode;
         Vec3d pos = player.getEntityPos();
         ticksSinceRecalc++;
         if (recalcCooldown > 0) recalcCooldown--;
+        lastDistToWall = distToWall;
+        lastVerticalClearance = verticalClearance;
+        lastStressLevel = stressLevel;
+        lastPosAnomaly = posAnomaly;
+
+        if (posAnomaly >= POS_ANOMALY_RESET_THRESH) {
+            forceResetForTeleport(stressLevel);
+        }
 
         BlockPos goal = pickGoal(client, player, targetMode, currentMode);
 
         // Debug logging every 5 sec
         if (ticksSinceRecalc % 100 == 0) {
-            System.out.printf("[Pathfinder] mode=%d goal=%s targetMob=%s nameTag=%s path=%d wp=%d%n",
+            System.out.printf("[Pathfinder] mode=%d goal=%s targetMob=%s nameTag=%s path=%d wp=%d wall=%.3f vclear=%.3f stress=%.3f posA=%.3f%n",
                 targetMode,
                 goal != null ? goal.toShortString() : "null",
                 targetMob != null ? targetMob.getType().getTranslationKey() : "null",
                 targetNameTag != null ? getMobName(targetNameTag) : "null",
-                currentPath.size(), waypointIndex);
+                currentPath.size(), waypointIndex,
+                distToWall, verticalClearance, stressLevel, posAnomaly);
         }
 
         // Check pending async result
@@ -204,6 +236,8 @@ public class Pathfinder {
         if (goal != null && !goal.equals(lastGoal)) needRecalc = true;
         if (ticksSinceRecalc >= SAFETY_RECALC) needRecalc = true;
         if (waypointIndex >= currentPath.size()) needRecalc = true;
+        if (distToWall <= WALL_REPLAN_THRESH) needRecalc = true;
+        if (verticalClearance <= VERTICAL_REPLAN_THRESH) needRecalc = true;
         if (!currentPath.isEmpty() && waypointIndex < currentPath.size()) {
             BlockPos wp = currentPath.get(waypointIndex);
             double distToPath = pos.distanceTo(Vec3d.ofCenter(wp));
@@ -227,25 +261,28 @@ public class Pathfinder {
                 pathGoal = findNearestStandable(client.world, new BlockPos(ix, iy, iz));
             }
 
-            BlockCache cache = BlockCache.snapshotBetween(client.world, start, pathGoal);
             pendingGoal = goal;
-            startPathfinding(cache, start, pathGoal);
+            startPathfinding(client.world, start, pathGoal, stressLevel);
         }
     }
 
     public static float[] getPathRelative(Vec3d playerPos) {
-        if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) {
-            return new float[]{0.5f, 0.5f, 0.5f};
+        float[] out = new float[PATH_FEATURE_COUNT];
+        if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return out;
+
+        int outIndex = 0;
+        for (int i = 0; i < PATH_HORIZON_POINTS; i++) {
+            int idx = waypointIndex + i;
+            if (idx >= currentPath.size()) {
+                outIndex += 3;
+                continue;
+            }
+            Vec3d wpCenter = Vec3d.ofCenter(currentPath.get(idx));
+            out[outIndex++] = normalizePathDelta(wpCenter.x - playerPos.x);
+            out[outIndex++] = normalizePathDelta(wpCenter.y - playerPos.y);
+            out[outIndex++] = normalizePathDelta(wpCenter.z - playerPos.z);
         }
-
-        BlockPos wp = currentPath.get(waypointIndex);
-        Vec3d wpCenter = Vec3d.ofCenter(wp);
-
-        float rx = clamp01((float) ((wpCenter.x - playerPos.x) / 50.0 + 1) / 2.0f);
-        float ry = clamp01((float) ((wpCenter.y - playerPos.y) / 20.0 + 1) / 2.0f);
-        float rz = clamp01((float) ((wpCenter.z - playerPos.z) / 50.0 + 1) / 2.0f);
-
-        return new float[]{rx, ry, rz};
+        return out;
     }
 
     public static void reset() {
@@ -258,6 +295,10 @@ public class Pathfinder {
         targetMob = null;
         targetNameTag = null;
         activeTargetMode = 0;
+        lastDistToWall = 1f;
+        lastVerticalClearance = 1f;
+        lastStressLevel = 0f;
+        lastPosAnomaly = 0f;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
         computing.set(false);
@@ -272,6 +313,10 @@ public class Pathfinder {
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
         pendingGoal = null;
+        lastDistToWall = 1f;
+        lastVerticalClearance = 1f;
+        lastStressLevel = 0f;
+        lastPosAnomaly = 0f;
         computing.set(false);
     }
 
@@ -471,14 +516,16 @@ public class Pathfinder {
      *  ASYNC PATHFINDING — uses BlockCache, not ClientWorld
      * ============================================================== */
 
-    private static void startPathfinding(BlockCache cache, BlockPos start, BlockPos goal) {
+    private static void startPathfinding(ClientWorld world, BlockPos start, BlockPos goal, float stressLevel) {
         if (!computing.compareAndSet(false, true)) return;
 
         ticksSinceRecalc = 0;
-        recalcCooldown = RECALC_COOLDOWN;
+        recalcCooldown = computeRecalcCooldown(stressLevel);
 
         pendingFuture = CompletableFuture.supplyAsync(() -> {
             try {
+                // Build cache + run pathfinding off the game tick thread.
+                BlockCache cache = BlockCache.snapshotBetweenChunks(world, start, goal);
                 List<BlockPos> raw = astar(cache, start, goal);
                 return smoothPath(cache, raw);
             } catch (Exception e) {
@@ -569,9 +616,11 @@ public class Pathfinder {
                  || !cache.isPassable(x, y, z + d[1]) || !cache.isPassable(x, y + 1, z + d[1])) {
                     continue;
                 }
-                neighbors.add(new Neighbor(new BlockPos(nx, y, nz), 1.414));
+                double cost = 1.414 + wallProximityPenalty(cache, nx, y, nz);
+                neighbors.add(new Neighbor(new BlockPos(nx, y, nz), cost));
             } else {
-                neighbors.add(new Neighbor(new BlockPos(nx, y, nz), 1.0));
+                double cost = 1.0 + wallProximityPenalty(cache, nx, y, nz);
+                neighbors.add(new Neighbor(new BlockPos(nx, y, nz), cost));
             }
         }
 
@@ -587,9 +636,11 @@ public class Pathfinder {
                  || !cache.isPassable(x, ny, z + d[1]) || !cache.isPassable(x, ny + 1, z + d[1])) {
                     continue;
                 }
-                neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), 2.414));
+                double cost = 2.414 + wallProximityPenalty(cache, nx, ny, nz);
+                neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
             } else {
-                neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), 2.0));
+                double cost = 2.0 + wallProximityPenalty(cache, nx, ny, nz);
+                neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
             }
         }
 
@@ -609,6 +660,7 @@ public class Pathfinder {
                 if (cache.isStandable(nx, ny, nz)) {
                     double cost = (d[0] != 0 && d[1] != 0) ? 1.414 : 1.0;
                     cost += dy * 0.1;
+                    cost += wallProximityPenalty(cache, nx, ny, nz);
                     neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
                     break;
                 }
@@ -621,7 +673,8 @@ public class Pathfinder {
             int ny = y - dy;
             if (ny < -64) break;
             if (cache.isStandable(x, ny, z)) {
-                neighbors.add(new Neighbor(new BlockPos(x, ny, z), dy * 0.1));
+                double cost = dy * 0.1 + wallProximityPenalty(cache, x, ny, z);
+                neighbors.add(new Neighbor(new BlockPos(x, ny, z), cost));
                 break;
             }
             if (cache.isSolid(x, ny, z)) break;
@@ -707,6 +760,47 @@ public class Pathfinder {
         double dy = a.getY() - b.getY();
         double dz = a.getZ() - b.getZ();
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private static int computeRecalcCooldown(float stressLevel) {
+        float s = clamp01(stressLevel);
+        int cd = Math.round(RECALC_COOLDOWN * (1.0f - 0.75f * s));
+        return Math.max(2, cd);
+    }
+
+    private static void forceResetForTeleport(float stressLevel) {
+        currentPath = Collections.emptyList();
+        waypointIndex = 0;
+        lastGoal = null;
+        pendingGoal = null;
+        ticksSinceRecalc = SAFETY_RECALC;
+        recalcCooldown = 0;
+        if (pendingFuture != null) pendingFuture.cancel(true);
+        pendingFuture = null;
+        computing.set(false);
+        if (stressLevel > 0.75f) recalcCooldown = 0;
+    }
+
+    private static float normalizePathDelta(double delta) {
+        return clamp01((float) (((delta / 50.0) + 1.0) / 2.0));
+    }
+
+    private static double wallProximityPenalty(BlockCache cache, int x, int y, int z) {
+        double minDistSq = Double.MAX_VALUE;
+        for (int dx = -WALL_COST_RADIUS; dx <= WALL_COST_RADIUS; dx++) {
+            for (int dz = -WALL_COST_RADIUS; dz <= WALL_COST_RADIUS; dz++) {
+                if (dx == 0 && dz == 0) continue;
+                if (!cache.isSolid(x + dx, y, z + dz) && !cache.isSolid(x + dx, y + 1, z + dz)) {
+                    continue;
+                }
+                double dSq = dx * dx + dz * dz;
+                if (dSq < minDistSq) minDistSq = dSq;
+            }
+        }
+        if (minDistSq == Double.MAX_VALUE) return 0.0;
+        double minDist = Math.sqrt(minDistSq);
+        double norm = clamp01((float) ((WALL_COST_RADIUS + 1.0 - minDist) / (WALL_COST_RADIUS + 1.0)));
+        return WALL_PROXIMITY_COST * norm * norm;
     }
 
     /**

@@ -3,6 +3,7 @@ package macro.topography;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.client.option.GameOptions;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.decoration.ArmorStandEntity;
@@ -64,8 +65,12 @@ public class DataCollector {
         "e2_rel_x,e2_rel_y,e2_rel_z,e2_type,e2_visible,e2_yaw_diff,e2_comp_count,e2_comp_min_dist,e2_comp_intent," +
         "e3_rel_x,e3_rel_y,e3_rel_z,e3_type,e3_visible,e3_yaw_diff,e3_comp_count,e3_comp_min_dist,e3_comp_intent," +
         "e4_rel_x,e4_rel_y,e4_rel_z,e4_type,e4_visible,e4_yaw_diff,e4_comp_count,e4_comp_min_dist,e4_comp_intent," +
-        "rot_anomaly,pos_anomaly,vel_anomaly,stress_level," +
-        "path_rel_x,path_rel_y,path_rel_z";
+        "rot_anomaly,pos_anomaly,vel_anomaly,stress_level,ping," +
+        "path0_rel_x,path0_rel_y,path0_rel_z," +
+        "path1_rel_x,path1_rel_y,path1_rel_z," +
+        "path2_rel_x,path2_rel_y,path2_rel_z," +
+        "path3_rel_x,path3_rel_y,path3_rel_z," +
+        "path4_rel_x,path4_rel_y,path4_rel_z";
 
     private static Vec3d prevVelocity = Vec3d.ZERO;
     private static Vec3d prevPos = null;
@@ -241,6 +246,8 @@ public class DataCollector {
             } else {
                 currentStress = Math.max(0f, currentStress - 0.05f);
             }
+            // [0,1]: normalized by 1000 ms cap
+            float ping = clamp01(getPlayerPingMs(client, player) / 1000.0f);
 
             prevVelocity = vel;
             prevPos = pos;
@@ -248,7 +255,7 @@ public class DataCollector {
             prevPitch = pitchRaw;
 
             // === WRITE CSV ===
-            StringBuilder sb = new StringBuilder(512);
+            StringBuilder sb = new StringBuilder(768);
             sb.append(String.format(Locale.ROOT,
                 "%.4f,%d,%d,%d,%.4f,%.4f," +
                 "%d,%d,%d,%d,%.4f,%d,%d," +
@@ -274,14 +281,19 @@ public class DataCollector {
                     e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]));
             }
 
-            sb.append(String.format(Locale.ROOT, "%.4f,%.4f,%.4f,%.4f,",
-                rotAnomaly, posAnomaly, velAnomaly, currentStress));
+            sb.append(String.format(Locale.ROOT, "%.4f,%.4f,%.4f,%.4f,%.4f,",
+                rotAnomaly, posAnomaly, velAnomaly, currentStress, ping));
 
             // === PATHFINDER ===
-            Pathfinder.update(client, player, targetMode, currentMode);
+            Pathfinder.update(client, player, targetMode, currentMode, distWall, vertClear, currentStress, posAnomaly);
             float[] pathRel = Pathfinder.getPathRelative(pos);
-            sb.append(String.format(Locale.ROOT, "%.4f,%.4f,%.4f",
-                pathRel[0], pathRel[1], pathRel[2]));
+            for (int i = 0; i < Pathfinder.PATH_FEATURE_COUNT; i++) {
+                float v = (i < pathRel.length) ? pathRel[i] : 0f;
+                sb.append(String.format(Locale.ROOT, "%.4f", v));
+                if (i < Pathfinder.PATH_FEATURE_COUNT - 1) {
+                    sb.append(",");
+                }
+            }
             sb.append(System.lineSeparator());
 
             csvWriter.print(sb);
@@ -493,6 +505,13 @@ public class DataCollector {
             }
         }
         return 0f;
+    }
+
+    private static int getPlayerPingMs(MinecraftClient client, ClientPlayerEntity player) {
+        if (client.getNetworkHandler() == null || player == null) return 0;
+        PlayerListEntry entry = client.getNetworkHandler().getPlayerListEntry(player.getUuid());
+        if (entry == null) return 0;
+        return Math.max(0, entry.getLatency());
     }
 
     private static float clamp01(float v) {

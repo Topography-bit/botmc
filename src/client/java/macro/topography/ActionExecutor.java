@@ -81,6 +81,8 @@ public class ActionExecutor {
     /* ── warmup: skip first N ticks to stabilize GRU ───────────── */
     private static int   warmupTicks    = 0;
     private static final int WARMUP_COUNT = 5;
+    private static final int BASE_FEATURE_COUNT = 89;
+    private static final int FEATURE_COUNT = BASE_FEATURE_COUNT + Pathfinder.PATH_FEATURE_COUNT;
 
     /* ================================================================
      *  LIFECYCLE
@@ -192,7 +194,7 @@ public class ActionExecutor {
             return;
         }
 
-        /* 1. build 92-float feature vector */
+        /* 1. build feature vector */
         float[] feat = buildFeatures(client, player);
 
         /* 2. inference */
@@ -408,11 +410,11 @@ public class ActionExecutor {
     }
 
     /* ================================================================
-     *  FEATURE VECTOR  (92 floats, all [0,1])
+     *  FEATURE VECTOR  (base + path horizon, all [0,1])
      * ============================================================== */
 
     private static float[] buildFeatures(MinecraftClient client, ClientPlayerEntity player) {
-        float[] f = new float[92];
+        float[] f = new float[FEATURE_COUNT];
 
         Vec3d vel = player.getVelocity();
         Vec3d pos = player.getEntityPos();
@@ -531,12 +533,13 @@ public class ActionExecutor {
         f[87] = velAnomaly;
         f[88] = stress;
 
-        /* [89..91] path_rel from Pathfinder */
-        Pathfinder.update(client, player, lastTargetMode, cm);
+        /* [89..] path horizon from Pathfinder */
+        Pathfinder.update(client, player, lastTargetMode, cm, f[21], f[30], stress, posAnomaly);
         float[] pathRel = Pathfinder.getPathRelative(pos);
-        f[89] = pathRel[0];
-        f[90] = pathRel[1];
-        f[91] = pathRel[2];
+        int pathCount = Math.min(pathRel.length, Pathfinder.PATH_FEATURE_COUNT);
+        for (int i = 0; i < pathCount; i++) {
+            f[BASE_FEATURE_COUNT + i] = pathRel[i];
+        }
 
         return f;
     }

@@ -75,11 +75,24 @@ public class Pathfinder {
 
     /* ── per-mob path costs (cached, updated async) ── */
     private static final float[] mobPathCosts = new float[MOB_PATH_COST_COUNT]; // [0,1] normalized
+    private static final Map<UUID, Float> mobPathCostByTag = new HashMap<>();
     private static List<BlockPos> mobGoals = Collections.emptyList(); // standable goals for up to 5 mobs
     private static List<LivingEntity> targetMobs = Collections.emptyList(); // real mobs for hitbox
     private static int mobCostTicks = 0;
     private static final int MOB_COST_INTERVAL = 40; // recalc every 2 sec
-    private static CompletableFuture<float[]> pendingMobCosts = null;
+    private static CompletableFuture<MobCostResult> pendingMobCosts = null;
+
+    private static class MobCostResult {
+        final float[] costs;
+        final Map<UUID, Float> costsByTag;
+        final List<LivingEntity> renderedMobs;
+
+        MobCostResult(float[] costs, Map<UUID, Float> costsByTag, List<LivingEntity> renderedMobs) {
+            this.costs = costs;
+            this.costsByTag = costsByTag;
+            this.renderedMobs = renderedMobs;
+        }
+    }
 
     /* ================================================================
      *  BLOCK CACHE — snapshot on main thread, read safely from async
@@ -193,6 +206,7 @@ public class Pathfinder {
             forceResetForTeleport(stressLevel);
         }
 
+        boolean farmMode = (targetMode != 0 && currentMode == targetMode);
         BlockPos goal = pickGoal(client, player, targetMode, currentMode);
 
         // Debug logging every 5 sec
@@ -275,14 +289,34 @@ public class Pathfinder {
             startPathfinding(client.world, start, pathGoal, stressLevel);
         }
 
+        if (!farmMode) {
+            mobCostTicks = 0;
+            Arrays.fill(mobPathCosts, 1.0f);
+            synchronized (mobPathCostByTag) {
+                mobPathCostByTag.clear();
+            }
+            mobGoals = Collections.emptyList();
+            targetMobs = Collections.emptyList();
+            if (pendingMobCosts != null) {
+                pendingMobCosts.cancel(true);
+                pendingMobCosts = null;
+            }
+            return;
+        }
+
         // === MOB PATH COSTS (async, every MOB_COST_INTERVAL ticks) ===
         mobCostTicks++;
         // Check pending mob cost result
         if (pendingMobCosts != null && pendingMobCosts.isDone()) {
             try {
-                float[] costs = pendingMobCosts.get();
-                if (costs != null) {
-                    System.arraycopy(costs, 0, mobPathCosts, 0, MOB_PATH_COST_COUNT);
+                MobCostResult result = pendingMobCosts.get();
+                if (result != null) {
+                    System.arraycopy(result.costs, 0, mobPathCosts, 0, MOB_PATH_COST_COUNT);
+                    synchronized (mobPathCostByTag) {
+                        mobPathCostByTag.clear();
+                        mobPathCostByTag.putAll(result.costsByTag);
+                    }
+                    targetMobs = result.renderedMobs;
                 }
             } catch (Exception e) {
                 // ignore
@@ -295,6 +329,7 @@ public class Pathfinder {
             List<ArmorStandEntity> tags = findAllNameTags(client, player, targetMode);
             List<BlockPos> goals = new ArrayList<>();
             List<LivingEntity> realMobs = new ArrayList<>();
+            List<UUID> tagIds = new ArrayList<>();
             BlockPos playerBlock = findStandableStart(client.world, player.getBlockPos());
 
             for (int i = 0; i < Math.min(tags.size(), MOB_PATH_COST_COUNT); i++) {
@@ -304,19 +339,22 @@ public class Pathfinder {
                 goals.add(findNearestStandable(client.world, mobBlock));
                 LivingEntity real = findRealMobNear(client, player, tag);
                 realMobs.add(real); // can be null
+                tagIds.add(tag.getUuid());
             }
 
             mobGoals = goals;
-            targetMobs = realMobs;
 
             // Async: compute A* cost from player to each mob goal
             final BlockPos startPos = playerBlock;
             final List<BlockPos> goalsCopy = new ArrayList<>(goals);
+            final List<UUID> idsCopy = new ArrayList<>(tagIds);
+            final List<LivingEntity> renderedMobs = new ArrayList<>(realMobs);
             final ClientWorld world = client.world;
 
             pendingMobCosts = CompletableFuture.supplyAsync(() -> {
                 float[] costs = new float[MOB_PATH_COST_COUNT];
                 Arrays.fill(costs, 1.0f); // default = max cost (unreachable)
+                Map<UUID, Float> byTag = new HashMap<>();
                 try {
                     // Build one cache covering all mob goals
                     int minX = startPos.getX(), maxX = startPos.getX();
@@ -332,7 +370,7 @@ public class Pathfinder {
                     }
                     BlockPos cacheMin = new BlockPos(minX - 5, minY - MAX_FALL, minZ - 5);
                     BlockPos cacheMax = new BlockPos(maxX + 5, maxY + 10, maxZ + 5);
-                    BlockCache cache = BlockCache.snapshotBetweenChunks(world, cacheMin, cacheMax);
+                    BlockCache cache = snapshotOnClientThread(world, cacheMin, cacheMax);
 
                     // Run single A* from player and extract gCosts for all mob goals
                     Map<Long, Double> gCosts = astarMultiGoal(cache, startPos, goalsCopy);
@@ -340,15 +378,20 @@ public class Pathfinder {
                     for (int i = 0; i < goalsCopy.size(); i++) {
                         long key = posKey(goalsCopy.get(i));
                         Double cost = gCosts.get(key);
+                        float norm = 1.0f;
                         if (cost != null) {
-                            costs[i] = clamp01((float) (cost / PATH_COST_MAX));
+                            norm = clamp01((float) (cost / PATH_COST_MAX));
+                            costs[i] = norm;
                         }
                         // else stays 1.0 (unreachable)
+                        if (i < idsCopy.size()) {
+                            byTag.put(idsCopy.get(i), norm);
+                        }
                     }
                 } catch (Exception e) {
                     System.err.println("[Pathfinder] Mob cost error: " + e.getMessage());
                 }
-                return costs;
+                return new MobCostResult(costs, byTag, renderedMobs);
             });
         }
     }
@@ -387,6 +430,9 @@ public class Pathfinder {
         lastStressLevel = 0f;
         lastPosAnomaly = 0f;
         Arrays.fill(mobPathCosts, 1.0f);
+        synchronized (mobPathCostByTag) {
+            mobPathCostByTag.clear();
+        }
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -407,11 +453,20 @@ public class Pathfinder {
     public static void stop() {
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        if (pendingMobCosts != null) pendingMobCosts.cancel(true);
+        pendingMobCosts = null;
         pendingGoal = null;
         lastDistToWall = 1f;
         lastVerticalClearance = 1f;
         lastStressLevel = 0f;
         lastPosAnomaly = 0f;
+        Arrays.fill(mobPathCosts, 1.0f);
+        synchronized (mobPathCostByTag) {
+            mobPathCostByTag.clear();
+        }
+        mobGoals = Collections.emptyList();
+        targetMobs = Collections.emptyList();
+        mobCostTicks = 0;
         computing.set(false);
     }
 
@@ -524,7 +579,7 @@ public class Pathfinder {
 
     /** Pick the mob with the lowest cached path_cost. Falls back to nearest by distance. */
     private static ArmorStandEntity pickBestMobByPathCost(MinecraftClient client,
-                                                            ClientPlayerEntity player, int targetMode) {
+                                                             ClientPlayerEntity player, int targetMode) {
         List<ArmorStandEntity> tags = findAllNameTags(client, player, targetMode);
         if (tags.isEmpty()) return null;
 
@@ -532,8 +587,12 @@ public class Pathfinder {
         int bestIdx = 0;
         float bestCost = Float.MAX_VALUE;
         for (int i = 0; i < tags.size() && i < MOB_PATH_COST_COUNT; i++) {
-            if (mobPathCosts[i] < bestCost) {
-                bestCost = mobPathCosts[i];
+            float c;
+            synchronized (mobPathCostByTag) {
+                c = mobPathCostByTag.getOrDefault(tags.get(i).getUuid(), 1.0f);
+            }
+            if (c < bestCost) {
+                bestCost = c;
                 bestIdx = i;
             }
         }
@@ -636,8 +695,8 @@ public class Pathfinder {
 
         pendingFuture = CompletableFuture.supplyAsync(() -> {
             try {
-                // Build cache + run pathfinding off the game tick thread.
-                BlockCache cache = BlockCache.snapshotBetweenChunks(world, start, goal);
+                // Build cache on client thread (world-safe), run A* off-thread.
+                BlockCache cache = snapshotOnClientThread(world, start, goal);
                 List<BlockPos> raw = astar(cache, start, goal);
                 return smoothPath(cache, raw);
             } catch (Exception e) {
@@ -921,6 +980,29 @@ public class Pathfinder {
         return Math.max(2, cd);
     }
 
+    private static BlockCache snapshotOnClientThread(ClientWorld world, BlockPos start, BlockPos goal) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.isOnThread()) {
+            return BlockCache.snapshotBetweenChunks(world, start, goal);
+        }
+
+        CompletableFuture<BlockCache> snapshotFuture = new CompletableFuture<>();
+        mc.execute(() -> {
+            try {
+                snapshotFuture.complete(BlockCache.snapshotBetweenChunks(world, start, goal));
+            } catch (Exception e) {
+                snapshotFuture.completeExceptionally(e);
+            }
+        });
+
+        try {
+            return snapshotFuture.get();
+        } catch (Exception e) {
+            System.err.println("[Pathfinder] Snapshot error: " + e.getMessage());
+            return new BlockCache();
+        }
+    }
+
     private static void forceResetForTeleport(float stressLevel) {
         currentPath = Collections.emptyList();
         waypointIndex = 0;
@@ -930,6 +1012,15 @@ public class Pathfinder {
         recalcCooldown = 0;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        if (pendingMobCosts != null) pendingMobCosts.cancel(true);
+        pendingMobCosts = null;
+        Arrays.fill(mobPathCosts, 1.0f);
+        synchronized (mobPathCostByTag) {
+            mobPathCostByTag.clear();
+        }
+        mobGoals = Collections.emptyList();
+        targetMobs = Collections.emptyList();
+        mobCostTicks = 0;
         computing.set(false);
         if (stressLevel > 0.75f) recalcCooldown = 0;
     }

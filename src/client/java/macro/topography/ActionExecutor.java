@@ -5,6 +5,7 @@ import macro.topography.mixin.client.MinecraftClientInvoker;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.client.option.GameOptions;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.entity.LivingEntity;
@@ -81,10 +82,11 @@ public class ActionExecutor {
     /* ── warmup: skip first N ticks to stabilize GRU ───────────── */
     private static int   warmupTicks    = 0;
     private static final int WARMUP_COUNT = 5;
-    private static final int BASE_FEATURE_COUNT = 90;
-    private static final int MOB_COST_OFFSET = BASE_FEATURE_COUNT; // 89
-    private static final int PATH_OFFSET = MOB_COST_OFFSET + Pathfinder.MOB_PATH_COST_COUNT; // 94
-    private static final int FEATURE_COUNT = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 109
+    private static final int BASE_FEATURE_COUNT = 86;
+    private static final int MOB_COST_OFFSET = BASE_FEATURE_COUNT; // 86..90
+    private static final int ANOMALY_OFFSET = MOB_COST_OFFSET + Pathfinder.MOB_PATH_COST_COUNT; // 91..95
+    private static final int PATH_OFFSET = ANOMALY_OFFSET + 5; // 96..110
+    private static final int FEATURE_COUNT = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 111
 
     /* ================================================================
      *  LIFECYCLE
@@ -518,7 +520,13 @@ public class ActionExecutor {
         /* [41..85] entity block (5 mobs × 9 features) */
         fillEntityBlock(client, player, pos, f);
 
-        /* [86..89] anomalies */
+        /* [86..90] per-mob path costs (same order as CSV) */
+        float[] mobCosts = Pathfinder.getMobPathCosts();
+        for (int i = 0; i < Pathfinder.MOB_PATH_COST_COUNT; i++) {
+            f[MOB_COST_OFFSET + i] = mobCosts[i];
+        }
+
+        /* [91..95] anomalies + stress + ping */
         float yawDiffA  = Math.abs(normalizeAngle(yawRaw - prevYaw))  / 180f;
         float pitchDiffA = Math.abs(pitchRaw - prevPitch) / 90f;
         float rotAnomaly = clamp01((yawDiffA + pitchDiffA) / 2f);
@@ -539,20 +547,15 @@ public class ActionExecutor {
 
         float tickStress = clamp01(rotAnomaly * 0.35f + posAnomaly * 0.35f + velAnomaly * 0.3f);
         stress = tickStress > stress ? tickStress : Math.max(0f, stress - 0.05f);
+        float ping = clamp01(getPlayerPingMs(client, player) / 1000.0f);
+        f[ANOMALY_OFFSET] = rotAnomaly;
+        f[ANOMALY_OFFSET + 1] = posAnomaly;
+        f[ANOMALY_OFFSET + 2] = velAnomaly;
+        f[ANOMALY_OFFSET + 3] = stress;
+        f[ANOMALY_OFFSET + 4] = ping;
 
-        f[86] = rotAnomaly;
-        f[87] = posAnomaly;
-        f[88] = velAnomaly;
-        f[89] = stress;
-
-        /* [89..93] per-mob path costs */
+        /* [96..110] path horizon from Pathfinder */
         Pathfinder.update(client, player, lastTargetMode, cm, f[21], f[30], stress, posAnomaly);
-        float[] mobCosts = Pathfinder.getMobPathCosts();
-        for (int i = 0; i < Pathfinder.MOB_PATH_COST_COUNT; i++) {
-            f[MOB_COST_OFFSET + i] = mobCosts[i];
-        }
-
-        /* [94..] path horizon from Pathfinder */
         float[] pathRel = Pathfinder.getPathRelative(pos);
         int pathCount = Math.min(pathRel.length, Pathfinder.PATH_FEATURE_COUNT);
         for (int i = 0; i < pathCount; i++) {
@@ -772,6 +775,13 @@ public class ActionExecutor {
         while (a >  180) a -= 360;
         while (a < -180) a += 360;
         return a;
+    }
+
+    private static int getPlayerPingMs(MinecraftClient client, ClientPlayerEntity player) {
+        if (client.getNetworkHandler() == null || player == null) return 0;
+        PlayerListEntry entry = client.getNetworkHandler().getPlayerListEntry(player.getUuid());
+        if (entry == null) return 0;
+        return Math.max(0, entry.getLatency());
     }
 
     private static float clamp01(float v) {

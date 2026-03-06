@@ -9,10 +9,13 @@ import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
+import net.minecraft.block.BlockState;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.RaycastContext;
 
 import java.io.BufferedWriter;
@@ -59,12 +62,13 @@ public class DataCollector {
         "dist_to_block_right,block_height_right," +
         "vertical_clearance,mana,mana_cost_aotev,slot_aotev," +
         "time_to_collision,current_mode,target_mode," +
-        "ground_near,ground_mid,ground_far," +
+        "ground_near,ground_mid,ground_far,block_below_height," +
         "e0_rel_x,e0_rel_y,e0_rel_z,e0_type,e0_visible,e0_yaw_diff,e0_comp_count,e0_comp_min_dist,e0_comp_intent," +
         "e1_rel_x,e1_rel_y,e1_rel_z,e1_type,e1_visible,e1_yaw_diff,e1_comp_count,e1_comp_min_dist,e1_comp_intent," +
         "e2_rel_x,e2_rel_y,e2_rel_z,e2_type,e2_visible,e2_yaw_diff,e2_comp_count,e2_comp_min_dist,e2_comp_intent," +
         "e3_rel_x,e3_rel_y,e3_rel_z,e3_type,e3_visible,e3_yaw_diff,e3_comp_count,e3_comp_min_dist,e3_comp_intent," +
         "e4_rel_x,e4_rel_y,e4_rel_z,e4_type,e4_visible,e4_yaw_diff,e4_comp_count,e4_comp_min_dist,e4_comp_intent," +
+        "e0_path_cost,e1_path_cost,e2_path_cost,e3_path_cost,e4_path_cost," +
         "rot_anomaly,pos_anomaly,vel_anomaly,stress_level,ping," +
         "path0_rel_x,path0_rel_y,path0_rel_z," +
         "path1_rel_x,path1_rel_y,path1_rel_z," +
@@ -180,6 +184,18 @@ public class DataCollector {
             float groundMid  = RaycastHelper.calcGroundProbe(client, player, 3.0f);
             float groundFar  = RaycastHelper.calcGroundProbe(client, player, 4.5f);
 
+            // [0,1]: collision shape height of block below player feet
+            // full block = 1.0, slab = 0.5, stairs ~0.5-1.0, air = 0.0
+            float blockBelowHeight = 0f;
+            if (client.world != null) {
+                BlockPos belowPos = player.getBlockPos().down();
+                BlockState belowState = client.world.getBlockState(belowPos);
+                VoxelShape shape = belowState.getCollisionShape(client.world, belowPos);
+                if (!shape.isEmpty()) {
+                    blockBelowHeight = clamp01((float) shape.getMax(net.minecraft.util.math.Direction.Axis.Y));
+                }
+            }
+
             // === ENTITY BLOCK ===
             List<LivingEntity> mobs = getNearestMobs(client, player);
             float[][] eData = new float[5][9];
@@ -264,7 +280,7 @@ public class DataCollector {
                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f," +
                 "%.4f,%.4f,%.4f,%.4f," +
                 "%.4f,%.4f,%.4f," +
-                "%.4f,%.4f,%.4f,",
+                "%.4f,%.4f,%.4f,%.4f,",
                 activeSlot, on_ground, is_sprinting, is_jumping, yaw, pitch,
                 key_W, key_S, key_A, key_D, pressedSlot, leftClick, rightClick,
                 deltaYaw, deltaPitch, velX, velY, velZ, accelX, accelY, accelZ,
@@ -272,13 +288,19 @@ public class DataCollector {
                 bStraight[0], bStraight[1], bLeft[0], bLeft[1], bRight[0], bRight[1],
                 vertClear, mana, manaCostAotev, aotevSlot,
                 timeToCollision, currentModeNorm, targetModeNorm,
-                groundNear, groundMid, groundFar
+                groundNear, groundMid, groundFar, blockBelowHeight
             ));
 
             for (int i = 0; i < 5; i++) {
                 float[] e = eData[i];
                 sb.append(String.format(Locale.ROOT, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,",
                     e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]));
+            }
+
+            // === MOB PATH COSTS ===
+            float[] mobCosts = Pathfinder.getMobPathCosts();
+            for (int i = 0; i < Pathfinder.MOB_PATH_COST_COUNT; i++) {
+                sb.append(String.format(Locale.ROOT, "%.4f,", mobCosts[i]));
             }
 
             sb.append(String.format(Locale.ROOT, "%.4f,%.4f,%.4f,%.4f,%.4f,",

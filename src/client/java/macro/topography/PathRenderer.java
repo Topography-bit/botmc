@@ -243,30 +243,68 @@ public class PathRenderer {
         );
     }
 
-    /* ── Target mob hitbox — excludes ArmorStands ── */
+    /* ── All target mob hitboxes — color-coded by path cost ── */
+    private static final float[][] MOB_COLORS = {
+        {1f, 0.2f, 0.2f},   // red — nearest
+        {1f, 0.6f, 0.1f},   // orange
+        {1f, 1f, 0.1f},     // yellow
+        {0.4f, 1f, 0.2f},   // green
+        {0.2f, 0.6f, 1f},   // blue — furthest
+    };
+
     private static void renderTargetMobHitbox(MatrixStack matrices, VertexConsumerProvider consumers,
                                                 float pulse) {
-        LivingEntity targetMob = Pathfinder.getTargetMob();
-        if (targetMob == null || !targetMob.isAlive()) return;
-        if (targetMob instanceof ArmorStandEntity) return;
+        List<LivingEntity> mobs = Pathfinder.getTargetMobs();
+        float[] costs = Pathfinder.getMobPathCosts();
 
-        net.minecraft.util.math.Box box = targetMob.getBoundingBox();
-        float minX = (float) box.minX;
-        float minY = (float) box.minY;
-        float minZ = (float) box.minZ;
-        float maxX = (float) box.maxX;
-        float maxY = (float) box.maxY;
-        float maxZ = (float) box.maxZ;
+        for (int i = 0; i < mobs.size(); i++) {
+            LivingEntity mob = mobs.get(i);
+            if (mob == null || !mob.isAlive()) continue;
+            if (mob instanceof ArmorStandEntity) continue;
 
-        VertexRendering.drawBox(
-            matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
-            minX, minY, minZ, maxX, maxY, maxZ,
-            1f, 0.2f, 0.6f, pulse
-        );
-        VertexRendering.drawFilledBox(
-            matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
-            minX, minY, minZ, maxX, maxY, maxZ,
-            1f, 0.1f, 0.4f, pulse * 0.3f
-        );
+            net.minecraft.util.math.Box box = mob.getBoundingBox();
+            float minX = (float) box.minX;
+            float minY = (float) box.minY;
+            float minZ = (float) box.minZ;
+            float maxX = (float) box.maxX;
+            float maxY = (float) box.maxY;
+            float maxZ = (float) box.maxZ;
+
+            float[] c = (i < MOB_COLORS.length) ? MOB_COLORS[i] : MOB_COLORS[MOB_COLORS.length - 1];
+            float cost = (i < costs.length) ? costs[i] : 1f;
+            // Brighter = lower cost (easier to reach)
+            float brightness = 1f - cost * 0.5f;
+
+            // Outline
+            VertexRendering.drawBox(
+                matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
+                minX, minY, minZ, maxX, maxY, maxZ,
+                c[0] * brightness, c[1] * brightness, c[2] * brightness, pulse
+            );
+            // Semi-transparent fill
+            VertexRendering.drawFilledBox(
+                matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
+                minX, minY, minZ, maxX, maxY, maxZ,
+                c[0], c[1], c[2], pulse * 0.2f
+            );
+        }
+
+        // Also render the primary target mob (from navigation) if not in the list
+        LivingEntity primary = Pathfinder.getTargetMob();
+        if (primary != null && primary.isAlive() && !(primary instanceof ArmorStandEntity)) {
+            boolean alreadyRendered = false;
+            for (LivingEntity m : mobs) {
+                if (m == primary) { alreadyRendered = true; break; }
+            }
+            if (!alreadyRendered) {
+                net.minecraft.util.math.Box box = primary.getBoundingBox();
+                VertexRendering.drawBox(
+                    matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
+                    (float) box.minX, (float) box.minY, (float) box.minZ,
+                    (float) box.maxX, (float) box.maxY, (float) box.maxZ,
+                    1f, 0.2f, 0.6f, pulse
+                );
+            }
+        }
     }
 }

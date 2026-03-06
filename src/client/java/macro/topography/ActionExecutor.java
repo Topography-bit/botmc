@@ -81,8 +81,10 @@ public class ActionExecutor {
     /* ── warmup: skip first N ticks to stabilize GRU ───────────── */
     private static int   warmupTicks    = 0;
     private static final int WARMUP_COUNT = 5;
-    private static final int BASE_FEATURE_COUNT = 89;
-    private static final int FEATURE_COUNT = BASE_FEATURE_COUNT + Pathfinder.PATH_FEATURE_COUNT;
+    private static final int BASE_FEATURE_COUNT = 90;
+    private static final int MOB_COST_OFFSET = BASE_FEATURE_COUNT; // 89
+    private static final int PATH_OFFSET = MOB_COST_OFFSET + Pathfinder.MOB_PATH_COST_COUNT; // 94
+    private static final int FEATURE_COUNT = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 109
 
     /* ================================================================
      *  LIFECYCLE
@@ -503,10 +505,20 @@ public class ActionExecutor {
         f[38] = RaycastHelper.calcGroundProbe(client, player, 3.0f);
         f[39] = RaycastHelper.calcGroundProbe(client, player, 4.5f);
 
-        /* [40..84] entity block (5 mobs × 9 features) */
+        /* [40] block_below_height — slab=0.5, full=1.0, air=0.0 */
+        if (client.world != null) {
+            net.minecraft.util.math.BlockPos belowPos = player.getBlockPos().down();
+            net.minecraft.block.BlockState belowState = client.world.getBlockState(belowPos);
+            net.minecraft.util.shape.VoxelShape shape = belowState.getCollisionShape(client.world, belowPos);
+            if (!shape.isEmpty()) {
+                f[40] = clamp01((float) shape.getMax(net.minecraft.util.math.Direction.Axis.Y));
+            }
+        }
+
+        /* [41..85] entity block (5 mobs × 9 features) */
         fillEntityBlock(client, player, pos, f);
 
-        /* [85..88] anomalies */
+        /* [86..89] anomalies */
         float yawDiffA  = Math.abs(normalizeAngle(yawRaw - prevYaw))  / 180f;
         float pitchDiffA = Math.abs(pitchRaw - prevPitch) / 90f;
         float rotAnomaly = clamp01((yawDiffA + pitchDiffA) / 2f);
@@ -528,17 +540,23 @@ public class ActionExecutor {
         float tickStress = clamp01(rotAnomaly * 0.35f + posAnomaly * 0.35f + velAnomaly * 0.3f);
         stress = tickStress > stress ? tickStress : Math.max(0f, stress - 0.05f);
 
-        f[85] = rotAnomaly;
-        f[86] = posAnomaly;
-        f[87] = velAnomaly;
-        f[88] = stress;
+        f[86] = rotAnomaly;
+        f[87] = posAnomaly;
+        f[88] = velAnomaly;
+        f[89] = stress;
 
-        /* [89..] path horizon from Pathfinder */
+        /* [89..93] per-mob path costs */
         Pathfinder.update(client, player, lastTargetMode, cm, f[21], f[30], stress, posAnomaly);
+        float[] mobCosts = Pathfinder.getMobPathCosts();
+        for (int i = 0; i < Pathfinder.MOB_PATH_COST_COUNT; i++) {
+            f[MOB_COST_OFFSET + i] = mobCosts[i];
+        }
+
+        /* [94..] path horizon from Pathfinder */
         float[] pathRel = Pathfinder.getPathRelative(pos);
         int pathCount = Math.min(pathRel.length, Pathfinder.PATH_FEATURE_COUNT);
         for (int i = 0; i < pathCount; i++) {
-            f[BASE_FEATURE_COUNT + i] = pathRel[i];
+            f[PATH_OFFSET + i] = pathRel[i];
         }
 
         return f;
@@ -550,7 +568,7 @@ public class ActionExecutor {
                                         Vec3d pos, float[] f) {
         List<LivingEntity> mobs = getNearestMobs(client, player);
         for (int i = 0; i < 5; i++) {
-            int base = 40 + i * 9;
+            int base = 41 + i * 9;
             if (i < mobs.size()) {
                 LivingEntity mob = mobs.get(i);
                 Vec3d rel = mob.getEntityPos().subtract(pos);

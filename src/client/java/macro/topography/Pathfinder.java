@@ -53,6 +53,8 @@ public class Pathfinder {
 
     /* ── mob targeting ────────────────────────────────────────────── */
     private static final double ATTACK_STANDOFF = 1.75;
+    private static final double PATH_COST_MAX = 100.0; // normalize path costs to [0,1]
+    public static final int MOB_PATH_COST_COUNT = 5;
 
     /* ── state ────────────────────────────────────────────────────── */
     private static List<BlockPos> currentPath = Collections.emptyList();
@@ -70,6 +72,14 @@ public class Pathfinder {
     private static float lastVerticalClearance = 1f;
     private static float lastStressLevel = 0f;
     private static float lastPosAnomaly = 0f;
+
+    /* ── per-mob path costs (cached, updated async) ── */
+    private static final float[] mobPathCosts = new float[MOB_PATH_COST_COUNT]; // [0,1] normalized
+    private static List<BlockPos> mobGoals = Collections.emptyList(); // standable goals for up to 5 mobs
+    private static List<LivingEntity> targetMobs = Collections.emptyList(); // real mobs for hitbox
+    private static int mobCostTicks = 0;
+    private static final int MOB_COST_INTERVAL = 40; // recalc every 2 sec
+    private static CompletableFuture<float[]> pendingMobCosts = null;
 
     /* ================================================================
      *  BLOCK CACHE — snapshot on main thread, read safely from async
@@ -264,6 +274,83 @@ public class Pathfinder {
             pendingGoal = goal;
             startPathfinding(client.world, start, pathGoal, stressLevel);
         }
+
+        // === MOB PATH COSTS (async, every MOB_COST_INTERVAL ticks) ===
+        mobCostTicks++;
+        // Check pending mob cost result
+        if (pendingMobCosts != null && pendingMobCosts.isDone()) {
+            try {
+                float[] costs = pendingMobCosts.get();
+                if (costs != null) {
+                    System.arraycopy(costs, 0, mobPathCosts, 0, MOB_PATH_COST_COUNT);
+                }
+            } catch (Exception e) {
+                // ignore
+            }
+            pendingMobCosts = null;
+        }
+        // Start new mob cost computation
+        if (mobCostTicks >= MOB_COST_INTERVAL && pendingMobCosts == null && client.world != null) {
+            mobCostTicks = 0;
+            List<ArmorStandEntity> tags = findAllNameTags(client, player, targetMode);
+            List<BlockPos> goals = new ArrayList<>();
+            List<LivingEntity> realMobs = new ArrayList<>();
+            BlockPos playerBlock = findStandableStart(client.world, player.getBlockPos());
+
+            for (int i = 0; i < Math.min(tags.size(), MOB_PATH_COST_COUNT); i++) {
+                ArmorStandEntity tag = tags.get(i);
+                Vec3d tagPos = tag.getEntityPos();
+                BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
+                goals.add(findNearestStandable(client.world, mobBlock));
+                LivingEntity real = findRealMobNear(client, player, tag);
+                realMobs.add(real); // can be null
+            }
+
+            mobGoals = goals;
+            targetMobs = realMobs;
+
+            // Async: compute A* cost from player to each mob goal
+            final BlockPos startPos = playerBlock;
+            final List<BlockPos> goalsCopy = new ArrayList<>(goals);
+            final ClientWorld world = client.world;
+
+            pendingMobCosts = CompletableFuture.supplyAsync(() -> {
+                float[] costs = new float[MOB_PATH_COST_COUNT];
+                Arrays.fill(costs, 1.0f); // default = max cost (unreachable)
+                try {
+                    // Build one cache covering all mob goals
+                    int minX = startPos.getX(), maxX = startPos.getX();
+                    int minZ = startPos.getZ(), maxZ = startPos.getZ();
+                    int minY = startPos.getY(), maxY = startPos.getY();
+                    for (BlockPos g : goalsCopy) {
+                        minX = Math.min(minX, g.getX());
+                        maxX = Math.max(maxX, g.getX());
+                        minZ = Math.min(minZ, g.getZ());
+                        maxZ = Math.max(maxZ, g.getZ());
+                        minY = Math.min(minY, g.getY());
+                        maxY = Math.max(maxY, g.getY());
+                    }
+                    BlockPos cacheMin = new BlockPos(minX - 5, minY - MAX_FALL, minZ - 5);
+                    BlockPos cacheMax = new BlockPos(maxX + 5, maxY + 10, maxZ + 5);
+                    BlockCache cache = BlockCache.snapshotBetweenChunks(world, cacheMin, cacheMax);
+
+                    // Run single A* from player and extract gCosts for all mob goals
+                    Map<Long, Double> gCosts = astarMultiGoal(cache, startPos, goalsCopy);
+
+                    for (int i = 0; i < goalsCopy.size(); i++) {
+                        long key = posKey(goalsCopy.get(i));
+                        Double cost = gCosts.get(key);
+                        if (cost != null) {
+                            costs[i] = clamp01((float) (cost / PATH_COST_MAX));
+                        }
+                        // else stays 1.0 (unreachable)
+                    }
+                } catch (Exception e) {
+                    System.err.println("[Pathfinder] Mob cost error: " + e.getMessage());
+                }
+                return costs;
+            });
+        }
     }
 
     public static float[] getPathRelative(Vec3d playerPos) {
@@ -299,6 +386,12 @@ public class Pathfinder {
         lastVerticalClearance = 1f;
         lastStressLevel = 0f;
         lastPosAnomaly = 0f;
+        Arrays.fill(mobPathCosts, 1.0f);
+        mobGoals = Collections.emptyList();
+        targetMobs = Collections.emptyList();
+        mobCostTicks = 0;
+        if (pendingMobCosts != null) pendingMobCosts.cancel(true);
+        pendingMobCosts = null;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
         computing.set(false);
@@ -308,6 +401,8 @@ public class Pathfinder {
     public static int getWaypointIndex() { return waypointIndex; }
     public static LivingEntity getTargetMob() { return targetMob; }
     public static int getActiveTargetMode() { return activeTargetMode; }
+    public static float[] getMobPathCosts() { return mobPathCosts; }
+    public static List<LivingEntity> getTargetMobs() { return targetMobs; }
 
     public static void stop() {
         if (pendingFuture != null) pendingFuture.cancel(true);
@@ -331,8 +426,8 @@ public class Pathfinder {
         boolean farmMode = (targetMode != 0 && currentMode == targetMode);
 
         if (farmMode) {
-            // Step 1: Find nearest ArmorStand name tag with matching name
-            ArmorStandEntity bestTag = findNearestNameTag(client, player, targetMode);
+            // Pick mob with lowest path_cost (easiest to reach), fallback to nearest
+            ArmorStandEntity bestTag = pickBestMobByPathCost(client, player, targetMode);
 
             if (bestTag != null) {
                 targetNameTag = bestTag;
@@ -405,13 +500,12 @@ public class Pathfinder {
      *  MOB TARGETING — find ArmorStand name tags, then pair with real mob
      * ============================================================== */
 
-    /** Find nearest ArmorStand name tag with matching mob name. */
-    private static ArmorStandEntity findNearestNameTag(MinecraftClient client,
-                                                        ClientPlayerEntity player, int targetMode) {
-        if (client.world == null || targetMode == 0) return null;
+    /** Find up to 5 ArmorStand name tags, sorted by distance. */
+    private static List<ArmorStandEntity> findAllNameTags(MinecraftClient client,
+                                                           ClientPlayerEntity player, int targetMode) {
+        if (client.world == null || targetMode == 0) return Collections.emptyList();
         Vec3d pPos = player.getEntityPos();
-        ArmorStandEntity best = null;
-        double bestDist = Double.MAX_VALUE;
+        List<ArmorStandEntity> tags = new ArrayList<>();
 
         for (LivingEntity e : client.world.getEntitiesByClass(
                 LivingEntity.class, player.getBoundingBox().expand(50),
@@ -421,15 +515,33 @@ public class Pathfinder {
             boolean match = false;
             if (targetMode == 1) match = name.contains("Zealot") && !name.contains("Bruiser");
             if (targetMode == 2) match = name.contains("Bruiser");
-            if (match) {
-                double d = e.getEntityPos().distanceTo(pPos);
-                if (d < bestDist) {
-                    bestDist = d;
-                    best = (ArmorStandEntity) e;
-                }
+            if (match) tags.add((ArmorStandEntity) e);
+        }
+        tags.sort(Comparator.comparingDouble(t -> t.getEntityPos().distanceTo(pPos)));
+        if (tags.size() > MOB_PATH_COST_COUNT) return tags.subList(0, MOB_PATH_COST_COUNT);
+        return tags;
+    }
+
+    /** Pick the mob with the lowest cached path_cost. Falls back to nearest by distance. */
+    private static ArmorStandEntity pickBestMobByPathCost(MinecraftClient client,
+                                                            ClientPlayerEntity player, int targetMode) {
+        List<ArmorStandEntity> tags = findAllNameTags(client, player, targetMode);
+        if (tags.isEmpty()) return null;
+
+        // If we have computed path costs, pick the one with lowest cost
+        int bestIdx = 0;
+        float bestCost = Float.MAX_VALUE;
+        for (int i = 0; i < tags.size() && i < MOB_PATH_COST_COUNT; i++) {
+            if (mobPathCosts[i] < bestCost) {
+                bestCost = mobPathCosts[i];
+                bestIdx = i;
             }
         }
-        return best;
+
+        // If all costs are 1.0 (not yet computed or all unreachable), fall back to nearest
+        if (bestCost >= 1.0f) return tags.get(0); // tags already sorted by distance
+
+        return tags.get(bestIdx);
     }
 
     /** Find the nearest non-ArmorStand LivingEntity within 5 blocks of a name tag. */
@@ -593,6 +705,47 @@ public class Pathfinder {
         }
 
         return Collections.emptyList();
+    }
+
+    /** Dijkstra from start — expands until all goals are found or MAX_NODES hit.
+     *  Returns gCosts map (contains cost to any reached position). */
+    private static Map<Long, Double> astarMultiGoal(BlockCache cache, BlockPos start,
+                                                      List<BlockPos> goals) {
+        PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(n -> n.f));
+        Map<Long, Double> gCosts = new HashMap<>();
+
+        long startKey = posKey(start);
+        Set<Long> goalKeys = new HashSet<>();
+        for (BlockPos g : goals) goalKeys.add(posKey(g));
+
+        open.add(new Node(start, 0, 0));
+        gCosts.put(startKey, 0.0);
+
+        int expanded = 0;
+        int goalsFound = 0;
+
+        while (!open.isEmpty() && expanded < MAX_NODES && goalsFound < goalKeys.size()) {
+            Node current = open.poll();
+            long curKey = posKey(current.pos);
+
+            double curG = gCosts.getOrDefault(curKey, Double.MAX_VALUE);
+            if (current.g > curG + 0.001) continue;
+
+            expanded++;
+
+            if (goalKeys.contains(curKey)) goalsFound++;
+
+            for (Neighbor nb : getNeighbors(cache, current.pos)) {
+                long nbKey = posKey(nb.pos);
+                double tentG = curG + nb.cost;
+                if (tentG < gCosts.getOrDefault(nbKey, Double.MAX_VALUE)) {
+                    gCosts.put(nbKey, tentG);
+                    open.add(new Node(nb.pos, tentG, tentG)); // no heuristic = Dijkstra
+                }
+            }
+        }
+
+        return gCosts;
     }
 
     /* ── neighbor generation ─────────────────────────────────────── */

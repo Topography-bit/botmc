@@ -35,6 +35,7 @@ public class Pathfinder {
     /* ── waypoint management ──────────────────────────────────────── */
     private static final double ADVANCE_RADIUS = 1.5;
     private static final double FINAL_RADIUS = 0.3;
+    private static final double WAYPOINT_PROGRESS_EPS_SQ = 0.05;
 
     /* ── async control ────────────────────────────────────────────── */
     private static final int RECALC_COOLDOWN = 20;
@@ -52,6 +53,7 @@ public class Pathfinder {
     private static final AtomicBoolean computing = new AtomicBoolean(false);
     private static CompletableFuture<List<BlockPos>> pendingFuture = null;
     private static BlockPos lastGoal = null;
+    private static BlockPos pendingGoal = null;
     private static LivingEntity targetMob = null;        // real mob for hitbox (can be null)
     private static ArmorStandEntity targetNameTag = null; // name tag for position
     private static int activeTargetMode = 0;
@@ -150,7 +152,7 @@ public class Pathfinder {
         ticksSinceRecalc++;
         if (recalcCooldown > 0) recalcCooldown--;
 
-        BlockPos goal = pickGoal(client, player, targetMode);
+        BlockPos goal = pickGoal(client, player, targetMode, currentMode);
 
         // Debug logging every 5 sec
         if (ticksSinceRecalc % 100 == 0) {
@@ -166,14 +168,22 @@ public class Pathfinder {
         if (pendingFuture != null && pendingFuture.isDone()) {
             try {
                 List<BlockPos> result = pendingFuture.get();
-                if (result != null && !result.isEmpty()) {
-                    currentPath = result;
-                    waypointIndex = 0;
+                currentPath = (result != null) ? result : Collections.emptyList();
+                waypointIndex = chooseWaypointIndexForPlayer(currentPath, pos);
+                if (currentPath.isEmpty()) {
+                    // Do not keep stale path when replan fails; it can point backward.
+                    lastGoal = null;
+                } else if (pendingGoal != null) {
+                    lastGoal = pendingGoal;
                 }
             } catch (Exception e) {
                 System.err.println("[Pathfinder] Async error: " + e.getMessage());
+                currentPath = Collections.emptyList();
+                waypointIndex = 0;
+                lastGoal = null;
             }
             pendingFuture = null;
+            pendingGoal = null;
             computing.set(false);
         }
 
@@ -186,6 +196,7 @@ public class Pathfinder {
             if (dist < radius) {
                 waypointIndex++;
             }
+            waypointIndex = advanceWaypointIfBehind(currentPath, waypointIndex, pos);
         }
 
         // Check if recalc needed
@@ -217,8 +228,8 @@ public class Pathfinder {
             }
 
             BlockCache cache = BlockCache.snapshotBetween(client.world, start, pathGoal);
+            pendingGoal = goal;
             startPathfinding(cache, start, pathGoal);
-            lastGoal = goal;
         }
     }
 
@@ -243,6 +254,7 @@ public class Pathfinder {
         ticksSinceRecalc = 0;
         recalcCooldown = 0;
         lastGoal = null;
+        pendingGoal = null;
         targetMob = null;
         targetNameTag = null;
         activeTargetMode = 0;
@@ -259,6 +271,7 @@ public class Pathfinder {
     public static void stop() {
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        pendingGoal = null;
         computing.set(false);
     }
 
@@ -267,43 +280,46 @@ public class Pathfinder {
      * ============================================================== */
 
     private static BlockPos pickGoal(MinecraftClient client, ClientPlayerEntity player,
-                                     int targetMode) {
+                                     int targetMode, int currentMode) {
         if (client.world == null) return null;
         Vec3d pPos = player.getEntityPos();
+        boolean farmMode = (targetMode != 0 && currentMode == targetMode);
 
-        // Step 1: Find nearest ArmorStand name tag with matching name
-        ArmorStandEntity bestTag = findNearestNameTag(client, player, targetMode);
+        if (farmMode) {
+            // Step 1: Find nearest ArmorStand name tag with matching name
+            ArmorStandEntity bestTag = findNearestNameTag(client, player, targetMode);
 
-        if (bestTag != null) {
-            targetNameTag = bestTag;
-            Vec3d tagPos = bestTag.getEntityPos();
+            if (bestTag != null) {
+                targetNameTag = bestTag;
+                Vec3d tagPos = bestTag.getEntityPos();
 
-            // Try to find real mob near the name tag for hitbox rendering
-            targetMob = findRealMobNear(client, player, bestTag);
+                // Try to find real mob near the name tag for hitbox rendering
+                targetMob = findRealMobNear(client, player, bestTag);
 
-            // Use tag position for navigation (it's directly above the mob)
-            BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
+                // Use tag position for navigation (it's directly above the mob)
+                BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
 
-            // Find standable goal near the mob, offset toward player
-            Vec3d toPlayer = pPos.subtract(tagPos);
-            double hDist = Math.sqrt(toPlayer.x * toPlayer.x + toPlayer.z * toPlayer.z);
+                // Find standable goal near the mob, offset toward player
+                Vec3d toPlayer = pPos.subtract(tagPos);
+                double hDist = Math.sqrt(toPlayer.x * toPlayer.x + toPlayer.z * toPlayer.z);
 
-            if (hDist > 0.1) {
-                for (double dist = ATTACK_STANDOFF; dist >= 0; dist -= 0.5) {
-                    Vec3d offset = new Vec3d(toPlayer.x / hDist * dist, 0,
-                                             toPlayer.z / hDist * dist);
-                    Vec3d goal = tagPos.add(offset);
-                    BlockPos gb = BlockPos.ofFloored(goal.x, goal.y, goal.z);
-                    // Try current Y, Y-1, Y-2 (name tag floats above mob)
-                    for (int dy = 0; dy >= -3; dy--) {
-                        if (isStandableWorld(client.world, gb.getX(), gb.getY() + dy, gb.getZ())) {
-                            return new BlockPos(gb.getX(), gb.getY() + dy, gb.getZ());
+                if (hDist > 0.1) {
+                    for (double dist = ATTACK_STANDOFF; dist >= 0; dist -= 0.5) {
+                        Vec3d offset = new Vec3d(toPlayer.x / hDist * dist, 0,
+                                                 toPlayer.z / hDist * dist);
+                        Vec3d goal = tagPos.add(offset);
+                        BlockPos gb = BlockPos.ofFloored(goal.x, goal.y, goal.z);
+                        // Try current Y, Y-1, Y-2 (name tag floats above mob)
+                        for (int dy = 0; dy >= -3; dy--) {
+                            if (isStandableWorld(client.world, gb.getX(), gb.getY() + dy, gb.getZ())) {
+                                return new BlockPos(gb.getX(), gb.getY() + dy, gb.getZ());
+                            }
                         }
                     }
                 }
+                // Fallback: find any standable position near the tag
+                return findNearestStandable(client.world, mobBlock);
             }
-            // Fallback: find any standable position near the tag
-            return findNearestStandable(client.world, mobBlock);
         }
 
         targetMob = null;
@@ -616,7 +632,7 @@ public class Pathfinder {
 
     /* ── path smoothing — conservative, max 6 node skip ────────── */
 
-    private static final int MAX_SMOOTH_SKIP = 6;
+    private static final int MAX_SMOOTH_SKIP = 3;
 
     private static List<BlockPos> smoothPath(BlockCache cache, List<BlockPos> raw) {
         if (raw == null || raw.size() <= 2) return raw;
@@ -667,7 +683,7 @@ public class Pathfinder {
 
         int y = from.getY();
         // Check every block along the line, not just every step
-        int checks = Math.max(dist * 2, 4); // 2 checks per block for precision
+        int checks = Math.max(dist * 3, 6); // denser sampling to avoid corner clipping
 
         for (double[] off : offsets) {
             for (int s = 1; s <= checks; s++) {
@@ -675,12 +691,8 @@ public class Pathfinder {
                 int cx = (int) Math.floor(from.getX() + 0.5 + dx * t + off[0]);
                 int cz = (int) Math.floor(from.getZ() + 0.5 + dz * t + off[1]);
 
-                // Feet + head must be passable
-                if (!cache.isPassable(cx, y, cz) || !cache.isPassable(cx, y + 1, cz)) {
-                    return false;
-                }
-                // Must have ground below (within 2 blocks)
-                if (!cache.isSolid(cx, y - 1, cz) && !cache.isSolid(cx, y - 2, cz)) {
+                // Keep smoothing only on truly walkable cells, not just passable rays.
+                if (!cache.isStandable(cx, y, cz)) {
                     return false;
                 }
             }
@@ -695,6 +707,61 @@ public class Pathfinder {
         double dy = a.getY() - b.getY();
         double dz = a.getZ() - b.getZ();
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /**
+     * If the next waypoint is already closer than the current one, skip ahead.
+     * Prevents "pull back" behavior when the bot passes a waypoint from the side.
+     */
+    private static int advanceWaypointIfBehind(List<BlockPos> path, int index, Vec3d playerPos) {
+        int idx = index;
+        while (idx >= 0 && idx + 1 < path.size()) {
+            Vec3d cur = Vec3d.ofCenter(path.get(idx));
+            Vec3d next = Vec3d.ofCenter(path.get(idx + 1));
+            double curDistSq = cur.squaredDistanceTo(playerPos);
+            double nextDistSq = next.squaredDistanceTo(playerPos);
+            if (nextDistSq + WAYPOINT_PROGRESS_EPS_SQ < curDistSq) {
+                idx++;
+            } else {
+                break;
+            }
+        }
+        return idx;
+    }
+
+    /**
+     * Async path is built from an older start position.
+     * Pick the waypoint nearest to the CURRENT player position
+     * so we do not backtrack to path[0] when the player has already moved.
+     */
+    private static int chooseWaypointIndexForPlayer(List<BlockPos> path, Vec3d playerPos) {
+        if (path == null || path.isEmpty()) return 0;
+
+        int bestIndex = 0;
+        double bestDistSq = Double.MAX_VALUE;
+        for (int i = 0; i < path.size(); i++) {
+            double dSq = Vec3d.ofCenter(path.get(i)).squaredDistanceTo(playerPos);
+            if (dSq < bestDistSq) {
+                bestDistSq = dSq;
+                bestIndex = i;
+            }
+        }
+
+        // If player is already progressing along best->next segment, advance one step.
+        if (bestIndex < path.size() - 1) {
+            Vec3d a = Vec3d.ofCenter(path.get(bestIndex));
+            Vec3d b = Vec3d.ofCenter(path.get(bestIndex + 1));
+            Vec3d ab = b.subtract(a);
+            double lenSq = ab.lengthSquared();
+            if (lenSq > 1.0e-6) {
+                double t = playerPos.subtract(a).dotProduct(ab) / lenSq;
+                if (t > 0.35) {
+                    bestIndex++;
+                }
+            }
+        }
+
+        return bestIndex;
     }
 
     private static long posKey(BlockPos p) {

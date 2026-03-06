@@ -30,6 +30,7 @@ public class Pathfinder {
     private static final int MAX_NODES = 10_000;
     private static final int MAX_FALL = 40;
     private static final int CACHE_RADIUS = 80;
+    private static final double MAX_PATHFIND_DIST = 50.0; // intermediate goal distance
 
     /* ── waypoint management ──────────────────────────────────────── */
     private static final double ADVANCE_RADIUS = 1.5;
@@ -42,7 +43,6 @@ public class Pathfinder {
 
     /* ── mob targeting ────────────────────────────────────────────── */
     private static final double ATTACK_STANDOFF = 1.75;
-    private static final double WALL_PADDING = 0.25;
 
     /* ── state ────────────────────────────────────────────────────── */
     private static List<BlockPos> currentPath = Collections.emptyList();
@@ -52,7 +52,8 @@ public class Pathfinder {
     private static final AtomicBoolean computing = new AtomicBoolean(false);
     private static CompletableFuture<List<BlockPos>> pendingFuture = null;
     private static BlockPos lastGoal = null;
-    private static LivingEntity targetMob = null;
+    private static LivingEntity targetMob = null;        // real mob for hitbox (can be null)
+    private static ArmorStandEntity targetNameTag = null; // name tag for position
     private static int activeTargetMode = 0;
 
     /* ================================================================
@@ -151,6 +152,16 @@ public class Pathfinder {
 
         BlockPos goal = pickGoal(client, player, targetMode);
 
+        // Debug logging every 5 sec
+        if (ticksSinceRecalc % 100 == 0) {
+            System.out.printf("[Pathfinder] mode=%d goal=%s targetMob=%s nameTag=%s path=%d wp=%d%n",
+                targetMode,
+                goal != null ? goal.toShortString() : "null",
+                targetMob != null ? targetMob.getType().getTranslationKey() : "null",
+                targetNameTag != null ? getMobName(targetNameTag) : "null",
+                currentPath.size(), waypointIndex);
+        }
+
         // Check pending async result
         if (pendingFuture != null && pendingFuture.isDone()) {
             try {
@@ -190,9 +201,23 @@ public class Pathfinder {
 
         if (needRecalc && recalcCooldown <= 0 && !computing.get() && goal != null) {
             BlockPos start = findStandableStart(client.world, player.getBlockPos());
-            // Snapshot block data on MAIN THREAD before going async
-            BlockCache cache = BlockCache.snapshotBetween(client.world, start, goal);
-            startPathfinding(cache, start, goal);
+
+            // For distant goals, create intermediate goal in the right direction
+            BlockPos pathGoal = goal;
+            double distToGoal = Math.sqrt(
+                Math.pow(goal.getX() - start.getX(), 2) +
+                Math.pow(goal.getY() - start.getY(), 2) +
+                Math.pow(goal.getZ() - start.getZ(), 2));
+            if (distToGoal > MAX_PATHFIND_DIST) {
+                double ratio = MAX_PATHFIND_DIST / distToGoal;
+                int ix = start.getX() + (int) ((goal.getX() - start.getX()) * ratio);
+                int iy = start.getY() + (int) ((goal.getY() - start.getY()) * ratio);
+                int iz = start.getZ() + (int) ((goal.getZ() - start.getZ()) * ratio);
+                pathGoal = findNearestStandable(client.world, new BlockPos(ix, iy, iz));
+            }
+
+            BlockCache cache = BlockCache.snapshotBetween(client.world, start, pathGoal);
+            startPathfinding(cache, start, pathGoal);
             lastGoal = goal;
         }
     }
@@ -219,6 +244,7 @@ public class Pathfinder {
         recalcCooldown = 0;
         lastGoal = null;
         targetMob = null;
+        targetNameTag = null;
         activeTargetMode = 0;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
@@ -242,40 +268,90 @@ public class Pathfinder {
 
     private static BlockPos pickGoal(MinecraftClient client, ClientPlayerEntity player,
                                      int targetMode) {
-        LivingEntity nearest = getNearestTargetMob(client, player, targetMode);
-        if (nearest != null) {
-            targetMob = nearest;
-            // Use bounding box center, not feet position
-            Vec3d mobCenter = nearest.getBoundingBox().getCenter();
-            // Offset goal toward player so bot stops at attack range, not inside the mob
-            Vec3d playerPos = player.getEntityPos();
-            Vec3d toPlayer = playerPos.subtract(mobCenter);
+        if (client.world == null) return null;
+        Vec3d pPos = player.getEntityPos();
+
+        // Step 1: Find nearest ArmorStand name tag with matching name
+        ArmorStandEntity bestTag = findNearestNameTag(client, player, targetMode);
+
+        if (bestTag != null) {
+            targetNameTag = bestTag;
+            Vec3d tagPos = bestTag.getEntityPos();
+
+            // Try to find real mob near the name tag for hitbox rendering
+            targetMob = findRealMobNear(client, player, bestTag);
+
+            // Use tag position for navigation (it's directly above the mob)
+            BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
+
+            // Find standable goal near the mob, offset toward player
+            Vec3d toPlayer = pPos.subtract(tagPos);
             double hDist = Math.sqrt(toPlayer.x * toPlayer.x + toPlayer.z * toPlayer.z);
+
             if (hDist > 0.1) {
-                Vec3d offset = new Vec3d(toPlayer.x / hDist * ATTACK_STANDOFF, 0,
-                                         toPlayer.z / hDist * ATTACK_STANDOFF);
-                Vec3d goal = mobCenter.add(offset);
-                return BlockPos.ofFloored(goal.x, mobCenter.y, goal.z);
+                for (double dist = ATTACK_STANDOFF; dist >= 0; dist -= 0.5) {
+                    Vec3d offset = new Vec3d(toPlayer.x / hDist * dist, 0,
+                                             toPlayer.z / hDist * dist);
+                    Vec3d goal = tagPos.add(offset);
+                    BlockPos gb = BlockPos.ofFloored(goal.x, goal.y, goal.z);
+                    // Try current Y, Y-1, Y-2 (name tag floats above mob)
+                    for (int dy = 0; dy >= -3; dy--) {
+                        if (isStandableWorld(client.world, gb.getX(), gb.getY() + dy, gb.getZ())) {
+                            return new BlockPos(gb.getX(), gb.getY() + dy, gb.getZ());
+                        }
+                    }
+                }
             }
-            return BlockPos.ofFloored(mobCenter.x, mobCenter.y, mobCenter.z);
+            // Fallback: find any standable position near the tag
+            return findNearestStandable(client.world, mobBlock);
         }
+
         targetMob = null;
+        targetNameTag = null;
         if (targetMode == 1) return DRAGONS_NEST;
         if (targetMode == 2) return BRUISER_HIDEOUT;
         return null;
     }
 
+    /** Find the nearest standable block within a small radius. */
+    private static BlockPos findNearestStandable(ClientWorld world, BlockPos center) {
+        // Search downward first (name tags float above mobs)
+        for (int dy = 0; dy >= -5; dy--) {
+            if (isStandableWorld(world, center.getX(), center.getY() + dy, center.getZ())) {
+                return new BlockPos(center.getX(), center.getY() + dy, center.getZ());
+            }
+        }
+        double bestDist = Double.MAX_VALUE;
+        BlockPos best = center;
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int dy = -5; dy <= 2; dy++) {
+                    int x = center.getX() + dx, y = center.getY() + dy, z = center.getZ() + dz;
+                    if (isStandableWorld(world, x, y, z)) {
+                        double d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                        if (d < bestDist) {
+                            bestDist = d;
+                            best = new BlockPos(x, y, z);
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
     /* ================================================================
-     *  MOB TARGETING — strict mode filtering with § stripping
+     *  MOB TARGETING — find ArmorStand name tags, then pair with real mob
      * ============================================================== */
 
-    private static LivingEntity getNearestTargetMob(MinecraftClient client,
-                                                     ClientPlayerEntity player, int targetMode) {
+    /** Find nearest ArmorStand name tag with matching mob name. */
+    private static ArmorStandEntity findNearestNameTag(MinecraftClient client,
+                                                        ClientPlayerEntity player, int targetMode) {
         if (client.world == null || targetMode == 0) return null;
         Vec3d pPos = player.getEntityPos();
+        ArmorStandEntity best = null;
+        double bestDist = Double.MAX_VALUE;
 
-        // Step 1: Find ArmorStand name tags with matching names
-        List<ArmorStandEntity> nameTags = new ArrayList<>();
         for (LivingEntity e : client.world.getEntitiesByClass(
                 LivingEntity.class, player.getBoundingBox().expand(50),
                 ent -> ent instanceof ArmorStandEntity)) {
@@ -284,36 +360,28 @@ public class Pathfinder {
             boolean match = false;
             if (targetMode == 1) match = name.contains("Zealot") && !name.contains("Bruiser");
             if (targetMode == 2) match = name.contains("Bruiser");
-            if (match) nameTags.add((ArmorStandEntity) e);
-        }
-
-        // Step 2: For each name tag, find the nearest real mob within 4 blocks
-        LivingEntity best = null;
-        double bestDist = Double.MAX_VALUE;
-
-        for (ArmorStandEntity tag : nameTags) {
-            LivingEntity mob = findRealMobNear(client, player, tag);
-            if (mob != null) {
-                double d = mob.getEntityPos().distanceTo(pPos);
+            if (match) {
+                double d = e.getEntityPos().distanceTo(pPos);
                 if (d < bestDist) {
                     bestDist = d;
-                    best = mob;
+                    best = (ArmorStandEntity) e;
                 }
             }
         }
         return best;
     }
 
-    /** Find the nearest non-ArmorStand, non-Player LivingEntity within 4 blocks of a name tag. */
+    /** Find the nearest non-ArmorStand LivingEntity within 5 blocks of a name tag. */
     private static LivingEntity findRealMobNear(MinecraftClient client,
                                                   ClientPlayerEntity player,
                                                   ArmorStandEntity nameTag) {
+        if (client.world == null) return null;
         LivingEntity closest = null;
-        double closestDist = 4.0;
+        double closestDist = 5.0;
         Vec3d tagPos = nameTag.getEntityPos();
 
         for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, nameTag.getBoundingBox().expand(4),
+                LivingEntity.class, nameTag.getBoundingBox().expand(5),
                 ent -> !(ent instanceof ArmorStandEntity)
                     && !(ent instanceof PlayerEntity)
                     && ent != player)) {
@@ -546,7 +614,9 @@ public class Pathfinder {
         return neighbors;
     }
 
-    /* ── path smoothing (Theta*-style line-of-sight skip) ────────── */
+    /* ── path smoothing — conservative, max 6 node skip ────────── */
+
+    private static final int MAX_SMOOTH_SKIP = 6;
 
     private static List<BlockPos> smoothPath(BlockCache cache, List<BlockPos> raw) {
         if (raw == null || raw.size() <= 2) return raw;
@@ -557,7 +627,9 @@ public class Pathfinder {
         int i = 0;
         while (i < raw.size() - 1) {
             int furthest = i + 1;
-            for (int j = raw.size() - 1; j > i + 1; j--) {
+            // Only try skipping up to MAX_SMOOTH_SKIP nodes ahead
+            int maxJ = Math.min(raw.size() - 1, i + MAX_SMOOTH_SKIP);
+            for (int j = maxJ; j > i + 1; j--) {
                 if (hasLineOfSight(cache, raw.get(i), raw.get(j))) {
                     furthest = j;
                     break;
@@ -567,63 +639,50 @@ public class Pathfinder {
             i = furthest;
         }
 
-        // Wall-hugging prevention: nudge corner waypoints away from adjacent walls
-        for (int w = 1; w < smooth.size() - 1; w++) {
-            BlockPos wp = smooth.get(w);
-            int wx = wp.getX(), wy = wp.getY(), wz = wp.getZ();
-            double nudgeX = 0, nudgeZ = 0;
-            if (cache.isSolid(wx + 1, wy, wz)) nudgeX -= WALL_PADDING;
-            if (cache.isSolid(wx - 1, wy, wz)) nudgeX += WALL_PADDING;
-            if (cache.isSolid(wx, wy, wz + 1)) nudgeZ -= WALL_PADDING;
-            if (cache.isSolid(wx, wy, wz - 1)) nudgeZ += WALL_PADDING;
-            if (nudgeX != 0 || nudgeZ != 0) {
-                BlockPos nudged = BlockPos.ofFloored(wx + 0.5 + nudgeX, wy, wz + 0.5 + nudgeZ);
-                if (cache.isPassable(nudged.getX(), nudged.getY(), nudged.getZ())
-                    && cache.isPassable(nudged.getX(), nudged.getY() + 1, nudged.getZ())) {
-                    smooth.set(w, nudged);
-                }
-            }
-        }
-
         return smooth;
     }
 
-    /** Check if the full player hitbox (0.6 wide) can WALK in a straight line.
-     *  Checks passability AND ground below (no smoothing over chasms). */
+    /** Check if the full player hitbox can WALK in a straight line.
+     *  Checks: passability, wall clearance (5 rays), ground below, same Y level. */
     private static boolean hasLineOfSight(BlockCache cache, BlockPos from, BlockPos to) {
         int dx = to.getX() - from.getX();
         int dz = to.getZ() - from.getZ();
-        int steps = Math.max(Math.abs(dx), Math.abs(dz));
-        if (steps == 0) return true;
-        if (Math.abs(to.getY() - from.getY()) > 1) return false;
+        int dist = Math.max(Math.abs(dx), Math.abs(dz));
+        if (dist == 0) return true;
+        // No smoothing across Y changes — let A* handle elevation
+        if (from.getY() != to.getY()) return false;
 
-        // Perpendicular offset direction (normalized)
         double len = Math.sqrt(dx * dx + dz * dz);
         double perpX = -dz / len;
         double perpZ =  dx / len;
 
-        // 3 rays: center, left (-0.3), right (+0.3) — player half-width
-        double[][] offsets = {{0, 0}, {perpX * 0.3, perpZ * 0.3}, {-perpX * 0.3, -perpZ * 0.3}};
+        // 5 rays: center + 4 offsets (player hitbox ~0.6 wide)
+        double[][] offsets = {
+            {0, 0},
+            { perpX * 0.35,  perpZ * 0.35},
+            {-perpX * 0.35, -perpZ * 0.35},
+            { dx / len * 0.35,  dz / len * 0.35},  // forward
+            {-dx / len * 0.35, -dz / len * 0.35},  // backward
+        };
+
+        int y = from.getY();
+        // Check every block along the line, not just every step
+        int checks = Math.max(dist * 2, 4); // 2 checks per block for precision
 
         for (double[] off : offsets) {
-            for (int s = 1; s < steps; s++) {
-                float t = (float) s / steps;
+            for (int s = 1; s <= checks; s++) {
+                float t = (float) s / checks;
                 int cx = (int) Math.floor(from.getX() + 0.5 + dx * t + off[0]);
                 int cz = (int) Math.floor(from.getZ() + 0.5 + dz * t + off[1]);
-                int cy = from.getY() + Math.round((to.getY() - from.getY()) * t);
-                // Check passability (feet + head)
-                if (!cache.isPassable(cx, cy, cz) || !cache.isPassable(cx, cy + 1, cz)) {
+
+                // Feet + head must be passable
+                if (!cache.isPassable(cx, y, cz) || !cache.isPassable(cx, y + 1, cz)) {
                     return false;
                 }
-                // Check ground exists within 3 blocks below — prevents smoothing over chasms
-                boolean hasGround = false;
-                for (int drop = 0; drop <= 3; drop++) {
-                    if (cache.isSolid(cx, cy - 1 - drop, cz)) {
-                        hasGround = true;
-                        break;
-                    }
+                // Must have ground below (within 2 blocks)
+                if (!cache.isSolid(cx, y - 1, cz) && !cache.isSolid(cx, y - 2, cz)) {
+                    return false;
                 }
-                if (!hasGround) return false;
             }
         }
         return true;

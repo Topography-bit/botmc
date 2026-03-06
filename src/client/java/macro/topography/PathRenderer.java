@@ -51,7 +51,7 @@ public class PathRenderer {
         matrices.pop();
     }
 
-    /* ── Thick visible path lines using small filled box segments ── */
+    /* ── Path lines — L-shaped for elevation changes ── */
     private static void renderPathLines(MatrixStack matrices, VertexConsumerProvider consumers,
                                          List<BlockPos> path, int wpIndex) {
         float thickness = 0.06f;
@@ -60,42 +60,29 @@ public class PathRenderer {
             BlockPos a = path.get(i);
             BlockPos b = path.get(i + 1);
 
-            float ax = a.getX() + 0.5f, ay = a.getY() + 0.15f, az = a.getZ() + 0.5f;
-            float bx = b.getX() + 0.5f, by = b.getY() + 0.15f, bz = b.getZ() + 0.5f;
-
             float r, g, bl, alpha;
             if (i < wpIndex) {
-                // Passed segments — dim teal
                 r = 0.15f; g = 0.45f; bl = 0.5f; alpha = 0.4f;
             } else {
-                // Active/upcoming — bright cyan
                 r = 0f; g = 1f; bl = 1f; alpha = 0.85f;
             }
 
-            // Interpolate small filled boxes along the segment for "thick line" effect
-            float dx = bx - ax, dy = by - ay, dz = bz - az;
-            float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (len < 0.01f) continue;
+            // Build segment points: if Y differs, split into L-shape
+            // (horizontal at start Y → vertical drop/climb → arrive at B)
+            float ax = a.getX() + 0.5f, ay = a.getY() + 0.15f, az = a.getZ() + 0.5f;
+            float bx = b.getX() + 0.5f, by = b.getY() + 0.15f, bz = b.getZ() + 0.5f;
 
-            float step = 0.5f; // one box every 0.5 blocks
-            int segments = Math.max(1, (int) (len / step));
-
-            for (int s = 0; s <= segments; s++) {
-                float t = (float) s / segments;
-                float cx = ax + dx * t;
-                float cy = ay + dy * t;
-                float cz = az + dz * t;
-
-                VertexRendering.drawFilledBox(
-                    matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
-                    cx - thickness, cy - thickness, cz - thickness,
-                    cx + thickness, cy + thickness, cz + thickness,
-                    r, g, bl, alpha
-                );
+            if (a.getY() != b.getY()) {
+                // L-shape: horizontal to B's XZ at A's Y, then vertical to B's Y
+                float midX = bx, midY = ay, midZ = bz;
+                drawThickLine(matrices, consumers, ax, ay, az, midX, midY, midZ, thickness, r, g, bl, alpha);
+                drawThickLine(matrices, consumers, midX, midY, midZ, bx, by, bz, thickness, r, g, bl, alpha);
+            } else {
+                drawThickLine(matrices, consumers, ax, ay, az, bx, by, bz, thickness, r, g, bl, alpha);
             }
         }
 
-        // Also draw thin RenderLayer lines for connectivity
+        // Thin RenderLayer lines for connectivity (also L-shaped)
         VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
         for (int i = 0; i < path.size() - 1; i++) {
             BlockPos a = path.get(i);
@@ -111,26 +98,60 @@ public class PathRenderer {
                 r = 0; g = 255; bl = 255; alpha = 255;
             }
 
-            float dx = bx - ax, dy = by - ay, dz = bz - az;
-            float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (len < 0.001f) continue;
-            float nx = dx / len, ny = dy / len, nz = dz / len;
-
-            lines.vertex(matrices.peek(), ax, ay, az)
-                 .color(r, g, bl, alpha)
-                 .normal(matrices.peek(), nx, ny, nz);
-            lines.vertex(matrices.peek(), bx, by, bz)
-                 .color(r, g, bl, alpha)
-                 .normal(matrices.peek(), nx, ny, nz);
+            if (a.getY() != b.getY()) {
+                float midX = bx, midY = ay, midZ = bz;
+                drawLine(lines, matrices, ax, ay, az, midX, midY, midZ, r, g, bl, alpha);
+                drawLine(lines, matrices, midX, midY, midZ, bx, by, bz, r, g, bl, alpha);
+            } else {
+                drawLine(lines, matrices, ax, ay, az, bx, by, bz, r, g, bl, alpha);
+            }
         }
     }
 
-    /* ── Key waypoint markers every 3-8 blocks based on direction changes ── */
+    private static void drawThickLine(MatrixStack matrices, VertexConsumerProvider consumers,
+                                        float ax, float ay, float az,
+                                        float bx, float by, float bz,
+                                        float thickness, float r, float g, float bl, float alpha) {
+        float dx = bx - ax, dy = by - ay, dz = bz - az;
+        float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 0.01f) return;
+
+        int segments = Math.max(1, (int) (len / 0.5f));
+        for (int s = 0; s <= segments; s++) {
+            float t = (float) s / segments;
+            float cx = ax + dx * t;
+            float cy = ay + dy * t;
+            float cz = az + dz * t;
+            VertexRendering.drawFilledBox(
+                matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
+                cx - thickness, cy - thickness, cz - thickness,
+                cx + thickness, cy + thickness, cz + thickness,
+                r, g, bl, alpha
+            );
+        }
+    }
+
+    private static void drawLine(VertexConsumer lines, MatrixStack matrices,
+                                   float ax, float ay, float az,
+                                   float bx, float by, float bz,
+                                   int r, int g, int bl, int alpha) {
+        float dx = bx - ax, dy = by - ay, dz = bz - az;
+        float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 0.001f) return;
+        float nx = dx / len, ny = dy / len, nz = dz / len;
+        lines.vertex(matrices.peek(), ax, ay, az)
+             .color(r, g, bl, alpha)
+             .normal(matrices.peek(), nx, ny, nz);
+        lines.vertex(matrices.peek(), bx, by, bz)
+             .color(r, g, bl, alpha)
+             .normal(matrices.peek(), nx, ny, nz);
+    }
+
+    /* ── Key waypoint markers every 3-8 blocks ── */
     private static void renderKeyWaypoints(MatrixStack matrices, VertexConsumerProvider consumers,
                                             List<BlockPos> path, int wpIndex, float pulse) {
-        // Build list of key waypoints: first, last, direction changes, and spaced markers
         List<Integer> keyIndices = new ArrayList<>();
-        keyIndices.add(0); // start
+        keyIndices.add(0);
 
         float accumDist = 0;
         for (int i = 1; i < path.size(); i++) {
@@ -145,7 +166,6 @@ public class PathRenderer {
             boolean isLast = (i == path.size() - 1);
             boolean dirChange = false;
 
-            // Check direction change at this point
             if (i < path.size() - 1) {
                 BlockPos next = path.get(i + 1);
                 float dx2 = next.getX() - cur.getX();
@@ -155,22 +175,21 @@ public class PathRenderer {
                 float len2 = (float) Math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2);
                 if (len1 > 0.01f && len2 > 0.01f) {
                     float dot = (dx * dx2 + dy * dy2 + dz * dz2) / (len1 * len2);
-                    // dot < 0.85 means > ~30 degree turn
                     if (dot < 0.85f) dirChange = true;
                 }
             }
 
-            // At direction changes: mark if at least 3 blocks from last key
-            // On straight paths: mark every 8 blocks
+            // Also mark elevation changes as direction changes
+            if (Math.abs(cur.getY() - prev.getY()) >= 2) dirChange = true;
+
             float minDist = dirChange ? 3.0f : 8.0f;
 
-            if (isLast || (accumDist >= minDist)) {
+            if (isLast || accumDist >= minDist) {
                 keyIndices.add(i);
                 accumDist = 0;
             }
         }
 
-        // Render each key waypoint
         for (int idx : keyIndices) {
             BlockPos wp = path.get(idx);
             float cx = wp.getX() + 0.5f;
@@ -178,7 +197,6 @@ public class PathRenderer {
             float cz = wp.getZ() + 0.5f;
 
             if (idx == wpIndex) {
-                // Current waypoint — larger pulsing cyan marker
                 float size = 0.25f + 0.1f * pulse;
                 VertexRendering.drawFilledBox(
                     matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
@@ -187,7 +205,6 @@ public class PathRenderer {
                     0f, 1f, 1f, pulse * 0.9f
                 );
             } else if (idx == path.size() - 1) {
-                // Final destination — golden marker (only if no mob target)
                 if (Pathfinder.getTargetMob() == null) {
                     VertexRendering.drawFilledBox(
                         matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
@@ -197,7 +214,6 @@ public class PathRenderer {
                     );
                 }
             } else if (idx >= wpIndex) {
-                // Upcoming key waypoint — medium cyan diamond
                 float s = 0.18f;
                 VertexRendering.drawFilledBox(
                     matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
@@ -206,7 +222,6 @@ public class PathRenderer {
                     0.05f, 0.9f, 1f, 0.75f
                 );
             }
-            // Skip passed waypoints — no marker
         }
     }
 
@@ -228,13 +243,11 @@ public class PathRenderer {
         );
     }
 
-    /* ── Target mob hitbox highlight — excludes ArmorStands ── */
+    /* ── Target mob hitbox — excludes ArmorStands ── */
     private static void renderTargetMobHitbox(MatrixStack matrices, VertexConsumerProvider consumers,
                                                 float pulse) {
         LivingEntity targetMob = Pathfinder.getTargetMob();
         if (targetMob == null || !targetMob.isAlive()) return;
-
-        // Skip ArmorStands (holograms, portal labels, etc.)
         if (targetMob instanceof ArmorStandEntity) return;
 
         net.minecraft.util.math.Box box = targetMob.getBoundingBox();
@@ -245,13 +258,11 @@ public class PathRenderer {
         float maxY = (float) box.maxY;
         float maxZ = (float) box.maxZ;
 
-        // Bright pulsing red-magenta outline
         VertexRendering.drawBox(
             matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
             minX, minY, minZ, maxX, maxY, maxZ,
             1f, 0.2f, 0.6f, pulse
         );
-        // Semi-transparent fill
         VertexRendering.drawFilledBox(
             matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
             minX, minY, minZ, maxX, maxY, maxZ,

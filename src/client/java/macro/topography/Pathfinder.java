@@ -13,7 +13,6 @@ import net.minecraft.world.chunk.WorldChunk;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -38,6 +37,9 @@ public class Pathfinder {
     private static final float WALL_REPLAN_THRESH = 0.08f;
     private static final float VERTICAL_REPLAN_THRESH = 0.15f;
     private static final float POS_ANOMALY_RESET_THRESH = 0.15f;
+    private static final long SNAPSHOT_REUSE_MS = 650L;
+    private static final int SNAPSHOT_COVER_MARGIN = 8;
+    private static final double HEURISTIC_WEIGHT = 1.22;
 
     /* ── waypoint management ──────────────────────────────────────── */
     private static final double ADVANCE_RADIUS = 1.5;
@@ -54,6 +56,8 @@ public class Pathfinder {
     /* ── mob targeting ────────────────────────────────────────────── */
     private static final double ATTACK_STANDOFF = 1.75;
     private static final double PATH_COST_MAX = 100.0; // normalize path costs to [0,1]
+    private static final float TARGET_SWITCH_COST_THRESHOLD = 0.72f;
+    private static final long TARGET_SWITCH_DELAY_MS = 200L;
     public static final int MOB_PATH_COST_COUNT = 5;
 
     /* ── state ────────────────────────────────────────────────────── */
@@ -67,6 +71,8 @@ public class Pathfinder {
     private static BlockPos pendingGoal = null;
     private static LivingEntity targetMob = null;        // real mob for hitbox (can be null)
     private static ArmorStandEntity targetNameTag = null; // name tag for position
+    private static final Set<UUID> seenNameTagIds = new HashSet<>();
+    private static long lastNewNameTagMs = 0L;
     private static int activeTargetMode = 0;
     private static float lastDistToWall = 1f;
     private static float lastVerticalClearance = 1f;
@@ -79,8 +85,22 @@ public class Pathfinder {
     private static List<BlockPos> mobGoals = Collections.emptyList(); // standable goals for up to 5 mobs
     private static List<LivingEntity> targetMobs = Collections.emptyList(); // real mobs for hitbox
     private static int mobCostTicks = 0;
-    private static final int MOB_COST_INTERVAL = 40; // recalc every 2 sec
+    private static final int MOB_COST_INTERVAL = 20; // recalc every 1 sec
     private static CompletableFuture<MobCostResult> pendingMobCosts = null;
+    private static final Object snapshotLock = new Object();
+    private static CachedSnapshot cachedSnapshot = null;
+
+    private static class CachedSnapshot {
+        final ClientWorld world;
+        final BlockCache cache;
+        final long createdAtMs;
+
+        CachedSnapshot(ClientWorld world, BlockCache cache, long createdAtMs) {
+            this.world = world;
+            this.cache = cache;
+            this.createdAtMs = createdAtMs;
+        }
+    }
 
     private static class MobCostResult {
         final float[] costs;
@@ -99,9 +119,46 @@ public class Pathfinder {
      * ============================================================== */
 
     private static class BlockCache {
-        private final Map<Long, Boolean> solidMap = new ConcurrentHashMap<>();
+        private final int minX;
+        private final int maxX;
+        private final int minY;
+        private final int maxY;
+        private final int minZ;
+        private final int maxZ;
+        private final int sizeY;
+        private final int sizeZ;
+        private final BitSet solidBits;
+        private final boolean empty;
 
-        /** Build cache in worker thread by scanning loaded chunks in target area. */
+        private BlockCache(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
+            this.minX = minX;
+            this.maxX = maxX;
+            this.minY = minY;
+            this.maxY = maxY;
+            this.minZ = minZ;
+            this.maxZ = maxZ;
+
+            int sx = maxX - minX + 1;
+            int sy = maxY - minY + 1;
+            int sz = maxZ - minZ + 1;
+            if (sx <= 0 || sy <= 0 || sz <= 0) {
+                this.empty = true;
+                this.sizeY = 0;
+                this.sizeZ = 0;
+                this.solidBits = new BitSet();
+            } else {
+                this.empty = false;
+                this.sizeY = sy;
+                this.sizeZ = sz;
+                this.solidBits = new BitSet(sx * sy * sz);
+            }
+        }
+
+        static BlockCache empty() {
+            return new BlockCache(0, -1, 0, -1, 0, -1);
+        }
+
+        /** Build cache by scanning loaded chunks in target area. */
         static BlockCache snapshotBetweenChunks(ClientWorld world, BlockPos start, BlockPos goal) {
             int minX = Math.min(start.getX(), goal.getX()) - 10;
             int maxX = Math.max(start.getX(), goal.getX()) + 10;
@@ -119,7 +176,9 @@ public class Pathfinder {
                 maxY = start.getY() + 20;
             }
 
-            BlockCache cache = new BlockCache();
+            BlockCache cache = new BlockCache(minX, maxX, minY, maxY, minZ, maxZ);
+            if (cache.empty) return cache;
+
             BlockPos.Mutable mutable = new BlockPos.Mutable();
             int minChunkX = Math.floorDiv(minX, 16);
             int maxChunkX = Math.floorDiv(maxX, 16);
@@ -148,9 +207,9 @@ public class Pathfinder {
                                 try {
                                     BlockState state = chunk.getBlockState(mutable);
                                     boolean solid = !state.getCollisionShape(world, mutable).isEmpty();
-                                    cache.solidMap.put(packPos(x, y, z), solid);
+                                    cache.setSolid(x, y, z, solid);
                                 } catch (Exception e) {
-                                    cache.solidMap.put(packPos(x, y, z), false);
+                                    // Unknown states are treated as passable.
                                 }
                             }
                         }
@@ -161,9 +220,23 @@ public class Pathfinder {
             return cache;
         }
 
+        boolean covers(BlockPos start, BlockPos goal, int margin) {
+            if (empty) return false;
+            int reqMinX = Math.min(start.getX(), goal.getX()) - margin;
+            int reqMaxX = Math.max(start.getX(), goal.getX()) + margin;
+            int reqMinZ = Math.min(start.getZ(), goal.getZ()) - margin;
+            int reqMaxZ = Math.max(start.getZ(), goal.getZ()) + margin;
+            int reqMinY = Math.max(-64, Math.min(start.getY(), goal.getY()) - MAX_FALL - 3);
+            int reqMaxY = Math.max(start.getY(), goal.getY()) + 8;
+
+            return reqMinX >= minX && reqMaxX <= maxX
+                && reqMinY >= minY && reqMaxY <= maxY
+                && reqMinZ >= minZ && reqMaxZ <= maxZ;
+        }
+
         boolean isSolid(int x, int y, int z) {
-            Boolean val = solidMap.get(packPos(x, y, z));
-            return val != null && val; // unknown = not solid (passable)
+            if (!inBounds(x, y, z)) return false;
+            return solidBits.get(index(x, y, z));
         }
 
         boolean isPassable(int x, int y, int z) {
@@ -171,15 +244,28 @@ public class Pathfinder {
         }
 
         boolean isStandable(int x, int y, int z) {
-            return isSolid(x, y - 1, z)      // solid below feet
-                && isPassable(x, y, z)        // feet clear
-                && isPassable(x, y + 1, z);   // head clear
+            return isSolid(x, y - 1, z)
+                && isPassable(x, y, z)
+                && isPassable(x, y + 1, z);
         }
 
-        private static long packPos(int x, int y, int z) {
-            return ((long)(x + 30000000) << 36)
-                 | ((long)(y + 64) << 26)
-                 | ((long)(z + 30000000));
+        private boolean inBounds(int x, int y, int z) {
+            return !empty
+                && x >= minX && x <= maxX
+                && y >= minY && y <= maxY
+                && z >= minZ && z <= maxZ;
+        }
+
+        private int index(int x, int y, int z) {
+            int ox = x - minX;
+            int oy = y - minY;
+            int oz = z - minZ;
+            return ((ox * sizeY) + oy) * sizeZ + oz;
+        }
+
+        private void setSolid(int x, int y, int z, boolean solid) {
+            if (!solid || !inBounds(x, y, z)) return;
+            solidBits.set(index(x, y, z));
         }
     }
 
@@ -295,6 +381,8 @@ public class Pathfinder {
             synchronized (mobPathCostByTag) {
                 mobPathCostByTag.clear();
             }
+            seenNameTagIds.clear();
+            lastNewNameTagMs = 0L;
             mobGoals = Collections.emptyList();
             targetMobs = Collections.emptyList();
             if (pendingMobCosts != null) {
@@ -416,6 +504,7 @@ public class Pathfinder {
     }
 
     public static void reset() {
+        clearCachedSnapshot();
         currentPath = Collections.emptyList();
         waypointIndex = 0;
         ticksSinceRecalc = 0;
@@ -433,6 +522,8 @@ public class Pathfinder {
         synchronized (mobPathCostByTag) {
             mobPathCostByTag.clear();
         }
+        seenNameTagIds.clear();
+        lastNewNameTagMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -451,6 +542,7 @@ public class Pathfinder {
     public static List<LivingEntity> getTargetMobs() { return targetMobs; }
 
     public static void stop() {
+        clearCachedSnapshot();
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
@@ -464,6 +556,8 @@ public class Pathfinder {
         synchronized (mobPathCostByTag) {
             mobPathCostByTag.clear();
         }
+        seenNameTagIds.clear();
+        lastNewNameTagMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -581,7 +675,66 @@ public class Pathfinder {
     private static ArmorStandEntity pickBestMobByPathCost(MinecraftClient client,
                                                              ClientPlayerEntity player, int targetMode) {
         List<ArmorStandEntity> tags = findAllNameTags(client, player, targetMode);
-        if (tags.isEmpty()) return null;
+        if (tags.isEmpty()) {
+            seenNameTagIds.clear();
+            lastNewNameTagMs = 0L;
+            return null;
+        }
+
+        long now = System.currentTimeMillis();
+        Set<UUID> currentIds = new HashSet<>();
+        boolean hasNewTag = false;
+        for (ArmorStandEntity tag : tags) {
+            UUID id = tag.getUuid();
+            currentIds.add(id);
+            if (!seenNameTagIds.contains(id)) hasNewTag = true;
+        }
+        seenNameTagIds.retainAll(currentIds);
+        seenNameTagIds.addAll(currentIds);
+        if (hasNewTag) {
+            lastNewNameTagMs = now;
+        }
+
+        ArmorStandEntity currentTag = null;
+        if (targetNameTag != null) {
+            UUID currentId = targetNameTag.getUuid();
+            for (ArmorStandEntity tag : tags) {
+                if (tag.getUuid().equals(currentId)) {
+                    currentTag = tag;
+                    break;
+                }
+            }
+        }
+
+        // Sticky target policy:
+        // switch only after a new spawn event, with 200 ms delay, and only if current target path cost is high.
+        if (currentTag != null) {
+            if (lastNewNameTagMs <= 0L) {
+                return currentTag;
+            }
+            long elapsed = now - lastNewNameTagMs;
+            if (elapsed < TARGET_SWITCH_DELAY_MS) {
+                return currentTag;
+            }
+
+            Float currentCostObj;
+            synchronized (mobPathCostByTag) {
+                currentCostObj = mobPathCostByTag.get(currentTag.getUuid());
+            }
+
+            // No cost yet for current target: keep it until costs are available.
+            if (currentCostObj == null) {
+                return currentTag;
+            }
+
+            float currentCost = currentCostObj;
+            if (currentCost < TARGET_SWITCH_COST_THRESHOLD) {
+                lastNewNameTagMs = 0L;
+                return currentTag;
+            }
+            // Allowed one retarget after delayed spawn check.
+            lastNewNameTagMs = 0L;
+        }
 
         // If we have computed path costs, pick the one with lowest cost
         int bestIdx = 0;
@@ -720,7 +873,7 @@ public class Pathfinder {
         long startKey = posKey(start);
         long goalKey = posKey(goal);
 
-        open.add(new Node(start, 0, heuristic(start, goal)));
+        open.add(new Node(start, 0, heuristic(start, goal) * HEURISTIC_WEIGHT));
         gCosts.put(startKey, 0.0);
 
         int expanded = 0;
@@ -744,7 +897,7 @@ public class Pathfinder {
                 if (tentG < gCosts.getOrDefault(nbKey, Double.MAX_VALUE)) {
                     gCosts.put(nbKey, tentG);
                     cameFrom.put(nbKey, curKey);
-                    open.add(new Node(nb.pos, tentG, tentG + heuristic(nb.pos, goal)));
+                    open.add(new Node(nb.pos, tentG, tentG + heuristic(nb.pos, goal) * HEURISTIC_WEIGHT));
                 }
             }
         }
@@ -981,29 +1134,52 @@ public class Pathfinder {
     }
 
     private static BlockCache snapshotOnClientThread(ClientWorld world, BlockPos start, BlockPos goal) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.isOnThread()) {
-            return BlockCache.snapshotBetweenChunks(world, start, goal);
+        long now = System.currentTimeMillis();
+        synchronized (snapshotLock) {
+            if (cachedSnapshot != null
+                && cachedSnapshot.world == world
+                && now - cachedSnapshot.createdAtMs <= SNAPSHOT_REUSE_MS
+                && cachedSnapshot.cache.covers(start, goal, SNAPSHOT_COVER_MARGIN)) {
+                return cachedSnapshot.cache;
+            }
         }
 
+        MinecraftClient mc = MinecraftClient.getInstance();
         CompletableFuture<BlockCache> snapshotFuture = new CompletableFuture<>();
-        mc.execute(() -> {
+        Runnable buildTask = () -> {
             try {
                 snapshotFuture.complete(BlockCache.snapshotBetweenChunks(world, start, goal));
             } catch (Exception e) {
                 snapshotFuture.completeExceptionally(e);
             }
-        });
+        };
+
+        if (mc.isOnThread()) {
+            buildTask.run();
+        } else {
+            mc.execute(buildTask);
+        }
 
         try {
-            return snapshotFuture.get();
+            BlockCache cache = snapshotFuture.get();
+            synchronized (snapshotLock) {
+                cachedSnapshot = new CachedSnapshot(world, cache, System.currentTimeMillis());
+            }
+            return cache;
         } catch (Exception e) {
             System.err.println("[Pathfinder] Snapshot error: " + e.getMessage());
-            return new BlockCache();
+            return BlockCache.empty();
+        }
+    }
+
+    private static void clearCachedSnapshot() {
+        synchronized (snapshotLock) {
+            cachedSnapshot = null;
         }
     }
 
     private static void forceResetForTeleport(float stressLevel) {
+        clearCachedSnapshot();
         currentPath = Collections.emptyList();
         waypointIndex = 0;
         lastGoal = null;
@@ -1018,6 +1194,8 @@ public class Pathfinder {
         synchronized (mobPathCostByTag) {
             mobPathCostByTag.clear();
         }
+        seenNameTagIds.clear();
+        lastNewNameTagMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;

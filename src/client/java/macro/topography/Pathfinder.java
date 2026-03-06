@@ -27,6 +27,7 @@ public class Pathfinder {
 
     /* ── destinations ─────────────────────────────────────────────── */
     private static final BlockPos DRAGONS_NEST = new BlockPos(-621, 15, 275);
+    private static final BlockPos BRUISER_PORTAL_APPROACH = new BlockPos(-616, 5, -280);
     private static final BlockPos BRUISER_HIDEOUT = new BlockPos(-616, 5, -281);
 
     /* ── search limits ─────────────────────────────────────────────── */
@@ -787,7 +788,11 @@ public class Pathfinder {
         targetMob = null;
         targetNameTag = null;
         if (targetMode == 1) return DRAGONS_NEST;
-        if (targetMode == 2) return BRUISER_HIDEOUT;
+        if (targetMode == 2) {
+            // Bruiser area is portal-gated: first go to portal approach point.
+            if (currentMode != 2) return BRUISER_PORTAL_APPROACH;
+            return BRUISER_HIDEOUT;
+        }
         return null;
     }
 

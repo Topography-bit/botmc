@@ -7,8 +7,11 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 import net.minecraft.world.chunk.WorldChunk;
 
 import java.util.*;
@@ -56,7 +59,7 @@ public class Pathfinder {
     /* ── mob targeting ────────────────────────────────────────────── */
     private static final double ATTACK_STANDOFF = 1.75;
     private static final double PATH_COST_MAX = 100.0; // normalize path costs to [0,1]
-    private static final float TARGET_SWITCH_COST_THRESHOLD = 0.72f;
+    private static final float TARGET_SWITCH_COST_RATIO = 1.5f;
     private static final long TARGET_SWITCH_DELAY_MS = 200L;
     public static final int MOB_PATH_COST_COUNT = 5;
 
@@ -72,6 +75,7 @@ public class Pathfinder {
     private static LivingEntity targetMob = null;        // real mob for hitbox (can be null)
     private static ArmorStandEntity targetNameTag = null; // name tag for position
     private static final Set<UUID> seenNameTagIds = new HashSet<>();
+    private static final Set<UUID> pendingSpawnTagIds = new HashSet<>();
     private static long lastNewNameTagMs = 0L;
     private static int activeTargetMode = 0;
     private static float lastDistToWall = 1f;
@@ -293,6 +297,9 @@ public class Pathfinder {
         }
 
         boolean farmMode = (targetMode != 0 && currentMode == targetMode);
+        if (farmMode && isCurrentTargetInvalid()) {
+            onTargetLost();
+        }
         BlockPos goal = pickGoal(client, player, targetMode, currentMode);
 
         // Debug logging every 5 sec
@@ -382,6 +389,7 @@ public class Pathfinder {
                 mobPathCostByTag.clear();
             }
             seenNameTagIds.clear();
+            pendingSpawnTagIds.clear();
             lastNewNameTagMs = 0L;
             mobGoals = Collections.emptyList();
             targetMobs = Collections.emptyList();
@@ -523,6 +531,7 @@ public class Pathfinder {
             mobPathCostByTag.clear();
         }
         seenNameTagIds.clear();
+        pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
@@ -557,11 +566,36 @@ public class Pathfinder {
             mobPathCostByTag.clear();
         }
         seenNameTagIds.clear();
+        pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
         computing.set(false);
+    }
+
+    private static boolean isCurrentTargetInvalid() {
+        if (targetNameTag == null && targetMob == null) return false;
+        if (targetNameTag != null && (!targetNameTag.isAlive() || targetNameTag.isRemoved())) return true;
+        if (targetMob != null && (!targetMob.isAlive() || targetMob.isRemoved())) return true;
+        return false;
+    }
+
+    private static void onTargetLost() {
+        targetMob = null;
+        targetNameTag = null;
+        lastGoal = null;
+        pendingGoal = null;
+        if (pendingFuture != null) pendingFuture.cancel(true);
+        pendingFuture = null;
+        computing.set(false);
+        recalcCooldown = 0;
+        ticksSinceRecalc = SAFETY_RECALC;
+        if (pendingMobCosts != null) pendingMobCosts.cancel(true);
+        pendingMobCosts = null;
+        mobCostTicks = MOB_COST_INTERVAL;
+        pendingSpawnTagIds.clear();
+        lastNewNameTagMs = 0L;
     }
 
     /* ================================================================
@@ -579,11 +613,19 @@ public class Pathfinder {
             ArmorStandEntity bestTag = pickBestMobByPathCost(client, player, targetMode);
 
             if (bestTag != null) {
+                UUID prevTargetId = targetNameTag != null ? targetNameTag.getUuid() : null;
+                boolean targetSwitched = prevTargetId == null || !prevTargetId.equals(bestTag.getUuid());
                 targetNameTag = bestTag;
                 Vec3d tagPos = bestTag.getEntityPos();
 
                 // Try to find real mob near the name tag for hitbox rendering
                 targetMob = findRealMobNear(client, player, bestTag);
+
+                if (targetSwitched) {
+                    // Target changed -> allow immediate path recompute this tick.
+                    recalcCooldown = 0;
+                    ticksSinceRecalc = SAFETY_RECALC;
+                }
 
                 // Use tag position for navigation (it's directly above the mob)
                 BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
@@ -677,6 +719,7 @@ public class Pathfinder {
         List<ArmorStandEntity> tags = findAllNameTags(client, player, targetMode);
         if (tags.isEmpty()) {
             seenNameTagIds.clear();
+            pendingSpawnTagIds.clear();
             lastNewNameTagMs = 0L;
             return null;
         }
@@ -684,15 +727,21 @@ public class Pathfinder {
         long now = System.currentTimeMillis();
         Set<UUID> currentIds = new HashSet<>();
         boolean hasNewTag = false;
+        Set<UUID> newTagIds = new HashSet<>();
         for (ArmorStandEntity tag : tags) {
             UUID id = tag.getUuid();
             currentIds.add(id);
-            if (!seenNameTagIds.contains(id)) hasNewTag = true;
+            if (!seenNameTagIds.contains(id)) {
+                hasNewTag = true;
+                newTagIds.add(id);
+            }
         }
         seenNameTagIds.retainAll(currentIds);
         seenNameTagIds.addAll(currentIds);
+        pendingSpawnTagIds.retainAll(currentIds);
         if (hasNewTag) {
             lastNewNameTagMs = now;
+            pendingSpawnTagIds.addAll(newTagIds);
         }
 
         ArmorStandEntity currentTag = null;
@@ -707,7 +756,8 @@ public class Pathfinder {
         }
 
         // Sticky target policy:
-        // switch only after a new spawn event, with 200 ms delay, and only if current target path cost is high.
+        // switch only after a new spawn event, with 200 ms delay,
+        // and only if currentCost >= TARGET_SWITCH_COST_RATIO * newCost.
         if (currentTag != null) {
             if (lastNewNameTagMs <= 0L) {
                 return currentTag;
@@ -717,43 +767,86 @@ public class Pathfinder {
                 return currentTag;
             }
 
-            Float currentCostObj;
-            synchronized (mobPathCostByTag) {
-                currentCostObj = mobPathCostByTag.get(currentTag.getUuid());
-            }
-
-            // No cost yet for current target: keep it until costs are available.
-            if (currentCostObj == null) {
-                return currentTag;
-            }
-
-            float currentCost = currentCostObj;
-            if (currentCost < TARGET_SWITCH_COST_THRESHOLD) {
+            ArmorStandEntity spawnedBest = pickBestByPathCostAndVisibility(client, player, tags, pendingSpawnTagIds);
+            if (spawnedBest == null) {
+                pendingSpawnTagIds.clear();
                 lastNewNameTagMs = 0L;
                 return currentTag;
             }
-            // Allowed one retarget after delayed spawn check.
+
+            float currentCost = getTagPathCost(currentTag.getUuid());
+            float spawnedCost = getTagPathCost(spawnedBest.getUuid());
+
+            // Costs not ready yet -> keep current until next cycle.
+            if (currentCost >= 1.0f || spawnedCost >= 1.0f) {
+                return currentTag;
+            }
+
+            if (currentCost >= spawnedCost * TARGET_SWITCH_COST_RATIO) {
+                pendingSpawnTagIds.clear();
+                lastNewNameTagMs = 0L;
+                return spawnedBest;
+            }
+
+            pendingSpawnTagIds.clear();
             lastNewNameTagMs = 0L;
+            return currentTag;
         }
 
-        // If we have computed path costs, pick the one with lowest cost
-        int bestIdx = 0;
-        float bestCost = Float.MAX_VALUE;
-        for (int i = 0; i < tags.size() && i < MOB_PATH_COST_COUNT; i++) {
-            float c;
-            synchronized (mobPathCostByTag) {
-                c = mobPathCostByTag.getOrDefault(tags.get(i).getUuid(), 1.0f);
+        ArmorStandEntity best = pickBestByPathCostAndVisibility(client, player, tags, null);
+        return best != null ? best : tags.get(0);
+    }
+
+    private static float getTagPathCost(UUID tagId) {
+        synchronized (mobPathCostByTag) {
+            return mobPathCostByTag.getOrDefault(tagId, 1.0f);
+        }
+    }
+
+    /** Prefer visible mobs by path cost. If no visible targets, fall back to non-visible ones. */
+    private static ArmorStandEntity pickBestByPathCostAndVisibility(MinecraftClient client,
+                                                                     ClientPlayerEntity player,
+                                                                     List<ArmorStandEntity> tags,
+                                                                     Set<UUID> restrictToIds) {
+        ArmorStandEntity bestVisible = null;
+        float bestVisibleCost = Float.MAX_VALUE;
+        ArmorStandEntity bestHidden = null;
+        float bestHiddenCost = Float.MAX_VALUE;
+
+        for (ArmorStandEntity tag : tags) {
+            if (restrictToIds != null && !restrictToIds.isEmpty() && !restrictToIds.contains(tag.getUuid())) {
+                continue;
             }
-            if (c < bestCost) {
-                bestCost = c;
-                bestIdx = i;
+
+            float cost = getTagPathCost(tag.getUuid());
+            boolean visible = isTagVisible(client, player, tag);
+            if (visible) {
+                if (cost < bestVisibleCost) {
+                    bestVisibleCost = cost;
+                    bestVisible = tag;
+                }
+            } else if (cost < bestHiddenCost) {
+                bestHiddenCost = cost;
+                bestHidden = tag;
             }
         }
 
-        // If all costs are 1.0 (not yet computed or all unreachable), fall back to nearest
-        if (bestCost >= 1.0f) return tags.get(0); // tags already sorted by distance
+        if (bestVisible != null) return bestVisible;
+        return bestHidden;
+    }
 
-        return tags.get(bestIdx);
+    private static boolean isTagVisible(MinecraftClient client, ClientPlayerEntity player, ArmorStandEntity tag) {
+        if (client.world == null) return false;
+        Vec3d start = player.getEyePos();
+        Vec3d end = tag.getEntityPos().add(0, 0.35, 0);
+        BlockHitResult hit = client.world.raycast(new RaycastContext(
+            start,
+            end,
+            RaycastContext.ShapeType.COLLIDER,
+            RaycastContext.FluidHandling.NONE,
+            player
+        ));
+        return hit.getType() == HitResult.Type.MISS;
     }
 
     /** Find the nearest non-ArmorStand LivingEntity within 5 blocks of a name tag. */
@@ -1195,6 +1288,7 @@ public class Pathfinder {
             mobPathCostByTag.clear();
         }
         seenNameTagIds.clear();
+        pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();

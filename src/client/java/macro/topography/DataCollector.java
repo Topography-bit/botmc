@@ -5,6 +5,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.GameOptions;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.hit.BlockHitResult;
@@ -24,8 +25,10 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 public class DataCollector {
     public static double rawDX = 0;
@@ -292,22 +295,55 @@ public class DataCollector {
 
     private static List<LivingEntity> getNearestMobs(MinecraftClient client, ClientPlayerEntity player) {
         if (client.world == null) return Collections.emptyList();
-        Box searchBox = player.getBoundingBox().expand(50);
-        List<LivingEntity> mobs = new ArrayList<>(client.world.getEntitiesByClass(
-            LivingEntity.class, searchBox,
-            e -> {
-                if (e == player) return false;
-                String name = getMobName(e);
-                if (name.isEmpty()) return false;
-                if (targetMode == 1) return name.contains("Zealot") && !name.contains("Bruiser");
-                if (targetMode == 2) return name.contains("Bruiser");
-                return name.contains("Zealot") || name.contains("Bruiser");
-            }
-        ));
+
+        // Step 1: Find ArmorStand name tags with matching mob names
+        List<ArmorStandEntity> nameTags = new ArrayList<>();
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, player.getBoundingBox().expand(50),
+                ent -> ent instanceof ArmorStandEntity)) {
+            String name = getMobName(e);
+            if (name.isEmpty()) continue;
+            boolean match = false;
+            if (targetMode == 1) match = name.contains("Zealot") && !name.contains("Bruiser");
+            else if (targetMode == 2) match = name.contains("Bruiser");
+            else match = name.contains("Zealot") || name.contains("Bruiser");
+            if (match) nameTags.add((ArmorStandEntity) e);
+        }
+
+        // Step 2: For each name tag, find the nearest real mob within 4 blocks
+        Set<LivingEntity> found = new LinkedHashSet<>();
+        for (ArmorStandEntity tag : nameTags) {
+            LivingEntity mob = findRealMobNear(client, player, tag);
+            if (mob != null) found.add(mob);
+        }
+
+        List<LivingEntity> mobs = new ArrayList<>(found);
         Vec3d pPos = player.getEntityPos();
         mobs.sort(Comparator.comparingDouble(e -> e.getEntityPos().distanceTo(pPos)));
         if (mobs.size() > 5) return mobs.subList(0, 5);
         return mobs;
+    }
+
+    /** Find the nearest non-ArmorStand LivingEntity within 4 blocks of a name tag. */
+    private static LivingEntity findRealMobNear(MinecraftClient client,
+                                                  ClientPlayerEntity player,
+                                                  ArmorStandEntity nameTag) {
+        if (client.world == null) return null;
+        LivingEntity closest = null;
+        double closestDist = 4.0;
+        Vec3d tagPos = nameTag.getEntityPos();
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, nameTag.getBoundingBox().expand(4),
+                ent -> !(ent instanceof ArmorStandEntity)
+                    && !(ent instanceof PlayerEntity)
+                    && ent != player)) {
+            double d = e.getEntityPos().distanceTo(tagPos);
+            if (d < closestDist) {
+                closestDist = d;
+                closest = e;
+            }
+        }
+        return closest;
     }
 
     /** Get mob name from custom name or display name, stripping § color codes. */
@@ -319,9 +355,16 @@ public class DataCollector {
     }
 
     private static int getEntityType(LivingEntity e) {
-        String name = getMobName(e);
-        if (name.contains("Bruiser")) return 1;
-        if (name.contains("Special")) return 2;
+        // Real mob is an Enderman — check nearby ArmorStand name tags
+        if (MinecraftClient.getInstance().world != null) {
+            for (LivingEntity nearby : MinecraftClient.getInstance().world.getEntitiesByClass(
+                    LivingEntity.class, e.getBoundingBox().expand(4),
+                    ent -> ent instanceof ArmorStandEntity)) {
+                String name = getMobName(nearby);
+                if (name.contains("Bruiser")) return 1;
+                if (name.contains("Special")) return 2;
+            }
+        }
         return 0;
     }
 
@@ -387,19 +430,16 @@ public class DataCollector {
 
     private static int detectMode(MinecraftClient client, ClientPlayerEntity player) {
         if (client.world == null || targetMode == 0) return 0;
-        Box searchBox = player.getBoundingBox().expand(20);
-        List<LivingEntity> nearby = client.world.getEntitiesByClass(
-            LivingEntity.class, searchBox,
-            e -> {
-                if (e == player) return false;
-                String name = getMobName(e);
-                if (name.isEmpty()) return false;
-                if (targetMode == 1) return name.contains("Zealot") && !name.contains("Bruiser");
-                if (targetMode == 2) return name.contains("Bruiser");
-                return false;
-            }
-        );
-        return nearby.isEmpty() ? 0 : targetMode;
+        // Check if any ArmorStand name tags with matching names exist nearby
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, player.getBoundingBox().expand(20),
+                ent -> ent instanceof ArmorStandEntity)) {
+            String name = getMobName(e);
+            if (name.isEmpty()) continue;
+            if (targetMode == 1 && name.contains("Zealot") && !name.contains("Bruiser")) return targetMode;
+            if (targetMode == 2 && name.contains("Bruiser")) return targetMode;
+        }
+        return 0;
     }
 
     public static void startCollecting(int mode) {

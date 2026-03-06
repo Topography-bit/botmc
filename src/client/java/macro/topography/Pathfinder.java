@@ -5,6 +5,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -272,26 +273,57 @@ public class Pathfinder {
                                                      ClientPlayerEntity player, int targetMode) {
         if (client.world == null || targetMode == 0) return null;
         Vec3d pPos = player.getEntityPos();
+
+        // Step 1: Find ArmorStand name tags with matching names
+        List<ArmorStandEntity> nameTags = new ArrayList<>();
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, player.getBoundingBox().expand(50),
+                ent -> ent instanceof ArmorStandEntity)) {
+            String name = getMobName(e);
+            if (name.isEmpty()) continue;
+            boolean match = false;
+            if (targetMode == 1) match = name.contains("Zealot") && !name.contains("Bruiser");
+            if (targetMode == 2) match = name.contains("Bruiser");
+            if (match) nameTags.add((ArmorStandEntity) e);
+        }
+
+        // Step 2: For each name tag, find the nearest real mob within 4 blocks
         LivingEntity best = null;
         double bestDist = Double.MAX_VALUE;
 
-        for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(50),
-                ent -> {
-                    if (ent == player || ent instanceof PlayerEntity) return false;
-                    String name = getMobName(ent);
-                    if (name.isEmpty()) return false;
-                    if (targetMode == 1) return name.contains("Zealot") && !name.contains("Bruiser");
-                    if (targetMode == 2) return name.contains("Bruiser");
-                    return false;
-                })) {
-            double d = e.getEntityPos().distanceTo(pPos);
-            if (d < bestDist) {
-                bestDist = d;
-                best = e;
+        for (ArmorStandEntity tag : nameTags) {
+            LivingEntity mob = findRealMobNear(client, player, tag);
+            if (mob != null) {
+                double d = mob.getEntityPos().distanceTo(pPos);
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = mob;
+                }
             }
         }
         return best;
+    }
+
+    /** Find the nearest non-ArmorStand, non-Player LivingEntity within 4 blocks of a name tag. */
+    private static LivingEntity findRealMobNear(MinecraftClient client,
+                                                  ClientPlayerEntity player,
+                                                  ArmorStandEntity nameTag) {
+        LivingEntity closest = null;
+        double closestDist = 4.0;
+        Vec3d tagPos = nameTag.getEntityPos();
+
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, nameTag.getBoundingBox().expand(4),
+                ent -> !(ent instanceof ArmorStandEntity)
+                    && !(ent instanceof PlayerEntity)
+                    && ent != player)) {
+            double d = e.getEntityPos().distanceTo(tagPos);
+            if (d < closestDist) {
+                closestDist = d;
+                closest = e;
+            }
+        }
+        return closest;
     }
 
     /** Get mob name, checking custom name first then display name, stripping color codes. */
@@ -556,7 +588,8 @@ public class Pathfinder {
         return smooth;
     }
 
-    /** Check if the full player hitbox (0.6 wide) can pass in a straight line. */
+    /** Check if the full player hitbox (0.6 wide) can WALK in a straight line.
+     *  Checks passability AND ground below (no smoothing over chasms). */
     private static boolean hasLineOfSight(BlockCache cache, BlockPos from, BlockPos to) {
         int dx = to.getX() - from.getX();
         int dz = to.getZ() - from.getZ();
@@ -578,9 +611,19 @@ public class Pathfinder {
                 int cx = (int) Math.floor(from.getX() + 0.5 + dx * t + off[0]);
                 int cz = (int) Math.floor(from.getZ() + 0.5 + dz * t + off[1]);
                 int cy = from.getY() + Math.round((to.getY() - from.getY()) * t);
+                // Check passability (feet + head)
                 if (!cache.isPassable(cx, cy, cz) || !cache.isPassable(cx, cy + 1, cz)) {
                     return false;
                 }
+                // Check ground exists within 3 blocks below — prevents smoothing over chasms
+                boolean hasGround = false;
+                for (int drop = 0; drop <= 3; drop++) {
+                    if (cache.isSolid(cx, cy - 1 - drop, cz)) {
+                        hasGround = true;
+                        break;
+                    }
+                }
+                if (!hasGround) return false;
             }
         }
         return true;

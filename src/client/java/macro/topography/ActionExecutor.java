@@ -8,6 +8,7 @@ import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.GameOptions;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.hit.BlockHitResult;
@@ -578,49 +579,74 @@ public class ActionExecutor {
     private static List<LivingEntity> getNearestMobs(MinecraftClient client,
                                                       ClientPlayerEntity player) {
         if (client.world == null) return Collections.emptyList();
-        Box box = player.getBoundingBox().expand(50);
 
-        // Filter by targetMode: Zealots (mode 1) or Bruisers (mode 2)
-        List<LivingEntity> mobs = new ArrayList<>(client.world.getEntitiesByClass(
-            LivingEntity.class, box,
-            e -> {
-                if (e == player) return false;
-                String n = getMobName(e);
-                if (n.isEmpty()) return false;
-                if (lastTargetMode == 1) return n.contains("Zealot") && !n.contains("Bruiser");
-                if (lastTargetMode == 2) return n.contains("Bruiser");
-                return n.contains("Zealot") || n.contains("Bruiser");
-            }
-        ));
-
-        // Debug: log what we found (and what's nearby) every ~5 sec
-        if (debugTick % 100 == 0) {
-            List<LivingEntity> allNearby = new ArrayList<>(client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(30),
-                e -> e != player && !(e instanceof PlayerEntity)
-            ));
-            System.out.println("[Bot] Entities within 30 blocks: " + allNearby.size());
-            for (int i = 0; i < Math.min(allNearby.size(), 10); i++) {
-                LivingEntity e = allNearby.get(i);
-                String cn = e.hasCustomName() && e.getCustomName() != null
-                    ? e.getCustomName().getString() : "<none>";
-                String dn = e.getName().getString();
-                System.out.printf("[Bot]   %s | custom='%s' | display='%s' | dist=%.1f%n",
-                    e.getType().getTranslationKey(), cn, dn,
-                    e.getEntityPos().distanceTo(player.getEntityPos()));
-            }
-            System.out.println("[Bot] Matched mobs (Zealot/Bruiser): " + mobs.size());
+        // Step 1: Find ArmorStand name tags with matching mob names
+        List<ArmorStandEntity> nameTags = new ArrayList<>();
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, player.getBoundingBox().expand(50),
+                ent -> ent instanceof ArmorStandEntity)) {
+            String n = getMobName(e);
+            if (n.isEmpty()) continue;
+            boolean match = false;
+            if (lastTargetMode == 1) match = n.contains("Zealot") && !n.contains("Bruiser");
+            else if (lastTargetMode == 2) match = n.contains("Bruiser");
+            else match = n.contains("Zealot") || n.contains("Bruiser");
+            if (match) nameTags.add((ArmorStandEntity) e);
         }
 
+        // Step 2: For each name tag, find the nearest real mob within 4 blocks
+        Set<LivingEntity> found = new LinkedHashSet<>();
+        for (ArmorStandEntity tag : nameTags) {
+            LivingEntity mob = findRealMobNear(client, player, tag);
+            if (mob != null) found.add(mob);
+        }
+
+        // Debug: log what we found every ~5 sec
+        if (debugTick % 100 == 0) {
+            System.out.println("[Bot] Name tags found: " + nameTags.size()
+                + ", Real mobs matched: " + found.size());
+        }
+
+        List<LivingEntity> mobs = new ArrayList<>(found);
         Vec3d pp = player.getEntityPos();
         mobs.sort(Comparator.comparingDouble(e -> e.getEntityPos().distanceTo(pp)));
         return mobs.size() > 5 ? mobs.subList(0, 5) : mobs;
     }
 
+    /** Find the nearest non-ArmorStand LivingEntity within 4 blocks of a name tag. */
+    private static LivingEntity findRealMobNear(MinecraftClient client,
+                                                  ClientPlayerEntity player,
+                                                  ArmorStandEntity nameTag) {
+        if (client.world == null) return null;
+        LivingEntity closest = null;
+        double closestDist = 4.0;
+        Vec3d tagPos = nameTag.getEntityPos();
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, nameTag.getBoundingBox().expand(4),
+                ent -> !(ent instanceof ArmorStandEntity)
+                    && !(ent instanceof PlayerEntity)
+                    && ent != player)) {
+            double d = e.getEntityPos().distanceTo(tagPos);
+            if (d < closestDist) {
+                closestDist = d;
+                closest = e;
+            }
+        }
+        return closest;
+    }
+
     private static int getEntityType(LivingEntity e) {
-        String n = getMobName(e);
-        if (n.contains("Bruiser")) return 1;
-        if (n.contains("Special")) return 2;
+        // Real mob is an Enderman — check nearby ArmorStand name tags
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world != null) {
+            for (LivingEntity nearby : client.world.getEntitiesByClass(
+                    LivingEntity.class, e.getBoundingBox().expand(4),
+                    ent -> ent instanceof ArmorStandEntity)) {
+                String n = getMobName(nearby);
+                if (n.contains("Bruiser")) return 1;
+                if (n.contains("Special")) return 2;
+            }
+        }
         return 0; // Zealot or unknown
     }
 
@@ -678,16 +704,16 @@ public class ActionExecutor {
 
     private static int detectMode(MinecraftClient client, ClientPlayerEntity player) {
         if (client.world == null || lastTargetMode == 0) return 0;
-        Box box = player.getBoundingBox().expand(20);
-        boolean found = !client.world.getEntitiesByClass(LivingEntity.class, box, e -> {
-            if (e == player) return false;
+        // Check if any ArmorStand name tags with matching names exist nearby
+        for (LivingEntity e : client.world.getEntitiesByClass(
+                LivingEntity.class, player.getBoundingBox().expand(20),
+                ent -> ent instanceof ArmorStandEntity)) {
             String n = getMobName(e);
-            if (n.isEmpty()) return false;
-            if (lastTargetMode == 1) return n.contains("Zealot") && !n.contains("Bruiser");
-            if (lastTargetMode == 2) return n.contains("Bruiser");
-            return false;
-        }).isEmpty();
-        return found ? lastTargetMode : 0;
+            if (n.isEmpty()) continue;
+            if (lastTargetMode == 1 && n.contains("Zealot") && !n.contains("Bruiser")) return lastTargetMode;
+            if (lastTargetMode == 2 && n.contains("Bruiser")) return lastTargetMode;
+        }
+        return 0;
     }
 
     /** Get mob name from custom name or display name, stripping color codes. */

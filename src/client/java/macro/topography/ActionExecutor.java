@@ -649,7 +649,9 @@ public class ActionExecutor {
                 LivingEntity.class, nameTag.getBoundingBox().expand(4),
                 ent -> !(ent instanceof ArmorStandEntity)
                     && !(ent instanceof PlayerEntity)
-                    && ent != player)) {
+                    && ent != player
+                    && ent.isAlive()
+                    && !ent.isRemoved())) {
             double d = e.getEntityPos().distanceTo(tagPos);
             if (d < closestDist) {
                 closestDist = d;

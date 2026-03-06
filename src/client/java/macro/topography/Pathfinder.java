@@ -91,6 +91,15 @@ public class Pathfinder {
     private static int mobCostTicks = 0;
     private static final int MOB_COST_INTERVAL = 20; // recalc every 1 sec
     private static CompletableFuture<MobCostResult> pendingMobCosts = null;
+    private static final boolean EVENT_LOG_ENABLED = true;
+    private static final long HEARTBEAT_LOG_INTERVAL_MS = 5000L;
+    private static long lastHeartbeatLogMs = 0L;
+    private static long pathTaskSeq = 0L;
+    private static long pendingPathTaskId = 0L;
+    private static long pendingPathTaskStartedMs = 0L;
+    private static long mobCostTaskSeq = 0L;
+    private static long pendingMobCostTaskId = 0L;
+    private static long pendingMobCostTaskStartedMs = 0L;
     private static final Object snapshotLock = new Object();
     private static CachedSnapshot cachedSnapshot = null;
 
@@ -121,6 +130,47 @@ public class Pathfinder {
     /* ================================================================
      *  BLOCK CACHE — snapshot on main thread, read safely from async
      * ============================================================== */
+
+    private static void eventLog(String format, Object... args) {
+        if (!EVENT_LOG_ENABLED) return;
+        long now = System.currentTimeMillis();
+        String message = String.format(Locale.ROOT, format, args);
+        System.out.printf(Locale.ROOT, "[Pathfinder][%d] %s%n", now, message);
+    }
+
+    private static String shortUuid(UUID id) {
+        if (id == null) return "null";
+        String s = id.toString();
+        return s.length() <= 8 ? s : s.substring(0, 8);
+    }
+
+    private static String tagInfo(ArmorStandEntity tag) {
+        if (tag == null) return "null";
+        Vec3d pos = tag.getEntityPos();
+        return String.format(
+            Locale.ROOT,
+            "%s/%s alive=%s removed=%s pos=%.1f,%.1f,%.1f",
+            getMobName(tag),
+            shortUuid(tag.getUuid()),
+            tag.isAlive(),
+            tag.isRemoved(),
+            pos.x, pos.y, pos.z
+        );
+    }
+
+    private static String mobInfo(LivingEntity mob) {
+        if (mob == null) return "null";
+        Vec3d pos = mob.getEntityPos();
+        return String.format(
+            Locale.ROOT,
+            "%s/%s alive=%s removed=%s pos=%.1f,%.1f,%.1f",
+            mob.getType().getTranslationKey(),
+            shortUuid(mob.getUuid()),
+            mob.isAlive(),
+            mob.isRemoved(),
+            pos.x, pos.y, pos.z
+        );
+    }
 
     private static class BlockCache {
         private final int minX;
@@ -298,19 +348,22 @@ public class Pathfinder {
 
         boolean farmMode = (targetMode != 0 && currentMode == targetMode);
         if (farmMode && isCurrentTargetInvalid()) {
-            onTargetLost();
+            eventLog("target_invalid tag=%s mob=%s", tagInfo(targetNameTag), mobInfo(targetMob));
+            onTargetLost("invalid_current_target");
         }
         BlockPos goal = pickGoal(client, player, targetMode, currentMode);
 
-        // Debug logging every 5 sec
-        if (ticksSinceRecalc % 100 == 0) {
-            System.out.printf("[Pathfinder] mode=%d goal=%s targetMob=%s nameTag=%s path=%d wp=%d wall=%.3f vclear=%.3f stress=%.3f posA=%.3f%n",
+        long nowMs = System.currentTimeMillis();
+        if (EVENT_LOG_ENABLED && nowMs - lastHeartbeatLogMs >= HEARTBEAT_LOG_INTERVAL_MS) {
+            lastHeartbeatLogMs = nowMs;
+            eventLog("heartbeat mode=%d goal=%s targetMob=%s nameTag=%s path=%d wp=%d wall=%.3f vclear=%.3f stress=%.3f posA=%.3f",
                 targetMode,
                 goal != null ? goal.toShortString() : "null",
                 targetMob != null ? targetMob.getType().getTranslationKey() : "null",
                 targetNameTag != null ? getMobName(targetNameTag) : "null",
                 currentPath.size(), waypointIndex,
-                distToWall, verticalClearance, stressLevel, posAnomaly);
+                distToWall, verticalClearance, stressLevel, posAnomaly
+            );
         }
 
         // Check pending async result
@@ -325,8 +378,20 @@ public class Pathfinder {
                 } else if (pendingGoal != null) {
                     lastGoal = pendingGoal;
                 }
+                long totalMs = pendingPathTaskStartedMs > 0L
+                    ? (System.currentTimeMillis() - pendingPathTaskStartedMs)
+                    : -1L;
+                eventLog(
+                    "path[%d] apply len=%d wp=%d goal=%s totalMs=%d",
+                    pendingPathTaskId,
+                    currentPath.size(),
+                    waypointIndex,
+                    pendingGoal != null ? pendingGoal.toShortString() : "null",
+                    totalMs
+                );
             } catch (Exception e) {
                 System.err.println("[Pathfinder] Async error: " + e.getMessage());
+                eventLog("path[%d] apply_error %s", pendingPathTaskId, e.getMessage());
                 currentPath = Collections.emptyList();
                 waypointIndex = 0;
                 lastGoal = null;
@@ -334,6 +399,8 @@ public class Pathfinder {
             pendingFuture = null;
             pendingGoal = null;
             computing.set(false);
+            pendingPathTaskId = 0L;
+            pendingPathTaskStartedMs = 0L;
         }
 
         // Advance waypoint
@@ -397,6 +464,8 @@ public class Pathfinder {
                 pendingMobCosts.cancel(true);
                 pendingMobCosts = null;
             }
+            pendingMobCostTaskId = 0L;
+            pendingMobCostTaskStartedMs = 0L;
             return;
         }
 
@@ -413,11 +482,23 @@ public class Pathfinder {
                         mobPathCostByTag.putAll(result.costsByTag);
                     }
                     targetMobs = result.renderedMobs;
+                    long totalMs = pendingMobCostTaskStartedMs > 0L
+                        ? (System.currentTimeMillis() - pendingMobCostTaskStartedMs)
+                        : -1L;
+                    eventLog(
+                        "mobCost[%d] apply tags=%d rendered=%d totalMs=%d",
+                        pendingMobCostTaskId,
+                        result.costsByTag.size(),
+                        result.renderedMobs != null ? result.renderedMobs.size() : 0,
+                        totalMs
+                    );
                 }
             } catch (Exception e) {
-                // ignore
+                eventLog("mobCost[%d] apply_error %s", pendingMobCostTaskId, e.getMessage());
             }
             pendingMobCosts = null;
+            pendingMobCostTaskId = 0L;
+            pendingMobCostTaskStartedMs = 0L;
         }
         // Start new mob cost computation
         if (mobCostTicks >= MOB_COST_INTERVAL && pendingMobCosts == null && client.world != null) {
@@ -446,30 +527,42 @@ public class Pathfinder {
             final List<UUID> idsCopy = new ArrayList<>(tagIds);
             final List<LivingEntity> renderedMobs = new ArrayList<>(realMobs);
             final ClientWorld world = client.world;
+            final long mobTaskId = ++mobCostTaskSeq;
+            final long mobTaskStartMs = System.currentTimeMillis();
+            // Build one cache covering all mob goals on client thread before async work.
+            int minX = startPos.getX(), maxX = startPos.getX();
+            int minZ = startPos.getZ(), maxZ = startPos.getZ();
+            int minY = startPos.getY(), maxY = startPos.getY();
+            for (BlockPos g : goalsCopy) {
+                minX = Math.min(minX, g.getX());
+                maxX = Math.max(maxX, g.getX());
+                minZ = Math.min(minZ, g.getZ());
+                maxZ = Math.max(maxZ, g.getZ());
+                minY = Math.min(minY, g.getY());
+                maxY = Math.max(maxY, g.getY());
+            }
+            BlockPos cacheMin = new BlockPos(minX - 5, minY - MAX_FALL, minZ - 5);
+            BlockPos cacheMax = new BlockPos(maxX + 5, maxY + 10, maxZ + 5);
+            final BlockCache mobCache = snapshotOnClientThread(world, cacheMin, cacheMax);
+            long snapshotMs = System.currentTimeMillis() - mobTaskStartMs;
+            pendingMobCostTaskId = mobTaskId;
+            pendingMobCostTaskStartedMs = mobTaskStartMs;
+            eventLog(
+                "mobCost[%d] start tags=%d goals=%d snapshotMs=%d",
+                mobTaskId,
+                tags.size(),
+                goalsCopy.size(),
+                snapshotMs
+            );
 
             pendingMobCosts = CompletableFuture.supplyAsync(() -> {
+                long solveStartMs = System.currentTimeMillis();
                 float[] costs = new float[MOB_PATH_COST_COUNT];
                 Arrays.fill(costs, 1.0f); // default = max cost (unreachable)
                 Map<UUID, Float> byTag = new HashMap<>();
                 try {
-                    // Build one cache covering all mob goals
-                    int minX = startPos.getX(), maxX = startPos.getX();
-                    int minZ = startPos.getZ(), maxZ = startPos.getZ();
-                    int minY = startPos.getY(), maxY = startPos.getY();
-                    for (BlockPos g : goalsCopy) {
-                        minX = Math.min(minX, g.getX());
-                        maxX = Math.max(maxX, g.getX());
-                        minZ = Math.min(minZ, g.getZ());
-                        maxZ = Math.max(maxZ, g.getZ());
-                        minY = Math.min(minY, g.getY());
-                        maxY = Math.max(maxY, g.getY());
-                    }
-                    BlockPos cacheMin = new BlockPos(minX - 5, minY - MAX_FALL, minZ - 5);
-                    BlockPos cacheMax = new BlockPos(maxX + 5, maxY + 10, maxZ + 5);
-                    BlockCache cache = snapshotOnClientThread(world, cacheMin, cacheMax);
-
                     // Run single A* from player and extract gCosts for all mob goals
-                    Map<Long, Double> gCosts = astarMultiGoal(cache, startPos, goalsCopy);
+                    Map<Long, Double> gCosts = astarMultiGoal(mobCache, startPos, goalsCopy);
 
                     for (int i = 0; i < goalsCopy.size(); i++) {
                         long key = posKey(goalsCopy.get(i));
@@ -484,8 +577,16 @@ public class Pathfinder {
                             byTag.put(idsCopy.get(i), norm);
                         }
                     }
+                    eventLog(
+                        "mobCost[%d] solved goals=%d solvedTags=%d solveMs=%d",
+                        mobTaskId,
+                        goalsCopy.size(),
+                        byTag.size(),
+                        System.currentTimeMillis() - solveStartMs
+                    );
                 } catch (Exception e) {
                     System.err.println("[Pathfinder] Mob cost error: " + e.getMessage());
+                    eventLog("mobCost[%d] solve_error %s", mobTaskId, e.getMessage());
                 }
                 return new MobCostResult(costs, byTag, renderedMobs);
             });
@@ -538,8 +639,12 @@ public class Pathfinder {
         mobCostTicks = 0;
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
         pendingMobCosts = null;
+        pendingMobCostTaskId = 0L;
+        pendingMobCostTaskStartedMs = 0L;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        pendingPathTaskId = 0L;
+        pendingPathTaskStartedMs = 0L;
         computing.set(false);
     }
 
@@ -554,8 +659,12 @@ public class Pathfinder {
         clearCachedSnapshot();
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        pendingPathTaskId = 0L;
+        pendingPathTaskStartedMs = 0L;
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
         pendingMobCosts = null;
+        pendingMobCostTaskId = 0L;
+        pendingMobCostTaskStartedMs = 0L;
         pendingGoal = null;
         lastDistToWall = 1f;
         lastVerticalClearance = 1f;
@@ -578,22 +687,36 @@ public class Pathfinder {
         if (targetNameTag == null && targetMob == null) return false;
         if (targetNameTag != null && (!targetNameTag.isAlive() || targetNameTag.isRemoved())) return true;
         if (targetMob != null && (!targetMob.isAlive() || targetMob.isRemoved())) return true;
+        // ArmorStand tag can linger after mob death; tag alive + mob missing is invalid target.
+        if (targetNameTag != null && targetMob == null) return true;
         return false;
     }
 
-    private static void onTargetLost() {
+    private static void onTargetLost(String reason) {
+        eventLog(
+            "target_lost reason=%s tag=%s mob=%s pendingPath=%s pendingMobCost=%s",
+            reason,
+            tagInfo(targetNameTag),
+            mobInfo(targetMob),
+            pendingFuture != null,
+            pendingMobCosts != null
+        );
         targetMob = null;
         targetNameTag = null;
         lastGoal = null;
         pendingGoal = null;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        pendingPathTaskId = 0L;
+        pendingPathTaskStartedMs = 0L;
         computing.set(false);
         recalcCooldown = 0;
         ticksSinceRecalc = SAFETY_RECALC;
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
         pendingMobCosts = null;
-        mobCostTicks = MOB_COST_INTERVAL;
+        pendingMobCostTaskId = 0L;
+        pendingMobCostTaskStartedMs = 0L;
+        mobCostTicks = 0;
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
     }
@@ -622,6 +745,14 @@ public class Pathfinder {
                 targetMob = findRealMobNear(client, player, bestTag);
 
                 if (targetSwitched) {
+                    float newCost = getTagPathCost(bestTag.getUuid());
+                    eventLog(
+                        "target_switch prev=%s next=%s cost=%.3f mob=%s",
+                        shortUuid(prevTargetId),
+                        shortUuid(bestTag.getUuid()),
+                        newCost,
+                        mobInfo(targetMob)
+                    );
                     // Target changed -> allow immediate path recompute this tick.
                     recalcCooldown = 0;
                     ticksSinceRecalc = SAFETY_RECALC;
@@ -708,6 +839,8 @@ public class Pathfinder {
             if (targetMode == 2) match = name.contains("Bruiser");
             if (match) tags.add((ArmorStandEntity) e);
         }
+        // Drop stale name tags that no longer have a real mob nearby.
+        tags.removeIf(tag -> findRealMobNear(client, player, tag) == null);
         tags.sort(Comparator.comparingDouble(t -> t.getEntityPos().distanceTo(pPos)));
         if (tags.size() > MOB_PATH_COST_COUNT) return tags.subList(0, MOB_PATH_COST_COUNT);
         return tags;
@@ -777,9 +910,19 @@ public class Pathfinder {
             float currentCost = getTagPathCost(currentTag.getUuid());
             float spawnedCost = getTagPathCost(spawnedBest.getUuid());
 
-            // Costs not ready yet -> keep current until next cycle.
-            if (currentCost >= 1.0f || spawnedCost >= 1.0f) {
+            // Unknown costs: do not stick forever to current target.
+            if (currentCost >= 1.0f && spawnedCost >= 1.0f) {
+                pendingSpawnTagIds.clear();
+                lastNewNameTagMs = 0L;
+                return spawnedBest;
+            }
+            if (spawnedCost >= 1.0f) {
                 return currentTag;
+            }
+            if (currentCost >= 1.0f) {
+                pendingSpawnTagIds.clear();
+                lastNewNameTagMs = 0L;
+                return spawnedBest;
             }
 
             if (currentCost >= spawnedCost * TARGET_SWITCH_COST_RATIO) {
@@ -862,7 +1005,9 @@ public class Pathfinder {
                 LivingEntity.class, nameTag.getBoundingBox().expand(5),
                 ent -> !(ent instanceof ArmorStandEntity)
                     && !(ent instanceof PlayerEntity)
-                    && ent != player)) {
+                    && ent != player
+                    && ent.isAlive()
+                    && !ent.isRemoved())) {
             double d = e.getEntityPos().distanceTo(tagPos);
             if (d < closestDist) {
                 closestDist = d;
@@ -938,15 +1083,39 @@ public class Pathfinder {
 
         ticksSinceRecalc = 0;
         recalcCooldown = computeRecalcCooldown(stressLevel);
+        final long taskId = ++pathTaskSeq;
+        final long taskStartMs = System.currentTimeMillis();
+        BlockCache cache = snapshotOnClientThread(world, start, goal);
+        long snapshotMs = System.currentTimeMillis() - taskStartMs;
+        pendingPathTaskId = taskId;
+        pendingPathTaskStartedMs = taskStartMs;
+        eventLog(
+            "path[%d] start from=%s goal=%s snapshotMs=%d cooldown=%d stress=%.3f",
+            taskId,
+            start.toShortString(),
+            goal.toShortString(),
+            snapshotMs,
+            recalcCooldown,
+            stressLevel
+        );
 
         pendingFuture = CompletableFuture.supplyAsync(() -> {
+            long solveStartMs = System.currentTimeMillis();
             try {
-                // Build cache on client thread (world-safe), run A* off-thread.
-                BlockCache cache = snapshotOnClientThread(world, start, goal);
+                // Run A* off-thread against already prepared world snapshot.
                 List<BlockPos> raw = astar(cache, start, goal);
-                return smoothPath(cache, raw);
+                List<BlockPos> smooth = smoothPath(cache, raw);
+                eventLog(
+                    "path[%d] solved raw=%d smooth=%d solveMs=%d",
+                    taskId,
+                    raw.size(),
+                    smooth.size(),
+                    System.currentTimeMillis() - solveStartMs
+                );
+                return smooth;
             } catch (Exception e) {
                 System.err.println("[Pathfinder] A* error: " + e.getMessage());
+                eventLog("path[%d] solve_error %s", taskId, e.getMessage());
                 return Collections.emptyList();
             }
         });
@@ -1272,6 +1441,7 @@ public class Pathfinder {
     }
 
     private static void forceResetForTeleport(float stressLevel) {
+        eventLog("teleport_reset stress=%.3f", stressLevel);
         clearCachedSnapshot();
         currentPath = Collections.emptyList();
         waypointIndex = 0;
@@ -1281,8 +1451,12 @@ public class Pathfinder {
         recalcCooldown = 0;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
+        pendingPathTaskId = 0L;
+        pendingPathTaskStartedMs = 0L;
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
         pendingMobCosts = null;
+        pendingMobCostTaskId = 0L;
+        pendingMobCostTaskStartedMs = 0L;
         Arrays.fill(mobPathCosts, 1.0f);
         synchronized (mobPathCostByTag) {
             mobPathCostByTag.clear();

@@ -14,6 +14,10 @@ public final class TopographyController {
     private static final Map<TopographyModuleDefinition, Boolean> KEY_STATE = new EnumMap<>(TopographyModuleDefinition.class);
     private static boolean screenOpenScheduled;
 
+    // Zone transition tracking
+    private static boolean wasInZealotZone = false;
+    private static boolean wasInBruiserZone = false;
+
     private TopographyController() {
     }
 
@@ -80,6 +84,8 @@ public final class TopographyController {
             return;
         }
 
+        checkZoneTransitions(client);
+
         for (TopographyModuleDefinition module : TopographyModuleDefinition.values()) {
             if (!TopographyUiConfig.isBindEnabled(module)) {
                 KEY_STATE.put(module, false);
@@ -96,6 +102,30 @@ public final class TopographyController {
 
             KEY_STATE.put(module, pressed);
         }
+    }
+
+    private static void checkZoneTransitions(MinecraftClient client) {
+        if (client.player == null || client.inGameHud == null) return;
+        net.minecraft.util.math.Vec3d pos = client.player.getEntityPos();
+        int x = (int) pos.x, y = (int) pos.y, z = (int) pos.z;
+
+        boolean inZealot  = Pathfinder.isInFarmZone(pos, 1);
+        boolean inBruiser = Pathfinder.isInFarmZone(pos, 2);
+
+        if (inZealot && !wasInZealotZone) {
+            client.inGameHud.getChatHud().addMessage(Text.literal("§a[ВОШЁЛ] Zealot zone | " + x + " " + y + " " + z));
+        } else if (!inZealot && wasInZealotZone) {
+            client.inGameHud.getChatHud().addMessage(Text.literal("§c[ВЫШЕЛ] Zealot zone | " + x + " " + y + " " + z));
+        }
+
+        if (inBruiser && !wasInBruiserZone) {
+            client.inGameHud.getChatHud().addMessage(Text.literal("§a[ВОШЁЛ] Bruiser zone | " + x + " " + y + " " + z));
+        } else if (!inBruiser && wasInBruiserZone) {
+            client.inGameHud.getChatHud().addMessage(Text.literal("§c[ВЫШЕЛ] Bruiser zone | " + x + " " + y + " " + z));
+        }
+
+        wasInZealotZone  = inZealot;
+        wasInBruiserZone = inBruiser;
     }
 
     private static boolean toggleRecording(TopographyModuleDefinition module) {

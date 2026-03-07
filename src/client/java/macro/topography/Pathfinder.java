@@ -30,15 +30,29 @@ public class Pathfinder {
     private static final BlockPos BRUISER_PORTAL_APPROACH = new BlockPos(-616, 5, -280);
     private static final BlockPos BRUISER_HIDEOUT = new BlockPos(-616, 5, -281);
 
-    /* ── farm zones (axis-aligned cubes) ──────────────────────────── */
-    // Zealot zone (Dragon's Nest area) — adjust corners as needed
-    private static final double ZEALOT_MIN_X = -700, ZEALOT_MAX_X = -540;
-    private static final double ZEALOT_MIN_Y = -10,  ZEALOT_MAX_Y = 80;
-    private static final double ZEALOT_MIN_Z = 200,  ZEALOT_MAX_Z = 360;
-    // Bruiser zone (Bruiser Hideout area)
-    private static final double BRUISER_MIN_X = -616, BRUISER_MAX_X = -511;
-    private static final double BRUISER_MIN_Y = 38,   BRUISER_MAX_Y = 90;
-    private static final double BRUISER_MIN_Z = -279,  BRUISER_MAX_Z = -187;
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                      FARM ZONES                             ║
+    // ║  Каждая строка: { minX, maxX, minY, maxY, minZ, maxZ }     ║
+    // ║  Добавляй новые прямоугольники в нужный массив             ║
+    // ╠══════════════════════════════════════════════════════════════╣
+    // ║  ZEALOT ZONES  (Dragon's Nest)                              ║
+    // ╠══════════════════════════════════════════════════════════════╣
+    // ║  BRUISER ZONES  (Bruiser Hideout)                           ║
+    // ║  [0]  X: -625 .. -542   Y: 48 .. 97   Z: -250 .. -185     ║
+    // ║  [1]  X: -548 .. -502   Y: 38 .. 56   Z: -289 .. -214     ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // { minX, maxX, minY, maxY, minZ, maxZ }
+    private static final double ZEALOT_MIN_X  = -675, ZEALOT_MAX_X  = -565;
+    private static final double ZEALOT_MIN_Y  =    5, ZEALOT_MAX_Y  =   50;
+    private static final double ZEALOT_MIN_Z  =  225, ZEALOT_MAX_Z  =  335;
+
+    private static final double[][] BRUISER_ZONES = {
+        // { minX, maxX, minY, maxY, minZ, maxZ }
+        { -625, -542,  48,  97, -250, -185 },  // зона 1
+        { -548, -502,  38,  56, -289, -214 },  // зона 2
+        { -538, -502,  38,  52, -329, -277 },  // zone 3
+    };
 
     /* ── search limits ─────────────────────────────────────────────── */
     private static final int MAX_NODES = 10_000;
@@ -696,8 +710,22 @@ public class Pathfinder {
                                  ZEALOT_MAX_X, ZEALOT_MAX_Y, ZEALOT_MAX_Z };
         }
         if (targetMode == 2) {
-            return new double[]{ BRUISER_MIN_X, BRUISER_MIN_Y, BRUISER_MIN_Z,
-                                 BRUISER_MAX_X, BRUISER_MAX_Y, BRUISER_MAX_Z };
+            double minX = Double.POSITIVE_INFINITY;
+            double minY = Double.POSITIVE_INFINITY;
+            double minZ = Double.POSITIVE_INFINITY;
+            double maxX = Double.NEGATIVE_INFINITY;
+            double maxY = Double.NEGATIVE_INFINITY;
+            double maxZ = Double.NEGATIVE_INFINITY;
+            for (double[] z : BRUISER_ZONES) {
+                minX = Math.min(minX, z[0]);
+                maxX = Math.max(maxX, z[1]);
+                minY = Math.min(minY, z[2]);
+                maxY = Math.max(maxY, z[3]);
+                minZ = Math.min(minZ, z[4]);
+                maxZ = Math.max(maxZ, z[5]);
+            }
+            if (Double.isInfinite(minX)) return null;
+            return new double[]{ minX, minY, minZ, maxX, maxY, maxZ };
         }
         return null;
     }
@@ -710,9 +738,12 @@ public class Pathfinder {
                 && pos.z >= ZEALOT_MIN_Z && pos.z <= ZEALOT_MAX_Z;
         }
         if (targetMode == 2) {
-            return pos.x >= BRUISER_MIN_X && pos.x <= BRUISER_MAX_X
-                && pos.y >= BRUISER_MIN_Y && pos.y <= BRUISER_MAX_Y
-                && pos.z >= BRUISER_MIN_Z && pos.z <= BRUISER_MAX_Z;
+            for (double[] z : BRUISER_ZONES) {
+                if (pos.x >= z[0] && pos.x <= z[1]
+                 && pos.y >= z[2] && pos.y <= z[3]
+                 && pos.z >= z[4] && pos.z <= z[5]) return true;
+            }
+            return false;
         }
         return false;
     }
@@ -1684,3 +1715,5 @@ public class Pathfinder {
         return Math.max(0f, Math.min(1f, v));
     }
 }
+
+

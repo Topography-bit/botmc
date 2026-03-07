@@ -30,6 +30,16 @@ public class Pathfinder {
     private static final BlockPos BRUISER_PORTAL_APPROACH = new BlockPos(-616, 5, -280);
     private static final BlockPos BRUISER_HIDEOUT = new BlockPos(-616, 5, -281);
 
+    /* ── farm zones (axis-aligned cubes) ──────────────────────────── */
+    // Zealot zone (Dragon's Nest area) — adjust corners as needed
+    private static final double ZEALOT_MIN_X = -700, ZEALOT_MAX_X = -540;
+    private static final double ZEALOT_MIN_Y = -10,  ZEALOT_MAX_Y = 80;
+    private static final double ZEALOT_MIN_Z = 200,  ZEALOT_MAX_Z = 360;
+    // Bruiser zone (Bruiser Hideout area)
+    private static final double BRUISER_MIN_X = -616, BRUISER_MAX_X = -511;
+    private static final double BRUISER_MIN_Y = 38,   BRUISER_MAX_Y = 90;
+    private static final double BRUISER_MIN_Z = -279,  BRUISER_MAX_Z = -187;
+
     /* ── search limits ─────────────────────────────────────────────── */
     private static final int MAX_NODES = 10_000;
     private static final int MAX_FALL = 40;
@@ -347,7 +357,7 @@ public class Pathfinder {
             forceResetForTeleport(stressLevel);
         }
 
-        boolean farmMode = (targetMode != 0 && currentMode == targetMode);
+        boolean farmMode = (targetMode != 0 && isInFarmZone(pos, targetMode));
         if (farmMode && isCurrentTargetInvalid()) {
             eventLog("target_invalid tag=%s mob=%s", tagInfo(targetNameTag), mobInfo(targetMob));
             onTargetLost("invalid_current_target");
@@ -439,11 +449,34 @@ public class Pathfinder {
                 Math.pow(goal.getY() - start.getY(), 2) +
                 Math.pow(goal.getZ() - start.getZ(), 2));
             if (distToGoal > MAX_PATHFIND_DIST) {
-                double ratio = MAX_PATHFIND_DIST / distToGoal;
-                int ix = start.getX() + (int) ((goal.getX() - start.getX()) * ratio);
-                int iy = start.getY() + (int) ((goal.getY() - start.getY()) * ratio);
-                int iz = start.getZ() + (int) ((goal.getZ() - start.getZ()) * ratio);
-                pathGoal = findNearestStandable(client.world, new BlockPos(ix, iy, iz));
+                // Try intermediate goals at decreasing distances to avoid placing them inside walls
+                double dx = goal.getX() - start.getX();
+                double dy = goal.getY() - start.getY();
+                double dz = goal.getZ() - start.getZ();
+                BlockPos bestIntermediate = null;
+                for (double tryDist = MAX_PATHFIND_DIST; tryDist >= 15.0; tryDist -= 10.0) {
+                    double r = tryDist / distToGoal;
+                    int ix = start.getX() + (int) (dx * r);
+                    int iy = start.getY() + (int) (dy * r);
+                    int iz = start.getZ() + (int) (dz * r);
+                    BlockPos candidate = findNearestStandable(client.world, new BlockPos(ix, iy, iz));
+                    // Check the candidate is actually in open space (not buried in a wall)
+                    if (isStandableWorld(client.world, candidate.getX(), candidate.getY(), candidate.getZ())
+                        && isAirWorld(client.world, candidate.getX(), candidate.getY() + 2, candidate.getZ())) {
+                        bestIntermediate = candidate;
+                        break;
+                    }
+                }
+                if (bestIntermediate != null) {
+                    pathGoal = bestIntermediate;
+                } else {
+                    // All tried distances hit walls — use nearest standable to original calc
+                    double r = MAX_PATHFIND_DIST / distToGoal;
+                    pathGoal = findNearestStandable(client.world, new BlockPos(
+                        start.getX() + (int) (dx * r),
+                        start.getY() + (int) (dy * r),
+                        start.getZ() + (int) (dz * r)));
+                }
             }
 
             pendingGoal = goal;
@@ -656,6 +689,34 @@ public class Pathfinder {
     public static float[] getMobPathCosts() { return mobPathCosts; }
     public static List<LivingEntity> getTargetMobs() { return targetMobs; }
 
+    /** Returns farm zone bounds as [minX, minY, minZ, maxX, maxY, maxZ] or null. */
+    public static double[] getFarmZoneBounds(int targetMode) {
+        if (targetMode == 1) {
+            return new double[]{ ZEALOT_MIN_X, ZEALOT_MIN_Y, ZEALOT_MIN_Z,
+                                 ZEALOT_MAX_X, ZEALOT_MAX_Y, ZEALOT_MAX_Z };
+        }
+        if (targetMode == 2) {
+            return new double[]{ BRUISER_MIN_X, BRUISER_MIN_Y, BRUISER_MIN_Z,
+                                 BRUISER_MAX_X, BRUISER_MAX_Y, BRUISER_MAX_Z };
+        }
+        return null;
+    }
+
+    /** Check if position is inside the farm zone for the given target mode. */
+    public static boolean isInFarmZone(Vec3d pos, int targetMode) {
+        if (targetMode == 1) {
+            return pos.x >= ZEALOT_MIN_X && pos.x <= ZEALOT_MAX_X
+                && pos.y >= ZEALOT_MIN_Y && pos.y <= ZEALOT_MAX_Y
+                && pos.z >= ZEALOT_MIN_Z && pos.z <= ZEALOT_MAX_Z;
+        }
+        if (targetMode == 2) {
+            return pos.x >= BRUISER_MIN_X && pos.x <= BRUISER_MAX_X
+                && pos.y >= BRUISER_MIN_Y && pos.y <= BRUISER_MAX_Y
+                && pos.z >= BRUISER_MIN_Z && pos.z <= BRUISER_MAX_Z;
+        }
+        return false;
+    }
+
     public static void stop() {
         clearCachedSnapshot();
         if (pendingFuture != null) pendingFuture.cancel(true);
@@ -730,7 +791,7 @@ public class Pathfinder {
                                      int targetMode, int currentMode) {
         if (client.world == null) return null;
         Vec3d pPos = player.getEntityPos();
-        boolean farmMode = (targetMode != 0 && currentMode == targetMode);
+        boolean farmMode = (targetMode != 0 && isInFarmZone(pPos, targetMode));
 
         if (farmMode) {
             // Pick mob with lowest path_cost (easiest to reach), fallback to nearest
@@ -912,8 +973,9 @@ public class Pathfinder {
                 return currentTag;
             }
 
-            float currentCost = getTagPathCost(currentTag.getUuid());
-            float spawnedCost = getTagPathCost(spawnedBest.getUuid());
+            double playerY = player.getEntityPos().y;
+            float currentCost = effectiveCost(getTagPathCost(currentTag.getUuid()), playerY, currentTag);
+            float spawnedCost = effectiveCost(getTagPathCost(spawnedBest.getUuid()), playerY, spawnedBest);
 
             // Unknown costs: do not stick forever to current target.
             if (currentCost >= 1.0f && spawnedCost >= 1.0f) {
@@ -951,7 +1013,24 @@ public class Pathfinder {
         }
     }
 
-    /** Prefer visible mobs by path cost. If no visible targets, fall back to non-visible ones. */
+    /** Height penalty per block of Y difference (climbing is expensive). */
+    private static final float HEIGHT_COST_UP   = 0.02f;  // per block above player
+    private static final float HEIGHT_COST_DOWN  = 0.005f; // per block below player (falling is cheap)
+
+    /** Compute effective cost = pathCost + height penalty. */
+    private static float effectiveCost(float pathCost, double playerY, ArmorStandEntity tag) {
+        double dy = tag.getEntityPos().y - playerY;
+        float heightPenalty;
+        if (dy > 0) {
+            heightPenalty = (float) dy * HEIGHT_COST_UP;
+        } else {
+            heightPenalty = (float) (-dy) * HEIGHT_COST_DOWN;
+        }
+        return pathCost + heightPenalty;
+    }
+
+    /** Prefer visible mobs by effective cost (path + height).
+     *  If no visible targets, fall back to non-visible ones. */
     private static ArmorStandEntity pickBestByPathCostAndVisibility(MinecraftClient client,
                                                                      ClientPlayerEntity player,
                                                                      List<ArmorStandEntity> tags,
@@ -960,13 +1039,15 @@ public class Pathfinder {
         float bestVisibleCost = Float.MAX_VALUE;
         ArmorStandEntity bestHidden = null;
         float bestHiddenCost = Float.MAX_VALUE;
+        double playerY = player.getEntityPos().y;
 
         for (ArmorStandEntity tag : tags) {
             if (restrictToIds != null && !restrictToIds.isEmpty() && !restrictToIds.contains(tag.getUuid())) {
                 continue;
             }
 
-            float cost = getTagPathCost(tag.getUuid());
+            float rawCost = getTagPathCost(tag.getUuid());
+            float cost = effectiveCost(rawCost, playerY, tag);
             boolean visible = isTagVisible(client, player, tag);
             if (visible) {
                 if (cost < bestVisibleCost) {

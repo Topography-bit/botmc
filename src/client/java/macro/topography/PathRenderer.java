@@ -56,6 +56,7 @@ public class PathRenderer {
         }
 
         renderTargetMobHitbox(matrices, consumers, pulse);
+        renderFarmZone(matrices, consumers, pulse);
 
         matrices.pop();
     }
@@ -335,5 +336,39 @@ public class PathRenderer {
                 1f, g, b, fillAlpha
             );
         }
+    }
+
+    private static void renderFarmZone(MatrixStack matrices, VertexConsumerProvider consumers,
+                                        float pulse) {
+        int targetMode = Pathfinder.getActiveTargetMode();
+        if (targetMode == 0) return;
+
+        // Get zone bounds from Pathfinder
+        double[] zone = Pathfinder.getFarmZoneBounds(targetMode);
+        if (zone == null) return;
+
+        float minX = (float) zone[0];
+        float minY = (float) zone[1];
+        float minZ = (float) zone[2];
+        float maxX = (float) zone[3];
+        float maxY = (float) zone[4];
+        float maxZ = (float) zone[5];
+
+        MinecraftClient mc = MinecraftClient.getInstance();
+        boolean inside = mc.player != null
+                && Pathfinder.isInFarmZone(mc.player.getEntityPos(), targetMode);
+
+        // Green if inside, orange if outside
+        float r = inside ? 0.1f : 1.0f;
+        float g = inside ? 0.9f : 0.6f;
+        float b = inside ? 0.3f : 0.1f;
+        float outlineAlpha = 0.35f + 0.15f * pulse;
+
+        // Outline only (no fill — zone is huge)
+        VertexRendering.drawBox(
+            matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
+            minX, minY, minZ, maxX, maxY, maxZ,
+            r, g, b, outlineAlpha
+        );
     }
 }

@@ -21,7 +21,8 @@
       "Bash(\"/c/Program Files/Common Files/Oracle/Java/javapath/jar\" tf:*)",
       "Bash(xargs unzip:*)",
       "Read(//mnt/c/Users/Ghost/Videos/**)",
-      "Bash(./gradlew.bat compileJava)"
+      "Bash(./gradlew.bat compileJava)",
+      "Bash(./gradlew compileJava:*)"
     ]
   }
 }

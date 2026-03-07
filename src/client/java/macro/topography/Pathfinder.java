@@ -27,6 +27,8 @@ public class Pathfinder {
 
     /* ── destinations ─────────────────────────────────────────────── */
     private static final BlockPos DRAGONS_NEST = new BlockPos(-621, 15, 275);
+    private static final BlockPos BRUISER_PORTAL_WAYPOINT = new BlockPos(-621, 15, -282);
+    private static final BlockPos BRUISER_PORTAL_WAYPOINT_2 = new BlockPos(-619, 8, -292);
     private static final BlockPos BRUISER_PORTAL_APPROACH = new BlockPos(-616, 5, -280);
     private static final BlockPos BRUISER_HIDEOUT = new BlockPos(-616, 5, -281);
 
@@ -109,6 +111,8 @@ public class Pathfinder {
     private static final Set<UUID> pendingSpawnTagIds = new HashSet<>();
     private static long lastNewNameTagMs = 0L;
     private static int activeTargetMode = 0;
+    // 0 = none reached, 1 = first waypoint reached, 2 = second waypoint reached
+    private static int bruiserWaypointStage = 0;
     private static float lastDistToWall = 1f;
     private static float lastVerticalClearance = 1f;
     private static float lastStressLevel = 0f;
@@ -677,6 +681,7 @@ public class Pathfinder {
         targetMob = null;
         targetNameTag = null;
         activeTargetMode = 0;
+        bruiserWaypointStage = 0;
         lastDistToWall = 1f;
         lastVerticalClearance = 1f;
         lastStressLevel = 0f;
@@ -899,12 +904,33 @@ public class Pathfinder {
 
         targetMob = null;
         targetNameTag = null;
-        if (targetMode == 1) return DRAGONS_NEST;
+        if (targetMode == 1) {
+            bruiserWaypointStage = 0;
+            return DRAGONS_NEST;
+        }
         if (targetMode == 2) {
-            // Bruiser area is portal-gated: first go to portal approach point.
-            if (currentMode != 2) return BRUISER_PORTAL_APPROACH;
+            Vec3d playerPos = player.getEntityPos();
+            if (bruiserWaypointStage == 0
+                && playerPos.distanceTo(Vec3d.ofCenter(BRUISER_PORTAL_WAYPOINT)) <= 3.0) {
+                bruiserWaypointStage = 1;
+            }
+            if (bruiserWaypointStage == 1
+                && playerPos.distanceTo(Vec3d.ofCenter(BRUISER_PORTAL_WAYPOINT_2)) <= 3.0) {
+                bruiserWaypointStage = 2;
+            }
+
+            if (bruiserWaypointStage < 1) {
+                return BRUISER_PORTAL_WAYPOINT;
+            }
+            if (bruiserWaypointStage < 2) {
+                return BRUISER_PORTAL_WAYPOINT_2;
+            }
+            if (currentMode != 2) {
+                return BRUISER_PORTAL_APPROACH;
+            }
             return BRUISER_HIDEOUT;
         }
+        bruiserWaypointStage = 0;
         return null;
     }
 
@@ -1584,6 +1610,7 @@ public class Pathfinder {
         waypointIndex = 0;
         lastGoal = null;
         pendingGoal = null;
+        bruiserWaypointStage = 0;
         ticksSinceRecalc = SAFETY_RECALC;
         recalcCooldown = 0;
         if (pendingFuture != null) pendingFuture.cancel(true);

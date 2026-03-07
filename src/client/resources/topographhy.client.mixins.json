@@ -5,6 +5,7 @@
 	"compatibilityLevel": "JAVA_21",
 	"client": [
 		"ActionBarMixin",
+		"ChatScreenMixin",
 		"MouseDeltaMixin",
 		"ClientConnectionMixin",
 		"MultiplayerScreenMixin",

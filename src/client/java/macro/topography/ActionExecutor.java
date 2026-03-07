@@ -180,6 +180,10 @@ public class ActionExecutor {
         System.out.println("[ActionExecutor] Stopped");
     }
 
+    public static int getTargetMode() {
+        return lastTargetMode;
+    }
+
     /* ================================================================
      *  TICK  (20 Hz)
      * ============================================================== */
@@ -245,6 +249,13 @@ public class ActionExecutor {
                 sb2.append(String.format("%.3f,", feat[i]));
             }
             System.out.println(sb2);
+        }
+
+        /* ── FIX 0: Outside farm zone — suppress combat, just run ── */
+        boolean inFarmZone = Pathfinder.isInFarmZone(player.getEntityPos(), lastTargetMode);
+        if (!inFarmZone && lastTargetMode != 0) {
+            keys[6] = 0f; // suppress LKM (attack)
+            keys[7] = 0f; // suppress RKM (ability)
         }
 
         /* ── FIX 1: Mana guard — suppress RKM if not enough mana ── */
@@ -518,7 +529,18 @@ public class ActionExecutor {
         }
 
         /* [41..85] entity block (5 mobs × 9 features) */
-        fillEntityBlock(client, player, pos, f);
+        boolean inZone = Pathfinder.isInFarmZone(pos, lastTargetMode);
+        if (inZone || lastTargetMode == 0) {
+            fillEntityBlock(client, player, pos, f);
+        } else {
+            // Outside farm zone: zero entity block so model ignores mobs in corridors
+            for (int i = 0; i < 5; i++) {
+                int base = 41 + i * 9;
+                f[base + 5] = 0.5f; // yaw_diff neutral
+                f[base + 7] = 1f;   // competitor_dist far
+                f[base + 8] = 0.5f; // competitor_intent neutral
+            }
+        }
 
         /* [86..90] per-mob path costs (same order as CSV) */
         float[] mobCosts = Pathfinder.getMobPathCosts();
@@ -730,14 +752,9 @@ public class ActionExecutor {
 
     private static int detectMode(MinecraftClient client, ClientPlayerEntity player) {
         if (client.world == null || lastTargetMode == 0) return 0;
-        // Check if any ArmorStand name tags with matching names exist nearby
-        for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(20),
-                ent -> ent instanceof ArmorStandEntity)) {
-            String n = getMobName(e);
-            if (n.isEmpty()) continue;
-            if (lastTargetMode == 1 && n.contains("Zealot") && !n.contains("Bruiser")) return lastTargetMode;
-            if (lastTargetMode == 2 && n.contains("Bruiser")) return lastTargetMode;
+        // Zone-based: if player is inside the farm zone, we're in farm mode
+        if (Pathfinder.isInFarmZone(player.getEntityPos(), lastTargetMode)) {
+            return lastTargetMode;
         }
         return 0;
     }

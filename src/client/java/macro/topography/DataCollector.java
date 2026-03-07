@@ -512,6 +512,10 @@ public class DataCollector {
         }
     }
 
+    public static int getTargetMode() {
+        return targetMode;
+    }
+
     private static float getPressedSlotKey(MinecraftClient client) {
         for (int i = 0; i < 9; i++) {
             if (client.options.hotbarKeys[i].isPressed()) return (i + 1) / 9f;

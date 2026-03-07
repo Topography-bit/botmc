@@ -343,32 +343,53 @@ public class PathRenderer {
         int targetMode = Pathfinder.getActiveTargetMode();
         if (targetMode == 0) return;
 
-        // Get zone bounds from Pathfinder
-        double[] zone = Pathfinder.getFarmZoneBounds(targetMode);
-        if (zone == null) return;
-
-        float minX = (float) zone[0];
-        float minY = (float) zone[1];
-        float minZ = (float) zone[2];
-        float maxX = (float) zone[3];
-        float maxY = (float) zone[4];
-        float maxZ = (float) zone[5];
-
         MinecraftClient mc = MinecraftClient.getInstance();
         boolean inside = mc.player != null
                 && Pathfinder.isInFarmZone(mc.player.getEntityPos(), targetMode);
 
-        // Green if inside, orange if outside
-        float r = inside ? 0.1f : 1.0f;
-        float g = inside ? 0.9f : 0.6f;
-        float b = inside ? 0.3f : 0.1f;
         float outlineAlpha = 0.35f + 0.15f * pulse;
 
-        // Outline only (no fill — zone is huge)
-        VertexRendering.drawBox(
-            matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
-            minX, minY, minZ, maxX, maxY, maxZ,
-            r, g, b, outlineAlpha
-        );
+        // Draw each bruiser sub-zone (green=inside, orange=outside)
+        if (targetMode == 2) {
+            for (double[] z : Pathfinder.getBruiserZones()) {
+                float r = inside ? 0.1f : 1.0f;
+                float g = inside ? 0.9f : 0.6f;
+                float b = inside ? 0.3f : 0.1f;
+                VertexRendering.drawBox(
+                    matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
+                    (float)z[0], (float)z[2], (float)z[4],
+                    (float)z[1], (float)z[3], (float)z[5],
+                    r, g, b, outlineAlpha
+                );
+            }
+
+            // Draw exclusion zones in RED
+            for (double[] e : Pathfinder.getExcludeZones(targetMode)) {
+                VertexRendering.drawBox(
+                    matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
+                    (float)e[0], (float)e[2], (float)e[4],
+                    (float)e[1], (float)e[3], (float)e[5],
+                    1f, 0f, 0f, 0.7f + 0.3f * pulse
+                );
+                VertexRendering.drawFilledBox(
+                    matrices, consumers.getBuffer(RenderLayer.getDebugFilledBox()),
+                    (float)e[0], (float)e[2], (float)e[4],
+                    (float)e[1], (float)e[3], (float)e[5],
+                    1f, 0f, 0f, 0.15f
+                );
+            }
+        } else {
+            double[] zone = Pathfinder.getFarmZoneBounds(targetMode);
+            if (zone == null) return;
+            float r = inside ? 0.1f : 1.0f;
+            float g = inside ? 0.9f : 0.6f;
+            float b = inside ? 0.3f : 0.1f;
+            VertexRendering.drawBox(
+                matrices.peek(), consumers.getBuffer(RenderLayer.getLines()),
+                (float)zone[0], (float)zone[1], (float)zone[2],
+                (float)zone[3], (float)zone[4], (float)zone[5],
+                r, g, b, outlineAlpha
+            );
+        }
     }
 }

@@ -117,14 +117,13 @@ public final class TopographyController {
         } else if (!inZealot && wasInZealotZone) {
             client.inGameHud.getChatHud().addMessage(Text.literal("§c[ВЫШЕЛ] Zealot zone | " + x + " " + y + " " + z));
         }
+        wasInZealotZone = inZealot;
 
         if (inBruiser && !wasInBruiserZone) {
             client.inGameHud.getChatHud().addMessage(Text.literal("§a[ВОШЁЛ] Bruiser zone | " + x + " " + y + " " + z));
         } else if (!inBruiser && wasInBruiserZone) {
             client.inGameHud.getChatHud().addMessage(Text.literal("§c[ВЫШЕЛ] Bruiser zone | " + x + " " + y + " " + z));
         }
-
-        wasInZealotZone  = inZealot;
         wasInBruiserZone = inBruiser;
     }
 

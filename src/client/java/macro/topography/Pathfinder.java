@@ -50,8 +50,14 @@ public class Pathfinder {
     private static final double[][] BRUISER_ZONES = {
         // { minX, maxX, minY, maxY, minZ, maxZ }
         { -625, -542,  48,  97, -250, -185 },  // зона 1
-        { -548, -502,  38,  56, -289, -214 },  // зона 2
-        { -538, -502,  38,  52, -329, -277 },  // zone 3
+        { -548, -502,  38,  56, -297, -214 },  // зона 2
+        { -539, -502,  38,  52, -329, -277 },  // zone 3
+    };
+
+    // Исключения — дыры внутри BRUISER_ZONES (здесь зона НЕ считается фарм-зоной)
+    // { minX, maxX, minY, maxY, minZ, maxZ }
+    private static final double[][] BRUISER_EXCLUDE_ZONES = {
+        { -549, -538,  38,  97, -280, -253 },  // исключение 1
     };
 
     /* ── search limits ─────────────────────────────────────────────── */
@@ -704,6 +710,15 @@ public class Pathfinder {
     public static List<LivingEntity> getTargetMobs() { return targetMobs; }
 
     /** Returns farm zone bounds as [minX, minY, minZ, maxX, maxY, maxZ] or null. */
+    public static double[][] getExcludeZones(int targetMode) {
+        if (targetMode == 2) return BRUISER_EXCLUDE_ZONES;
+        return new double[0][];
+    }
+
+    public static double[][] getBruiserZones() {
+        return BRUISER_ZONES;
+    }
+
     public static double[] getFarmZoneBounds(int targetMode) {
         if (targetMode == 1) {
             return new double[]{ ZEALOT_MIN_X, ZEALOT_MIN_Y, ZEALOT_MIN_Z,
@@ -738,6 +753,11 @@ public class Pathfinder {
                 && pos.z >= ZEALOT_MIN_Z && pos.z <= ZEALOT_MAX_Z;
         }
         if (targetMode == 2) {
+            for (double[] e : BRUISER_EXCLUDE_ZONES) {
+                if (pos.x >= e[0] && pos.x <= e[1]
+                 && pos.y >= e[2] && pos.y <= e[3]
+                 && pos.z >= e[4] && pos.z <= e[5]) return false;
+            }
             for (double[] z : BRUISER_ZONES) {
                 if (pos.x >= z[0] && pos.x <= z[1]
                  && pos.y >= z[2] && pos.y <= z[3]

@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class Pathfinder {
 
     /* ── destinations ─────────────────────────────────────────────── */
-    private static final BlockPos DRAGONS_NEST = new BlockPos(-621, 15, 275);
+    private static final BlockPos DRAGONS_NEST = new BlockPos(-608, 22, -275);
     private static final BlockPos BRUISER_PORTAL_WAYPOINT = new BlockPos(-621, 15, -282);
     private static final BlockPos BRUISER_PORTAL_WAYPOINT_2 = new BlockPos(-619, 8, -292);
     private static final BlockPos BRUISER_PORTAL_APPROACH = new BlockPos(-616, 5, -280);
@@ -39,7 +39,7 @@ public class Pathfinder {
     // ║  Каждая строка: { minX, maxX, minY, maxY, minZ, maxZ }     ║
     // ║  Добавляй новые прямоугольники в нужный массив             ║
     // ╠══════════════════════════════════════════════════════════════╣
-    // ║  ZEALOT ZONES  (Dragon's Nest)                              ║
+    // ║  ZEALOT ZONES   X: -746..-599  Y: 5..28  Z: -353..-200    ║
     // ╠══════════════════════════════════════════════════════════════╣
     // ║  BRUISER ZONES  (Bruiser Hideout)                           ║
     // ║  [0]  X: -625 .. -542   Y: 48 .. 97   Z: -250 .. -185     ║
@@ -47,9 +47,9 @@ public class Pathfinder {
     // ╚══════════════════════════════════════════════════════════════╝
 
     // { minX, maxX, minY, maxY, minZ, maxZ }
-    private static final double ZEALOT_MIN_X  = -675, ZEALOT_MAX_X  = -565;
-    private static final double ZEALOT_MIN_Y  =    5, ZEALOT_MAX_Y  =   50;
-    private static final double ZEALOT_MIN_Z  =  225, ZEALOT_MAX_Z  =  335;
+    private static final double ZEALOT_MIN_X  = -746, ZEALOT_MAX_X  = -599;
+    private static final double ZEALOT_MIN_Y  =    5, ZEALOT_MAX_Y  =   28;
+    private static final double ZEALOT_MIN_Z  = -353, ZEALOT_MAX_Z  = -200;
 
     private static final double[][] BRUISER_ZONES = {
         // { minX, maxX, minY, maxY, minZ, maxZ }
@@ -65,7 +65,7 @@ public class Pathfinder {
     };
 
     /* ── search limits ─────────────────────────────────────────────── */
-    private static final int MAX_NODES = 10_000;
+    private static final int MAX_NODES = 25_000;
     private static final int MAX_FALL = 40;
     private static final int CACHE_RADIUS = 80;
     private static final double MAX_PATHFIND_DIST = 50.0; // intermediate goal distance
@@ -77,7 +77,8 @@ public class Pathfinder {
     private static final float POS_ANOMALY_RESET_THRESH = 0.15f;
     private static final long SNAPSHOT_REUSE_MS = 650L;
     private static final int SNAPSHOT_COVER_MARGIN = 8;
-    private static final double HEURISTIC_WEIGHT = 1.22;
+    private static final double HEURISTIC_WEIGHT = 1.05;
+    private static final int INTERMEDIATE_GOAL_MAX_Y_DELTA = 8; // max Y diff for intermediate goal
 
     /* ── waypoint management ──────────────────────────────────────── */
     private static final double ADVANCE_RADIUS_BASE = 1.5;
@@ -108,6 +109,7 @@ public class Pathfinder {
     private static final float SPECIAL_ZEALOT_DISCOUNT = 0.15f; // Special Zealots get cost * 0.15 (massive priority)
     private static final double COMMITMENT_RADIUS = 15.0;      // don't switch if closer than this
     private static final float SOFT_CHOICE_THRESHOLD = 0.15f;  // 15% cost margin for randomization
+    private static final float REACHABLE_COST_THRESHOLD = 0.95f; // mobs with cost >= this are considered unreachable
     public static final int MOB_PATH_COST_COUNT = 5;
 
     /* ── state ────────────────────────────────────────────────────── */
@@ -136,6 +138,12 @@ public class Pathfinder {
     private static Vec3d lastPlayerPos = null;
     private static Vec3d lastPlayerVelocity = Vec3d.ZERO;
     private static boolean wasOnGround = true;
+
+    /* ── unreachable target tracking ── */
+    private static int consecutivePathFailures = 0;
+    private static final int MAX_PATH_FAILURES = 3;
+    private static final Map<UUID, Long> unreachableBlacklist = new HashMap<>();
+    private static final long BLACKLIST_DURATION_MS = 8000L; // don't retry blacklisted mob for 8s
 
     /* ── per-mob path costs (cached, updated async) ── */
     private static final float[] mobPathCosts = new float[MOB_PATH_COST_COUNT]; // [0,1] normalized
@@ -440,8 +448,20 @@ public class Pathfinder {
                 if (currentPath.isEmpty()) {
                     // Do not keep stale path when replan fails; it can point backward.
                     lastGoal = null;
-                } else if (pendingGoal != null) {
-                    lastGoal = pendingGoal;
+                    // Track consecutive failures to current target mob
+                    if (targetNameTag != null) {
+                        consecutivePathFailures++;
+                        eventLog("path_fail consecutiveFails=%d tag=%s", consecutivePathFailures, shortUuid(targetNameTag.getUuid()));
+                        if (consecutivePathFailures >= MAX_PATH_FAILURES) {
+                            eventLog("target_blacklisted tag=%s after %d failures", shortUuid(targetNameTag.getUuid()), consecutivePathFailures);
+                            unreachableBlacklist.put(targetNameTag.getUuid(), System.currentTimeMillis());
+                            onTargetLost("unreachable");
+                            consecutivePathFailures = 0;
+                        }
+                    }
+                } else {
+                    consecutivePathFailures = 0;
+                    if (pendingGoal != null) lastGoal = pendingGoal;
                 }
                 long totalMs = pendingPathTaskStartedMs > 0L
                     ? (System.currentTimeMillis() - pendingPathTaskStartedMs)
@@ -522,15 +542,22 @@ public class Pathfinder {
                 Math.pow(goal.getY() - start.getY(), 2) +
                 Math.pow(goal.getZ() - start.getZ(), 2));
             if (distToGoal > MAX_PATHFIND_DIST) {
-                // Try intermediate goals at decreasing distances to avoid placing them inside walls
+                // Try intermediate goals at decreasing distances to avoid placing them inside walls.
+                // Use only horizontal direction (XZ) for intermediate goal — clamp Y delta so we
+                // don't send the pathfinder flying up toward mobs on high ledges.
                 double dx = goal.getX() - start.getX();
                 double dy = goal.getY() - start.getY();
                 double dz = goal.getZ() - start.getZ();
+                // Horizontal-only distance for ratio (so XZ fraction is correct)
+                double hDist = Math.sqrt(dx * dx + dz * dz);
                 BlockPos bestIntermediate = null;
                 for (double tryDist = MAX_PATHFIND_DIST; tryDist >= 15.0; tryDist -= 10.0) {
-                    double r = tryDist / distToGoal;
+                    double r = hDist > 0.1 ? Math.min(tryDist / hDist, 1.0) : 0.0;
                     int ix = start.getX() + (int) (dx * r);
-                    int iy = start.getY() + (int) (dy * r);
+                    // Clamp Y: don't go more than INTERMEDIATE_GOAL_MAX_Y_DELTA blocks from start
+                    int rawIy = start.getY() + (int) (dy * r);
+                    int iy = Math.max(start.getY() - INTERMEDIATE_GOAL_MAX_Y_DELTA,
+                                      Math.min(start.getY() + INTERMEDIATE_GOAL_MAX_Y_DELTA, rawIy));
                     int iz = start.getZ() + (int) (dz * r);
                     BlockPos candidate = findNearestStandable(client.world, new BlockPos(ix, iy, iz));
                     // Check the candidate is actually in open space (not buried in a wall)
@@ -543,11 +570,14 @@ public class Pathfinder {
                 if (bestIntermediate != null) {
                     pathGoal = bestIntermediate;
                 } else {
-                    // All tried distances hit walls — use nearest standable to original calc
-                    double r = MAX_PATHFIND_DIST / distToGoal;
+                    // All tried distances hit walls — use nearest standable, Y clamped
+                    double r = hDist > 0.1 ? Math.min(MAX_PATHFIND_DIST / hDist, 1.0) : 0.0;
+                    int rawIy = start.getY() + (int) (dy * r);
+                    int iy = Math.max(start.getY() - INTERMEDIATE_GOAL_MAX_Y_DELTA,
+                                      Math.min(start.getY() + INTERMEDIATE_GOAL_MAX_Y_DELTA, rawIy));
                     pathGoal = findNearestStandable(client.world, new BlockPos(
                         start.getX() + (int) (dx * r),
-                        start.getY() + (int) (dy * r),
+                        iy,
                         start.getZ() + (int) (dz * r)));
                 }
             }
@@ -864,6 +894,8 @@ public class Pathfinder {
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
         targetAcquiredMs = 0L;
+        consecutivePathFailures = 0;
+        unreachableBlacklist.clear();
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -1002,6 +1034,8 @@ public class Pathfinder {
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
         targetAcquiredMs = 0L;
+        consecutivePathFailures = 0;
+        unreachableBlacklist.clear();
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -1094,8 +1128,8 @@ public class Pathfinder {
                                                  toPlayer.z / hDist * dist);
                         Vec3d goal = tagPos.add(offset);
                         BlockPos gb = BlockPos.ofFloored(goal.x, goal.y, goal.z);
-                        // Try current Y, Y-1, Y-2 (name tag floats above mob)
-                        for (int dy = 0; dy >= -3; dy--) {
+                        // Try current Y down to -15 (name tag can float well above mob/ground)
+                        for (int dy = 0; dy >= -15; dy--) {
                             if (isStandableWorld(client.world, gb.getX(), gb.getY() + dy, gb.getZ())) {
                                 return new BlockPos(gb.getX(), gb.getY() + dy, gb.getZ());
                             }
@@ -1145,7 +1179,7 @@ public class Pathfinder {
     /** Find the nearest standable block within a small radius. */
     private static BlockPos findNearestStandable(ClientWorld world, BlockPos center) {
         // Search downward first (name tags float above mobs)
-        for (int dy = 0; dy >= -5; dy--) {
+        for (int dy = 0; dy >= -20; dy--) {
             if (isStandableWorld(world, center.getX(), center.getY() + dy, center.getZ())) {
                 return new BlockPos(center.getX(), center.getY() + dy, center.getZ());
             }
@@ -1154,7 +1188,7 @@ public class Pathfinder {
         BlockPos best = center;
         for (int dx = -3; dx <= 3; dx++) {
             for (int dz = -3; dz <= 3; dz++) {
-                for (int dy = -5; dy <= 2; dy++) {
+                for (int dy = -20; dy <= 2; dy++) {
                     int x = center.getX() + dx, y = center.getY() + dy, z = center.getZ() + dz;
                     if (isStandableWorld(world, x, y, z)) {
                         double d = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -1237,10 +1271,15 @@ public class Pathfinder {
             if (targetMode == 2) match = name.contains("Bruiser") || name.contains("Special Zealot");
             if (match) tags.add((ArmorStandEntity) e);
         }
-        // Drop stale name tags that no longer have a real mob nearby.
+        // Remove expired blacklist entries
+        long nowMs = System.currentTimeMillis();
+        unreachableBlacklist.entrySet().removeIf(e -> nowMs - e.getValue() > BLACKLIST_DURATION_MS);
+
+        // Drop stale name tags that no longer have a real mob nearby, or are blacklisted.
         // Also collect real mobs for rendering (updated every tick, not tied to async A*).
         List<LivingEntity> realMobs = new ArrayList<>();
         tags.removeIf(tag -> {
+            if (unreachableBlacklist.containsKey(tag.getUuid())) return true;
             LivingEntity real = findRealMobNear(client, player, tag);
             if (real == null) return true;
             realMobs.add(real);
@@ -1404,7 +1443,7 @@ public class Pathfinder {
     }
 
     /** Height penalty per block of Y difference (climbing is expensive). */
-    private static final float HEIGHT_COST_UP   = 0.02f;  // per block above player
+    private static final float HEIGHT_COST_UP   = 0.05f;  // per block above player
     private static final float HEIGHT_COST_DOWN  = 0.005f; // per block below player (falling is cheap)
 
     /** Compute effective cost = pathCost * fovBias + height penalty. */
@@ -1477,34 +1516,42 @@ public class Pathfinder {
     /**
      * Soft-choice selection: when no current target exists, pick among all candidates
      * with randomization if top candidates are within SOFT_CHOICE_THRESHOLD of each other.
-     * This prevents always picking the exact same mob deterministically.
+     * Prefers mobs with known reachable path cost over unreachable ones.
      */
     private static ArmorStandEntity pickBestWithSoftChoice(MinecraftClient client,
                                                             ClientPlayerEntity player,
                                                             List<ArmorStandEntity> tags) {
         if (tags.size() == 1) return tags.get(0);
 
-        double playerY = player.getEntityPos().y;
-        float[] costs = new float[tags.size()];
-        float bestCost = Float.MAX_VALUE;
-
-        for (int i = 0; i < tags.size(); i++) {
-            costs[i] = selectionCost(getTagPathCost(tags.get(i).getUuid()), playerY, tags.get(i), client, player);
-            if (costs[i] < bestCost) bestCost = costs[i];
+        // Special Zealot always wins — no randomization
+        for (ArmorStandEntity tag : tags) {
+            if (isSpecialZealot(tag)) return tag;
         }
 
-        // Special Zealot always wins — no randomization
-        for (int i = 0; i < tags.size(); i++) {
-            if (isSpecialZealot(tags.get(i))) return tags.get(i);
+        // Prefer mobs with known reachable path cost; fall back to all if none known
+        List<ArmorStandEntity> reachable = new ArrayList<>();
+        for (ArmorStandEntity tag : tags) {
+            if (getTagPathCost(tag.getUuid()) < REACHABLE_COST_THRESHOLD) reachable.add(tag);
+        }
+        List<ArmorStandEntity> workingTags = reachable.isEmpty() ? tags : reachable;
+        if (workingTags.size() == 1) return workingTags.get(0);
+
+        double playerY = player.getEntityPos().y;
+        float[] costs = new float[workingTags.size()];
+        float bestCost = Float.MAX_VALUE;
+
+        for (int i = 0; i < workingTags.size(); i++) {
+            costs[i] = selectionCost(getTagPathCost(workingTags.get(i).getUuid()), playerY, workingTags.get(i), client, player);
+            if (costs[i] < bestCost) bestCost = costs[i];
         }
 
         // Collect candidates within threshold of the best
         float threshold = bestCost * (1.0f + SOFT_CHOICE_THRESHOLD);
         List<ArmorStandEntity> candidates = new ArrayList<>();
         List<Float> candidateCosts = new ArrayList<>();
-        for (int i = 0; i < tags.size(); i++) {
+        for (int i = 0; i < workingTags.size(); i++) {
             if (costs[i] <= threshold) {
-                candidates.add(tags.get(i));
+                candidates.add(workingTags.get(i));
                 candidateCosts.add(costs[i]);
             }
         }

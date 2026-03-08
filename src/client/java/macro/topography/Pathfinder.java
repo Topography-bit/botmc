@@ -16,6 +16,7 @@ import net.minecraft.world.chunk.WorldChunk;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -78,9 +79,11 @@ public class Pathfinder {
     private static final double HEURISTIC_WEIGHT = 1.22;
 
     /* ── waypoint management ──────────────────────────────────────── */
-    private static final double ADVANCE_RADIUS = 1.5;
+    private static final double ADVANCE_RADIUS_BASE = 1.5;
+    private static final double ADVANCE_RADIUS_MAX = 3.0;
     private static final double FINAL_RADIUS = 0.3;
     private static final double WAYPOINT_PROGRESS_EPS_SQ = 0.05;
+    private static final double GOAL_TIGHTEN_DIST = 5.0; // start tightening radius within this distance
     public static final int PATH_HORIZON_POINTS = 5;
     public static final int PATH_FEATURE_COUNT = PATH_HORIZON_POINTS * 3;
 
@@ -92,8 +95,15 @@ public class Pathfinder {
     /* ── mob targeting ────────────────────────────────────────────── */
     private static final double ATTACK_STANDOFF = 1.75;
     private static final double PATH_COST_MAX = 100.0; // normalize path costs to [0,1]
-    private static final float TARGET_SWITCH_COST_RATIO = 1.5f;
-    private static final long TARGET_SWITCH_DELAY_MS = 200L;
+    private static final float TARGET_SWITCH_COST_RATIO_BASE = 1.3f;
+    private static final float TARGET_SWITCH_COST_RATIO_MAX  = 2.5f;
+    private static final long  TARGET_SWITCH_DELAY_MS_MIN = 200L;
+    private static final long  TARGET_SWITCH_DELAY_MS_MAX = 600L;
+    private static final float FOV_BIAS_WEIGHT = 0.5f;        // angular cost multiplier
+    private static final float HIDDEN_MOB_PENALTY = 1.8f;     // cost multiplier for non-visible mobs
+    private static final float SPECIAL_ZEALOT_DISCOUNT = 0.15f; // Special Zealots get cost * 0.15 (massive priority)
+    private static final double COMMITMENT_RADIUS = 15.0;      // don't switch if closer than this
+    private static final float SOFT_CHOICE_THRESHOLD = 0.15f;  // 15% cost margin for randomization
     public static final int MOB_PATH_COST_COUNT = 5;
 
     /* ── state ────────────────────────────────────────────────────── */
@@ -110,6 +120,9 @@ public class Pathfinder {
     private static final Set<UUID> seenNameTagIds = new HashSet<>();
     private static final Set<UUID> pendingSpawnTagIds = new HashSet<>();
     private static long lastNewNameTagMs = 0L;
+    private static long targetAcquiredMs = 0L;          // when current target was picked
+    private static long currentSwitchDelayMs = 200L;    // randomized per-spawn delay
+    private static BlockPos roamingGoal = null;          // random point to walk to when no mobs
     private static int activeTargetMode = 0;
     // 0 = none reached, 1 = first waypoint reached, 2 = second waypoint reached
     private static int bruiserWaypointStage = 0;
@@ -438,12 +451,13 @@ public class Pathfinder {
             pendingPathTaskStartedMs = 0L;
         }
 
-        // Advance waypoint
+        // Advance waypoint (dynamic radius + corner cutting)
         if (!currentPath.isEmpty() && waypointIndex < currentPath.size()) {
             BlockPos wp = currentPath.get(waypointIndex);
             double dist = pos.distanceTo(Vec3d.ofCenter(wp));
             boolean isFinal = waypointIndex == currentPath.size() - 1;
-            double radius = isFinal ? FINAL_RADIUS : ADVANCE_RADIUS;
+            double radius = isFinal ? FINAL_RADIUS
+                : computeAdvanceRadius(currentPath, waypointIndex, pos, player.getVelocity().horizontalLength());
             if (dist < radius) {
                 waypointIndex++;
             }
@@ -655,19 +669,75 @@ public class Pathfinder {
         float[] out = new float[PATH_FEATURE_COUNT];
         if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return out;
 
+        // Build control points for Catmull-Rom: player + upcoming waypoints
+        int remaining = currentPath.size() - waypointIndex;
+        int nControl = Math.min(remaining, PATH_HORIZON_POINTS + 2); // extra for spline tangents
+        Vec3d[] controls = new Vec3d[nControl + 1]; // +1 for player pos as first point
+        controls[0] = playerPos;
+        for (int i = 0; i < nControl; i++) {
+            controls[i + 1] = Vec3d.ofCenter(currentPath.get(waypointIndex + i));
+        }
+
+        // Total arc length estimate for parameterization
+        double totalLen = 0;
+        double[] segLens = new double[controls.length - 1];
+        for (int i = 0; i < segLens.length; i++) {
+            segLens[i] = controls[i].distanceTo(controls[i + 1]);
+            totalLen += segLens[i];
+        }
+        if (totalLen < 0.01) return out;
+
+        // Sample PATH_HORIZON_POINTS evenly along Catmull-Rom curve
         int outIndex = 0;
-        for (int i = 0; i < PATH_HORIZON_POINTS; i++) {
-            int idx = waypointIndex + i;
-            if (idx >= currentPath.size()) {
-                outIndex += 3;
-                continue;
-            }
-            Vec3d wpCenter = Vec3d.ofCenter(currentPath.get(idx));
-            out[outIndex++] = normalizePathDelta(wpCenter.x - playerPos.x);
-            out[outIndex++] = normalizePathDelta(wpCenter.y - playerPos.y);
-            out[outIndex++] = normalizePathDelta(wpCenter.z - playerPos.z);
+        for (int h = 0; h < PATH_HORIZON_POINTS; h++) {
+            // t in [0,1] — skip t=0 (player pos), distribute from ~0.15 onwards
+            double t = (h + 1.0) / (PATH_HORIZON_POINTS + 0.5);
+            Vec3d pt = sampleCatmullRom(controls, segLens, totalLen, t);
+            out[outIndex++] = normalizePathDelta(pt.x - playerPos.x);
+            out[outIndex++] = normalizePathDelta(pt.y - playerPos.y);
+            out[outIndex++] = normalizePathDelta(pt.z - playerPos.z);
         }
         return out;
+    }
+
+    /** Sample a point on a Catmull-Rom spline through control points at parameter t∈[0,1]. */
+    private static Vec3d sampleCatmullRom(Vec3d[] pts, double[] segLens, double totalLen, double t) {
+        // Map t to arc length position
+        double targetLen = t * totalLen;
+        double accum = 0;
+        int seg = 0;
+        for (; seg < segLens.length - 1; seg++) {
+            if (accum + segLens[seg] >= targetLen) break;
+            accum += segLens[seg];
+        }
+        double localT = (segLens[seg] > 0.001) ? (targetLen - accum) / segLens[seg] : 0;
+
+        // Catmull-Rom needs 4 points: p0, p1, p2, p3
+        int i1 = seg;
+        int i2 = seg + 1;
+        int i0 = Math.max(0, i1 - 1);
+        int i3 = Math.min(pts.length - 1, i2 + 1);
+
+        return catmullRomInterp(pts[i0], pts[i1], pts[i2], pts[i3], localT);
+    }
+
+    /** Catmull-Rom interpolation between p1 and p2, using p0 and p3 as tangent guides. */
+    private static Vec3d catmullRomInterp(Vec3d p0, Vec3d p1, Vec3d p2, Vec3d p3, double t) {
+        double t2 = t * t;
+        double t3 = t2 * t;
+        double x = 0.5 * ((2 * p1.x)
+            + (-p0.x + p2.x) * t
+            + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2
+            + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+        double y = 0.5 * ((2 * p1.y)
+            + (-p0.y + p2.y) * t
+            + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2
+            + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+        double z = 0.5 * ((2 * p1.z)
+            + (-p0.z + p2.z) * t
+            + (2 * p0.z - 5 * p1.z + 4 * p2.z - p3.z) * t2
+            + (-p0.z + 3 * p1.z - 3 * p2.z + p3.z) * t3);
+        return new Vec3d(x, y, z);
     }
 
     public static void reset() {
@@ -693,6 +763,7 @@ public class Pathfinder {
         seenNameTagIds.clear();
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
+        targetAcquiredMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -709,6 +780,37 @@ public class Pathfinder {
 
     public static List<BlockPos> getCurrentPath() { return currentPath; }
     public static int getWaypointIndex() { return waypointIndex; }
+
+    /**
+     * Get smooth Catmull-Rom curve points for rendering.
+     * Returns ~samplesPerSeg points per path segment from waypointIndex onward.
+     */
+    public static List<Vec3d> getSmoothedCurve(Vec3d playerPos, int samplesPerSeg) {
+        List<Vec3d> curve = new ArrayList<>();
+        if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return curve;
+
+        int remaining = currentPath.size() - waypointIndex;
+        Vec3d[] controls = new Vec3d[remaining + 1];
+        controls[0] = playerPos;
+        for (int i = 0; i < remaining; i++) {
+            controls[i + 1] = Vec3d.ofCenter(currentPath.get(waypointIndex + i));
+        }
+        if (controls.length < 2) return curve;
+
+        for (int seg = 0; seg < controls.length - 1; seg++) {
+            int i0 = Math.max(0, seg - 1);
+            int i1 = seg;
+            int i2 = seg + 1;
+            int i3 = Math.min(controls.length - 1, seg + 2);
+            for (int s = 0; s <= samplesPerSeg; s++) {
+                double t = (double) s / samplesPerSeg;
+                // Skip first point of non-first segments to avoid duplicates
+                if (seg > 0 && s == 0) continue;
+                curve.add(catmullRomInterp(controls[i0], controls[i1], controls[i2], controls[i3], t));
+            }
+        }
+        return curve;
+    }
     public static LivingEntity getTargetMob() { return targetMob; }
     public static int getActiveTargetMode() { return activeTargetMode; }
     public static float[] getMobPathCosts() { return mobPathCosts; }
@@ -795,6 +897,7 @@ public class Pathfinder {
         seenNameTagIds.clear();
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
+        targetAcquiredMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -837,6 +940,7 @@ public class Pathfinder {
         mobCostTicks = 0;
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
+        targetAcquiredMs = 0L;
     }
 
     /* ================================================================
@@ -900,6 +1004,9 @@ public class Pathfinder {
                 // Fallback: find any standable position near the tag
                 return findNearestStandable(client.world, mobBlock);
             }
+
+            // No mobs found in farm zone — roam to a random point within the zone
+            return pickRoamingGoal(client, player, targetMode);
         }
 
         targetMob = null;
@@ -961,6 +1068,49 @@ public class Pathfinder {
         return best;
     }
 
+    /**
+     * Pick a random roaming goal within the farm zone when no mobs are available.
+     * Reuses the same goal until the player gets close, then picks a new one.
+     */
+    private static BlockPos pickRoamingGoal(MinecraftClient client, ClientPlayerEntity player, int targetMode) {
+        targetMob = null;
+        targetNameTag = null;
+        Vec3d pPos = player.getEntityPos();
+
+        // Reuse existing roaming goal if still far away
+        if (roamingGoal != null) {
+            double dist = pPos.distanceTo(Vec3d.ofCenter(roamingGoal));
+            if (dist > 5.0 && isInFarmZone(Vec3d.ofCenter(roamingGoal), targetMode)) {
+                return roamingGoal;
+            }
+        }
+
+        // Pick a new random point within the farm zone
+        double[] bounds = getFarmZoneBounds(targetMode);
+        if (bounds == null) return null;
+
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        for (int attempt = 0; attempt < 20; attempt++) {
+            int x = (int)(bounds[0] + rng.nextDouble() * (bounds[3] - bounds[0]));
+            int z = (int)(bounds[2] + rng.nextDouble() * (bounds[5] - bounds[2]));
+            // Must be far enough from current position to be worth walking
+            double hDist = Math.sqrt((x - pPos.x) * (x - pPos.x) + (z - pPos.z) * (z - pPos.z));
+            if (hDist < 15) continue;
+
+            // Search for standable Y within zone bounds
+            int minY = (int) bounds[1];
+            int maxY = (int) bounds[4];
+            for (int y = maxY; y >= minY; y--) {
+                if (client.world != null && isStandableWorld(client.world, x, y, z)) {
+                    roamingGoal = new BlockPos(x, y, z);
+                    eventLog("roaming_goal pos=%s", roamingGoal.toShortString());
+                    return roamingGoal;
+                }
+            }
+        }
+        return roamingGoal; // keep old goal if no new one found
+    }
+
     /* ================================================================
      *  MOB TARGETING — find ArmorStand name tags, then pair with real mob
      * ============================================================== */
@@ -979,13 +1129,24 @@ public class Pathfinder {
             if (name.isEmpty()) continue;
             boolean match = false;
             if (targetMode == 1) match = name.contains("Zealot") && !name.contains("Bruiser");
-            if (targetMode == 2) match = name.contains("Bruiser");
+            if (targetMode == 2) match = name.contains("Bruiser") || name.contains("Special Zealot");
             if (match) tags.add((ArmorStandEntity) e);
         }
         // Drop stale name tags that no longer have a real mob nearby.
-        tags.removeIf(tag -> findRealMobNear(client, player, tag) == null);
+        // Also collect real mobs for rendering (updated every tick, not tied to async A*).
+        List<LivingEntity> realMobs = new ArrayList<>();
+        tags.removeIf(tag -> {
+            LivingEntity real = findRealMobNear(client, player, tag);
+            if (real == null) return true;
+            realMobs.add(real);
+            return false;
+        });
         tags.sort(Comparator.comparingDouble(t -> t.getEntityPos().distanceTo(pPos)));
-        if (tags.size() > MOB_PATH_COST_COUNT) return tags.subList(0, MOB_PATH_COST_COUNT);
+        if (tags.size() > MOB_PATH_COST_COUNT) {
+            targetMobs = realMobs.subList(0, MOB_PATH_COST_COUNT);
+            return tags.subList(0, MOB_PATH_COST_COUNT);
+        }
+        targetMobs = realMobs;
         return tags;
     }
 
@@ -997,6 +1158,7 @@ public class Pathfinder {
             seenNameTagIds.clear();
             pendingSpawnTagIds.clear();
             lastNewNameTagMs = 0L;
+            targetAcquiredMs = 0L;
             return null;
         }
 
@@ -1018,6 +1180,9 @@ public class Pathfinder {
         if (hasNewTag) {
             lastNewNameTagMs = now;
             pendingSpawnTagIds.addAll(newTagIds);
+            // Randomize reaction delay per spawn event (humans react in 200-600ms)
+            currentSwitchDelayMs = TARGET_SWITCH_DELAY_MS_MIN
+                    + ThreadLocalRandom.current().nextLong(TARGET_SWITCH_DELAY_MS_MAX - TARGET_SWITCH_DELAY_MS_MIN);
         }
 
         ArmorStandEntity currentTag = null;
@@ -1031,15 +1196,34 @@ public class Pathfinder {
             }
         }
 
-        // Sticky target policy:
-        // switch only after a new spawn event, with 200 ms delay,
-        // and only if currentCost >= TARGET_SWITCH_COST_RATIO * newCost.
+        // If ANY visible Special Zealot exists, always switch to it immediately.
+        if (!isSpecialZealot(currentTag != null ? currentTag : tags.get(0))) {
+            for (ArmorStandEntity t : tags) {
+                if (isSpecialZealot(t)) {
+                    pendingSpawnTagIds.clear();
+                    lastNewNameTagMs = 0L;
+                    targetAcquiredMs = now;
+                    eventLog("special_zealot_override tag=%s", shortUuid(t.getUuid()));
+                    return t;
+                }
+            }
+        }
+
+        // Sticky target policy with human-like attention momentum, commitment, and reaction delay.
         if (currentTag != null) {
+            // Commitment: if we're close to the current target, don't switch.
+            double distToTarget = player.getEntityPos().distanceTo(currentTag.getEntityPos());
+            if (distToTarget < COMMITMENT_RADIUS) {
+                pendingSpawnTagIds.clear();
+                lastNewNameTagMs = 0L;
+                return currentTag;
+            }
+
             if (lastNewNameTagMs <= 0L) {
                 return currentTag;
             }
             long elapsed = now - lastNewNameTagMs;
-            if (elapsed < TARGET_SWITCH_DELAY_MS) {
+            if (elapsed < currentSwitchDelayMs) {
                 return currentTag;
             }
 
@@ -1058,6 +1242,7 @@ public class Pathfinder {
             if (currentCost >= 1.0f && spawnedCost >= 1.0f) {
                 pendingSpawnTagIds.clear();
                 lastNewNameTagMs = 0L;
+                targetAcquiredMs = now;
                 return spawnedBest;
             }
             if (spawnedCost >= 1.0f) {
@@ -1066,12 +1251,20 @@ public class Pathfinder {
             if (currentCost >= 1.0f) {
                 pendingSpawnTagIds.clear();
                 lastNewNameTagMs = 0L;
+                targetAcquiredMs = now;
                 return spawnedBest;
             }
 
-            if (currentCost >= spawnedCost * TARGET_SWITCH_COST_RATIO) {
+            // Attention momentum: the longer we've been on this target, the harder to switch.
+            float timeOnTargetSec = (now - targetAcquiredMs) / 1000f;
+            float switchRatio = TARGET_SWITCH_COST_RATIO_BASE
+                    + 0.3f * Math.min(timeOnTargetSec, 4.0f); // grows from 1.3 to 2.5 over 4 sec
+            switchRatio = Math.min(switchRatio, TARGET_SWITCH_COST_RATIO_MAX);
+
+            if (currentCost >= spawnedCost * switchRatio) {
                 pendingSpawnTagIds.clear();
                 lastNewNameTagMs = 0L;
+                targetAcquiredMs = now;
                 return spawnedBest;
             }
 
@@ -1080,7 +1273,9 @@ public class Pathfinder {
             return currentTag;
         }
 
-        ArmorStandEntity best = pickBestByPathCostAndVisibility(client, player, tags, null);
+        // No current target — pick best with soft randomization among close candidates.
+        ArmorStandEntity best = pickBestWithSoftChoice(client, player, tags);
+        targetAcquiredMs = now;
         return best != null ? best : tags.get(0);
     }
 
@@ -1094,7 +1289,7 @@ public class Pathfinder {
     private static final float HEIGHT_COST_UP   = 0.02f;  // per block above player
     private static final float HEIGHT_COST_DOWN  = 0.005f; // per block below player (falling is cheap)
 
-    /** Compute effective cost = pathCost + height penalty. */
+    /** Compute effective cost = pathCost * fovBias + height penalty. */
     private static float effectiveCost(float pathCost, double playerY, ArmorStandEntity tag) {
         double dy = tag.getEntityPos().y - playerY;
         float heightPenalty;
@@ -1103,19 +1298,47 @@ public class Pathfinder {
         } else {
             heightPenalty = (float) (-dy) * HEIGHT_COST_DOWN;
         }
-        return pathCost + heightPenalty;
+
+        // FOV bias: mobs behind the player cost more (humans don't see behind them)
+        float fovFactor = 1.0f;
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) {
+            Vec3d toTag = tag.getEntityPos().subtract(mc.player.getEntityPos());
+            double yawToTag = Math.toDegrees(Math.atan2(-toTag.x, toTag.z));
+            double playerYaw = mc.player.getYaw();
+            double diff = Math.abs(((yawToTag - playerYaw) % 360 + 540) % 360 - 180);
+            // diff is 0..180; mobs at 180° behind get max penalty
+            fovFactor = 1.0f + FOV_BIAS_WEIGHT * (float)(diff / 180.0);
+        }
+
+        return pathCost * fovFactor + heightPenalty;
     }
 
-    /** Prefer visible mobs by effective cost (path + height).
-     *  If no visible targets, fall back to non-visible ones. */
+    /** Check if a name tag belongs to a Special Zealot (highest priority target). */
+    private static boolean isSpecialZealot(ArmorStandEntity tag) {
+        return getMobName(tag).contains("Special");
+    }
+
+    /** Compute final selection cost with visibility and Special Zealot modifiers. */
+    private static float selectionCost(float rawCost, double playerY, ArmorStandEntity tag,
+                                       MinecraftClient client, ClientPlayerEntity player) {
+        float cost = effectiveCost(rawCost, playerY, tag);
+        if (!isTagVisible(client, player, tag)) {
+            cost *= HIDDEN_MOB_PENALTY;
+        }
+        if (isSpecialZealot(tag)) {
+            cost *= SPECIAL_ZEALOT_DISCOUNT;
+        }
+        return cost;
+    }
+
+    /** Pick mob with lowest selection cost. */
     private static ArmorStandEntity pickBestByPathCostAndVisibility(MinecraftClient client,
                                                                      ClientPlayerEntity player,
                                                                      List<ArmorStandEntity> tags,
                                                                      Set<UUID> restrictToIds) {
-        ArmorStandEntity bestVisible = null;
-        float bestVisibleCost = Float.MAX_VALUE;
-        ArmorStandEntity bestHidden = null;
-        float bestHiddenCost = Float.MAX_VALUE;
+        ArmorStandEntity best = null;
+        float bestCost = Float.MAX_VALUE;
         double playerY = player.getEntityPos().y;
 
         for (ArmorStandEntity tag : tags) {
@@ -1123,22 +1346,71 @@ public class Pathfinder {
                 continue;
             }
 
-            float rawCost = getTagPathCost(tag.getUuid());
-            float cost = effectiveCost(rawCost, playerY, tag);
-            boolean visible = isTagVisible(client, player, tag);
-            if (visible) {
-                if (cost < bestVisibleCost) {
-                    bestVisibleCost = cost;
-                    bestVisible = tag;
-                }
-            } else if (cost < bestHiddenCost) {
-                bestHiddenCost = cost;
-                bestHidden = tag;
+            float cost = selectionCost(getTagPathCost(tag.getUuid()), playerY, tag, client, player);
+            if (cost < bestCost) {
+                bestCost = cost;
+                best = tag;
             }
         }
 
-        if (bestVisible != null) return bestVisible;
-        return bestHidden;
+        return best;
+    }
+
+    /**
+     * Soft-choice selection: when no current target exists, pick among all candidates
+     * with randomization if top candidates are within SOFT_CHOICE_THRESHOLD of each other.
+     * This prevents always picking the exact same mob deterministically.
+     */
+    private static ArmorStandEntity pickBestWithSoftChoice(MinecraftClient client,
+                                                            ClientPlayerEntity player,
+                                                            List<ArmorStandEntity> tags) {
+        if (tags.size() == 1) return tags.get(0);
+
+        double playerY = player.getEntityPos().y;
+        float[] costs = new float[tags.size()];
+        float bestCost = Float.MAX_VALUE;
+
+        for (int i = 0; i < tags.size(); i++) {
+            costs[i] = selectionCost(getTagPathCost(tags.get(i).getUuid()), playerY, tags.get(i), client, player);
+            if (costs[i] < bestCost) bestCost = costs[i];
+        }
+
+        // Special Zealot always wins — no randomization
+        for (int i = 0; i < tags.size(); i++) {
+            if (isSpecialZealot(tags.get(i))) return tags.get(i);
+        }
+
+        // Collect candidates within threshold of the best
+        float threshold = bestCost * (1.0f + SOFT_CHOICE_THRESHOLD);
+        List<ArmorStandEntity> candidates = new ArrayList<>();
+        List<Float> candidateCosts = new ArrayList<>();
+        for (int i = 0; i < tags.size(); i++) {
+            if (costs[i] <= threshold) {
+                candidates.add(tags.get(i));
+                candidateCosts.add(costs[i]);
+            }
+        }
+
+        if (candidates.size() == 1) return candidates.get(0);
+
+        // Weighted random: lower cost = higher weight (softmax-like with temperature)
+        float temperature = 3.0f;
+        float[] weights = new float[candidates.size()];
+        float sumWeights = 0f;
+        for (int i = 0; i < candidates.size(); i++) {
+            weights[i] = (float) Math.exp(-candidateCosts.get(i) * temperature);
+            sumWeights += weights[i];
+        }
+        sumWeights = 0f;
+        for (float w : weights) sumWeights += w;
+
+        float roll = ThreadLocalRandom.current().nextFloat() * sumWeights;
+        float cumulative = 0f;
+        for (int i = 0; i < candidates.size(); i++) {
+            cumulative += weights[i];
+            if (roll <= cumulative) return candidates.get(i);
+        }
+        return candidates.get(candidates.size() - 1);
     }
 
     private static boolean isTagVisible(MinecraftClient client, ClientPlayerEntity player, ArmorStandEntity tag) {
@@ -1628,6 +1900,7 @@ public class Pathfinder {
         seenNameTagIds.clear();
         pendingSpawnTagIds.clear();
         lastNewNameTagMs = 0L;
+        targetAcquiredMs = 0L;
         mobGoals = Collections.emptyList();
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
@@ -1655,6 +1928,45 @@ public class Pathfinder {
         double minDist = Math.sqrt(minDistSq);
         double norm = clamp01((float) ((WALL_COST_RADIUS + 1.0 - minDist) / (WALL_COST_RADIUS + 1.0)));
         return WALL_PROXIMITY_COST * norm * norm;
+    }
+
+    /**
+     * Dynamic advance radius based on speed, turn angle, and distance to goal.
+     * Straight segments → larger radius (corner cutting), tight turns → smaller.
+     */
+    private static double computeAdvanceRadius(List<BlockPos> path, int wpIdx, Vec3d playerPos, double hSpeed) {
+        double radius = ADVANCE_RADIUS_BASE;
+
+        // Speed factor: walking ~0.22 blocks/tick, sprinting ~0.28
+        // Scale radius up when moving fast
+        double speedFactor = clamp01((float)(hSpeed / 0.22)) * 0.5 + 0.75; // 0.75..1.25
+        radius *= speedFactor;
+
+        // Turn angle factor: dot product of incoming vs outgoing direction
+        if (wpIdx + 1 < path.size()) {
+            Vec3d cur = Vec3d.ofCenter(path.get(wpIdx));
+            Vec3d next = Vec3d.ofCenter(path.get(wpIdx + 1));
+            Vec3d dirIn = cur.subtract(playerPos);
+            Vec3d dirOut = next.subtract(cur);
+            double lenIn = dirIn.horizontalLength();
+            double lenOut = dirOut.horizontalLength();
+            if (lenIn > 0.1 && lenOut > 0.1) {
+                double dot = (dirIn.x * dirOut.x + dirIn.z * dirOut.z) / (lenIn * lenOut);
+                // dot=1 straight, dot=0 90° turn, dot=-1 U-turn
+                // angleFactor: straight=1.4, 90°=0.8, U-turn=0.5
+                double angleFactor = 0.5 + 0.9 * Math.max(0, dot);
+                radius *= angleFactor;
+            }
+        }
+
+        // Distance to goal: tighten radius when close to final target
+        Vec3d goalPos = Vec3d.ofCenter(path.get(path.size() - 1));
+        double distToGoal = playerPos.distanceTo(goalPos);
+        if (distToGoal < GOAL_TIGHTEN_DIST) {
+            radius *= Math.max(0.2, distToGoal / GOAL_TIGHTEN_DIST);
+        }
+
+        return Math.max(FINAL_RADIUS, Math.min(radius, ADVANCE_RADIUS_MAX));
     }
 
     /**

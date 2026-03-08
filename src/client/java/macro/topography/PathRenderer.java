@@ -136,37 +136,6 @@ public class PathRenderer {
     /* Draw direct segments between centers of consecutive blocks. */
     private static void renderPathLines(MatrixStack matrices, VertexConsumerProvider consumers,
                                         ClientWorld world, List<BlockPos> path, int wpIndex) {
-        float thickness = 0.045f;
-
-        for (int i = 0; i < path.size() - 1; i++) {
-            BlockPos a = path.get(i);
-            BlockPos b = path.get(i + 1);
-
-            float r;
-            float g;
-            float bl;
-            float alpha;
-            if (i < wpIndex) {
-                r = 0.15f;
-                g = 0.45f;
-                bl = 0.5f;
-                alpha = 0.4f;
-            } else {
-                r = 0f;
-                g = 1f;
-                bl = 1f;
-                alpha = 0.85f;
-            }
-
-            float ax = a.getX() + 0.5f;
-            float ay = getSupportTopY(world, a) + 0.08f;
-            float az = a.getZ() + 0.5f;
-            float bx = b.getX() + 0.5f;
-            float by = getSupportTopY(world, b) + 0.08f;
-            float bz = b.getZ() + 0.5f;
-            drawThickLine(matrices, consumers, ax, ay, az, bx, by, bz, thickness, r, g, bl, alpha);
-        }
-
         VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
         for (int i = 0; i < path.size() - 1; i++) {
             BlockPos a = path.get(i);
@@ -195,7 +164,46 @@ public class PathRenderer {
                 alpha = 255;
             }
 
-            drawLine(lines, matrices, ax, ay, az, bx, by, bz, r, g, bl, alpha);
+            // If going down, draw L-shaped: horizontal to B's XZ, then vertical drop
+            // Use BlockPos Y difference (reliable) instead of support top Y (can be close on slabs)
+            if (b.getY() < a.getY()) {
+                // Horizontal segment at A's height to B's XZ
+                float hLen = (float) Math.sqrt((bx-ax)*(bx-ax) + (bz-az)*(bz-az));
+                if (hLen > 0.01f) {
+                    drawLine(lines, matrices, ax, ay, az, bx, ay, bz, r, g, bl, alpha);
+                }
+                // Vertical drop — use thin filled box column (GL lines can't render pure vertical)
+                float dropTop = ay;
+                float dropBot = by;
+                float thickness = 0.035f;
+                float fr = r / 255f, fg = g / 255f, fbl = bl / 255f, fa = alpha / 255f;
+                VertexRendering.drawFilledBox(
+                    matrices,
+                    consumers.getBuffer(RenderLayer.getDebugFilledBox()),
+                    bx - thickness, dropBot, bz - thickness,
+                    bx + thickness, dropTop, bz + thickness,
+                    fr, fg, fbl, fa * 0.85f
+                );
+                // Markers every 0.5 blocks along the drop
+                float dropHeight = dropTop - dropBot;
+                int dashes = Math.max(1, (int)(dropHeight / 0.5f));
+                for (int d = 0; d <= dashes; d++) {
+                    float t = (float)d / dashes;
+                    float cy = dropTop - dropHeight * t;
+                    float sz = 0.07f;
+                    VertexRendering.drawFilledBox(
+                        matrices,
+                        consumers.getBuffer(RenderLayer.getDebugFilledBox()),
+                        bx - sz, cy - sz, bz - sz,
+                        bx + sz, cy + sz, bz + sz,
+                        fr, fg, fbl, fa * 0.9f
+                    );
+                }
+                // Re-acquire line buffer after filled box calls
+                lines = consumers.getBuffer(RenderLayer.getLines());
+            } else {
+                drawLine(lines, matrices, ax, ay, az, bx, by, bz, r, g, bl, alpha);
+            }
         }
     }
 
@@ -213,39 +221,6 @@ public class PathRenderer {
             return (float) (supportPos.getY() + shape.getMax(Direction.Axis.Y));
         }
         return supportPos.getY() + 1.0f;
-    }
-
-    private static void drawThickLine(MatrixStack matrices, VertexConsumerProvider consumers,
-                                      float ax, float ay, float az,
-                                      float bx, float by, float bz,
-                                      float thickness, float r, float g, float bl, float alpha) {
-        float dx = bx - ax;
-        float dy = by - ay;
-        float dz = bz - az;
-        float len = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (len < 0.01f) return;
-
-        int segments = Math.max(1, (int) (len / 0.45f));
-        for (int s = 0; s <= segments; s++) {
-            float t = (float) s / segments;
-            float cx = ax + dx * t;
-            float cy = ay + dy * t;
-            float cz = az + dz * t;
-            VertexRendering.drawFilledBox(
-                matrices,
-                consumers.getBuffer(RenderLayer.getDebugFilledBox()),
-                cx - thickness,
-                cy - thickness,
-                cz - thickness,
-                cx + thickness,
-                cy + thickness,
-                cz + thickness,
-                r,
-                g,
-                bl,
-                alpha
-            );
-        }
     }
 
     private static void drawLine(VertexConsumer lines, MatrixStack matrices,

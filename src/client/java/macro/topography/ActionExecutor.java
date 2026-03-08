@@ -251,13 +251,6 @@ public class ActionExecutor {
             System.out.println(sb2);
         }
 
-        /* ── FIX 0: Outside farm zone — suppress combat, just run ── */
-        boolean inFarmZone = Pathfinder.isInFarmZone(player.getEntityPos(), lastTargetMode);
-        if (!inFarmZone && lastTargetMode != 0) {
-            keys[6] = 0f; // suppress LKM (attack)
-            keys[7] = 0f; // suppress RKM (ability)
-        }
-
         /* ── FIX 1: Mana guard — suppress RKM if not enough mana ── */
         float manaCurrent = feat[31]; // mana ratio [0,1]
         float manaCost    = feat[32]; // cost ratio [0,1]
@@ -309,10 +302,17 @@ public class ActionExecutor {
         applySlot(player, slot);
 
         /* 6. compute rotation target for sub-tick smoothing */
+        // Bias correction: model has mean collapse (yaw=0.474, pitch=0.478 instead of 0.500)
+        float correctedYaw   = mouse[0] - 0.474f + 0.5f;
+        float correctedPitch = mouse[1] - 0.478f + 0.5f;
+
+        // EMA smooth to reduce jitter
+        smoothYaw   = MOUSE_ALPHA * correctedYaw   + (1f - MOUSE_ALPHA) * smoothYaw;
+        smoothPitch = MOUSE_ALPHA * correctedPitch + (1f - MOUSE_ALPHA) * smoothPitch;
+
         // Denormalize: model output [0,1] maps to [-30,+30] degrees
-        // Dead zone: ignore tiny deltas to prevent drift
-        float deltaYaw   = Math.abs(mouse[0] - 0.5f) < 0.03f ? 0f : (mouse[0] - 0.5f) * 60f;
-        float deltaPitch  = Math.abs(mouse[1] - 0.5f) < 0.03f ? 0f : (mouse[1] - 0.5f) * 60f;
+        float deltaYaw   = Math.abs(smoothYaw   - 0.5f) < 0.015f ? 0f : (smoothYaw   - 0.5f) * 60f;
+        float deltaPitch  = Math.abs(smoothPitch - 0.5f) < 0.015f ? 0f : (smoothPitch - 0.5f) * 60f;
 
         startYaw   = player.getYaw();
         startPitch = player.getPitch();

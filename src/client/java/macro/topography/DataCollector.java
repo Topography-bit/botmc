@@ -61,7 +61,7 @@ public class DataCollector {
         "dist_to_block,block_height,dist_to_block_left,block_height_left," +
         "dist_to_block_right,block_height_right," +
         "vertical_clearance,mana,mana_cost_aotev,slot_aotev," +
-        "time_to_collision,current_mode,target_mode," +
+        "time_to_collision," +
         "ground_near,ground_mid,ground_far,block_below_height," +
         "e0_rel_x,e0_rel_y,e0_rel_z,e0_type,e0_visible,e0_yaw_diff,e0_comp_count,e0_comp_min_dist,e0_comp_intent," +
         "e1_rel_x,e1_rel_y,e1_rel_z,e1_type,e1_visible,e1_yaw_diff,e1_comp_count,e1_comp_min_dist,e1_comp_intent," +
@@ -174,10 +174,6 @@ public class DataCollector {
                 : 1.0f;
 
             currentMode = detectMode(client, player);
-            // [0,1]: mode 0,1,2 -> 0, 0.5, 1.0
-            float currentModeNorm = currentMode / 2.0f;
-            // [0,1]: target 1,2 -> 0.5, 1.0
-            float targetModeNorm = targetMode / 2.0f;
 
             // === GROUND PROBES (terrain ahead) ===
             float groundNear = RaycastHelper.calcGroundProbe(client, player, 1.5f);
@@ -279,7 +275,7 @@ public class DataCollector {
                 "%.4f,%.4f,%.4f," +
                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f," +
                 "%.4f,%.4f,%.4f,%.4f," +
-                "%.4f,%.4f,%.4f," +
+                "%.4f," +
                 "%.4f,%.4f,%.4f,%.4f,",
                 activeSlot, on_ground, is_sprinting, is_jumping, yaw, pitch,
                 key_W, key_S, key_A, key_D, pressedSlot, leftClick, rightClick,
@@ -287,7 +283,7 @@ public class DataCollector {
                 distWall, distWallRight, distWallLeft,
                 bStraight[0], bStraight[1], bLeft[0], bLeft[1], bRight[0], bRight[1],
                 vertClear, mana, manaCostAotev, aotevSlot,
-                timeToCollision, currentModeNorm, targetModeNorm,
+                timeToCollision,
                 groundNear, groundMid, groundFar, blockBelowHeight
             ));
 
@@ -307,7 +303,7 @@ public class DataCollector {
                 rotAnomaly, posAnomaly, velAnomaly, currentStress, ping));
 
             // === PATHFINDER ===
-            Pathfinder.update(client, player, targetMode, currentMode, distWall, vertClear, currentStress, posAnomaly);
+            Pathfinder.update(client, player, targetMode, currentMode, distWall, vertClear, currentStress, posAnomaly, velAnomaly);
             float[] pathRel = Pathfinder.getPathRelative(pos);
             for (int i = 0; i < Pathfinder.PATH_FEATURE_COUNT; i++) {
                 float v = (i < pathRel.length) ? pathRel[i] : 0f;
@@ -332,14 +328,16 @@ public class DataCollector {
 
         // Step 1: Find ArmorStand name tags with matching mob names
         List<ArmorStandEntity> nameTags = new ArrayList<>();
+        Box searchBox = getMobSearchBox(player, targetMode);
         for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(50),
+                LivingEntity.class, searchBox,
                 ent -> ent instanceof ArmorStandEntity)) {
+            if (targetMode != 0 && !Pathfinder.isInFarmZone(e.getEntityPos(), targetMode)) continue;
             String name = getMobName(e);
             if (name.isEmpty()) continue;
             boolean match = false;
             if (targetMode == 1) match = name.contains("Zealot") && !name.contains("Bruiser");
-            else if (targetMode == 2) match = name.contains("Bruiser");
+            else if (targetMode == 2) match = name.contains("Bruiser") || name.contains("Special Zealot");
             else match = name.contains("Zealot") || name.contains("Bruiser");
             if (match) nameTags.add((ArmorStandEntity) e);
         }
@@ -358,16 +356,29 @@ public class DataCollector {
         return mobs;
     }
 
-    /** Find the nearest non-ArmorStand LivingEntity within 4 blocks of a name tag. */
+    private static Box getMobSearchBox(ClientPlayerEntity player, int mode) {
+        if (mode != 0) {
+            double[] bounds = Pathfinder.getFarmZoneBounds(mode);
+            if (bounds != null) {
+                return new Box(
+                    bounds[0], bounds[1], bounds[2],
+                    bounds[3] + 1.0, bounds[4] + 2.0, bounds[5] + 1.0
+                );
+            }
+        }
+        return player.getBoundingBox().expand(50);
+    }
+
+    /** Find the nearest non-ArmorStand LivingEntity within 5 blocks of a name tag. */
     private static LivingEntity findRealMobNear(MinecraftClient client,
                                                   ClientPlayerEntity player,
                                                   ArmorStandEntity nameTag) {
         if (client.world == null) return null;
         LivingEntity closest = null;
-        double closestDist = 4.0;
+        double closestDist = 5.0;
         Vec3d tagPos = nameTag.getEntityPos();
         for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, nameTag.getBoundingBox().expand(4),
+                LivingEntity.class, nameTag.getBoundingBox().expand(5),
                 ent -> !(ent instanceof ArmorStandEntity)
                     && !(ent instanceof PlayerEntity)
                     && ent != player
@@ -466,14 +477,8 @@ public class DataCollector {
 
     private static int detectMode(MinecraftClient client, ClientPlayerEntity player) {
         if (client.world == null || targetMode == 0) return 0;
-        // Check if any ArmorStand name tags with matching names exist nearby
-        for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(20),
-                ent -> ent instanceof ArmorStandEntity)) {
-            String name = getMobName(e);
-            if (name.isEmpty()) continue;
-            if (targetMode == 1 && name.contains("Zealot") && !name.contains("Bruiser")) return targetMode;
-            if (targetMode == 2 && name.contains("Bruiser")) return targetMode;
+        if (Pathfinder.isInFarmZone(player.getEntityPos(), targetMode)) {
+            return targetMode;
         }
         return 0;
     }

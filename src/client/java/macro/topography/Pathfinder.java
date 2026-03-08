@@ -10,6 +10,7 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
 import net.minecraft.world.chunk.WorldChunk;
@@ -88,9 +89,12 @@ public class Pathfinder {
     public static final int PATH_FEATURE_COUNT = PATH_HORIZON_POINTS * 3;
 
     /* ── async control ────────────────────────────────────────────── */
-    private static final int RECALC_COOLDOWN = 20;
-    private static final int SAFETY_RECALC = 100;
     private static final double DEVIATE_DIST = 5.0;
+    private static final double GOAL_SHIFT_REPLAN_DIST = 3.0;
+    private static final double GOAL_SHIFT_REPLAN_DIST_SQ = GOAL_SHIFT_REPLAN_DIST * GOAL_SHIFT_REPLAN_DIST;
+    private static final int BLOCK_VALIDATION_POINTS = 4;
+    private static final float KNOCKBACK_REPLAN_VEL_ANOMALY = 0.12f;
+    private static final double LANDING_FALL_SPEED_THRESH = -0.12;
 
     /* ── mob targeting ────────────────────────────────────────────── */
     private static final double ATTACK_STANDOFF = 1.75;
@@ -109,12 +113,11 @@ public class Pathfinder {
     /* ── state ────────────────────────────────────────────────────── */
     private static List<BlockPos> currentPath = Collections.emptyList();
     private static int waypointIndex = 0;
-    private static int ticksSinceRecalc = 0;
-    private static int recalcCooldown = 0;
     private static final AtomicBoolean computing = new AtomicBoolean(false);
     private static CompletableFuture<List<BlockPos>> pendingFuture = null;
     private static BlockPos lastGoal = null;
     private static BlockPos pendingGoal = null;
+    private static String forcedRepathReason = null;
     private static LivingEntity targetMob = null;        // real mob for hitbox (can be null)
     private static ArmorStandEntity targetNameTag = null; // name tag for position
     private static final Set<UUID> seenNameTagIds = new HashSet<>();
@@ -130,6 +133,9 @@ public class Pathfinder {
     private static float lastVerticalClearance = 1f;
     private static float lastStressLevel = 0f;
     private static float lastPosAnomaly = 0f;
+    private static Vec3d lastPlayerPos = null;
+    private static Vec3d lastPlayerVelocity = Vec3d.ZERO;
+    private static boolean wasOnGround = true;
 
     /* ── per-mob path costs (cached, updated async) ── */
     private static final float[] mobPathCosts = new float[MOB_PATH_COST_COUNT]; // [0,1] normalized
@@ -218,6 +224,17 @@ public class Pathfinder {
             mob.isRemoved(),
             pos.x, pos.y, pos.z
         );
+    }
+
+    private static void requestImmediateRepath(String reason) {
+        if (reason == null || reason.isBlank()) return;
+        if (forcedRepathReason == null || forcedRepathReason.isBlank()) {
+            forcedRepathReason = reason;
+            return;
+        }
+        if (!forcedRepathReason.contains(reason)) {
+            forcedRepathReason = forcedRepathReason + "+" + reason;
+        }
     }
 
     private static class BlockCache {
@@ -378,13 +395,13 @@ public class Pathfinder {
     public static void update(MinecraftClient client, ClientPlayerEntity player,
                               int targetMode, int currentMode,
                               float distToWall, float verticalClearance,
-                              float stressLevel, float posAnomaly) {
+                              float stressLevel, float posAnomaly, float velAnomaly) {
         if (client.world == null || player == null) return;
 
         activeTargetMode = targetMode;
         Vec3d pos = player.getEntityPos();
-        ticksSinceRecalc++;
-        if (recalcCooldown > 0) recalcCooldown--;
+        Vec3d velocity = player.getVelocity();
+        boolean onGround = player.isOnGround();
         lastDistToWall = distToWall;
         lastVerticalClearance = verticalClearance;
         lastStressLevel = stressLevel;
@@ -457,27 +474,45 @@ public class Pathfinder {
             double dist = pos.distanceTo(Vec3d.ofCenter(wp));
             boolean isFinal = waypointIndex == currentPath.size() - 1;
             double radius = isFinal ? FINAL_RADIUS
-                : computeAdvanceRadius(currentPath, waypointIndex, pos, player.getVelocity().horizontalLength());
+                : computeAdvanceRadius(currentPath, waypointIndex, pos, velocity.horizontalLength());
             if (dist < radius) {
                 waypointIndex++;
             }
             waypointIndex = advanceWaypointIfBehind(currentPath, waypointIndex, pos);
         }
 
-        // Check if recalc needed
-        boolean needRecalc = false;
-        if (goal != null && !goal.equals(lastGoal)) needRecalc = true;
-        if (ticksSinceRecalc >= SAFETY_RECALC) needRecalc = true;
-        if (waypointIndex >= currentPath.size()) needRecalc = true;
-        if (distToWall <= WALL_REPLAN_THRESH) needRecalc = true;
-        if (verticalClearance <= VERTICAL_REPLAN_THRESH) needRecalc = true;
-        if (!currentPath.isEmpty() && waypointIndex < currentPath.size()) {
-            BlockPos wp = currentPath.get(waypointIndex);
-            double distToPath = pos.distanceTo(Vec3d.ofCenter(wp));
-            if (distToPath > DEVIATE_DIST) needRecalc = true;
+        if (velAnomaly >= KNOCKBACK_REPLAN_VEL_ANOMALY) {
+            requestImmediateRepath("player_knockback");
         }
 
-        if (needRecalc && recalcCooldown <= 0 && !computing.get() && goal != null) {
+        boolean justLanded = lastPlayerPos != null
+            && !wasOnGround
+            && onGround
+            && lastPlayerVelocity.y <= LANDING_FALL_SPEED_THRESH;
+        if (justLanded) {
+            String landingCheck = computePathStaleReason(client.world, pos, goal, distToWall, verticalClearance, true);
+            if (landingCheck != null) {
+                requestImmediateRepath("landed_" + landingCheck);
+            }
+        }
+
+        boolean forceRepath = forcedRepathReason != null;
+        String repathReason = forceRepath
+            ? forcedRepathReason
+            : computePathStaleReason(client.world, pos, goal, distToWall, verticalClearance, false);
+
+        if (repathReason != null && goal != null) {
+            if (forceRepath && computing.get()) {
+                eventLog("path_preempt reason=%s pendingTask=%d", repathReason, pendingPathTaskId);
+                if (pendingFuture != null) pendingFuture.cancel(true);
+                pendingFuture = null;
+                pendingGoal = null;
+                pendingPathTaskId = 0L;
+                pendingPathTaskStartedMs = 0L;
+                computing.set(false);
+            }
+
+            if (!computing.get()) {
             BlockPos start = findStandableStart(client.world, player.getBlockPos());
 
             // For distant goals, create intermediate goal in the right direction
@@ -519,7 +554,19 @@ public class Pathfinder {
 
             pendingGoal = goal;
             startPathfinding(client.world, start, pathGoal, stressLevel);
+                eventLog(
+                    "repath reason=%s goal=%s pathGoal=%s",
+                    repathReason,
+                    goal.toShortString(),
+                    pathGoal.toShortString()
+                );
+                forcedRepathReason = null;
+            }
         }
+
+        lastPlayerPos = pos;
+        lastPlayerVelocity = velocity;
+        wasOnGround = onGround;
 
         if (!farmMode) {
             mobCostTicks = 0;
@@ -665,6 +712,57 @@ public class Pathfinder {
         }
     }
 
+    private static String computePathStaleReason(ClientWorld world, Vec3d playerPos, BlockPos goal,
+                                                 float distToWall, float verticalClearance,
+                                                 boolean landingValidationOnly) {
+        if (goal == null) return null;
+        if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return "path_empty";
+        if (isPathBlockedAhead(world)) return "path_blocked";
+        if (!landingValidationOnly && isGoalShiftedSignificantly(goal)) return "goal_shifted";
+        if (!landingValidationOnly && hasPlayerDeviatedFromPath(playerPos)) return "player_deviated";
+        if (!landingValidationOnly && distToWall <= WALL_REPLAN_THRESH) return "wall_close";
+        if (!landingValidationOnly && verticalClearance <= VERTICAL_REPLAN_THRESH) return "low_clearance";
+        return null;
+    }
+
+    private static boolean isGoalShiftedSignificantly(BlockPos goal) {
+        if (lastGoal == null) return true;
+        Vec3d currentGoal = Vec3d.ofCenter(goal);
+        Vec3d prevGoal = Vec3d.ofCenter(lastGoal);
+        if (currentGoal.squaredDistanceTo(prevGoal) > GOAL_SHIFT_REPLAN_DIST_SQ) {
+            return true;
+        }
+        if (currentPath.isEmpty()) return false;
+        Vec3d pathEnd = Vec3d.ofCenter(currentPath.get(currentPath.size() - 1));
+        double endToNewGoalSq = pathEnd.squaredDistanceTo(currentGoal);
+        if (endToNewGoalSq <= GOAL_SHIFT_REPLAN_DIST_SQ) return false;
+        double endToPrevGoalSq = pathEnd.squaredDistanceTo(prevGoal);
+        return endToPrevGoalSq <= GOAL_SHIFT_REPLAN_DIST_SQ;
+    }
+
+    private static boolean hasPlayerDeviatedFromPath(Vec3d playerPos) {
+        if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return true;
+        double bestSq = Vec3d.ofCenter(currentPath.get(waypointIndex)).squaredDistanceTo(playerPos);
+        if (waypointIndex + 1 < currentPath.size()) {
+            double nextSq = Vec3d.ofCenter(currentPath.get(waypointIndex + 1)).squaredDistanceTo(playerPos);
+            if (nextSq < bestSq) bestSq = nextSq;
+        }
+        return bestSq > DEVIATE_DIST * DEVIATE_DIST;
+    }
+
+    private static boolean isPathBlockedAhead(ClientWorld world) {
+        if (world == null || currentPath.isEmpty() || waypointIndex >= currentPath.size()) return true;
+        int start = Math.max(0, waypointIndex);
+        int end = Math.min(currentPath.size(), start + BLOCK_VALIDATION_POINTS);
+        for (int i = start; i < end; i++) {
+            BlockPos node = currentPath.get(i);
+            if (!isStandableWorld(world, node.getX(), node.getY(), node.getZ())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static float[] getPathRelative(Vec3d playerPos) {
         float[] out = new float[PATH_FEATURE_COUNT];
         if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return out;
@@ -744,10 +842,9 @@ public class Pathfinder {
         clearCachedSnapshot();
         currentPath = Collections.emptyList();
         waypointIndex = 0;
-        ticksSinceRecalc = 0;
-        recalcCooldown = 0;
         lastGoal = null;
         pendingGoal = null;
+        forcedRepathReason = null;
         targetMob = null;
         targetNameTag = null;
         activeTargetMode = 0;
@@ -756,6 +853,9 @@ public class Pathfinder {
         lastVerticalClearance = 1f;
         lastStressLevel = 0f;
         lastPosAnomaly = 0f;
+        lastPlayerPos = null;
+        lastPlayerVelocity = Vec3d.ZERO;
+        wasOnGround = true;
         Arrays.fill(mobPathCosts, 1.0f);
         synchronized (mobPathCostByTag) {
             mobPathCostByTag.clear();
@@ -881,6 +981,7 @@ public class Pathfinder {
         pendingFuture = null;
         pendingPathTaskId = 0L;
         pendingPathTaskStartedMs = 0L;
+        forcedRepathReason = null;
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
         pendingMobCosts = null;
         pendingMobCostTaskId = 0L;
@@ -890,6 +991,9 @@ public class Pathfinder {
         lastVerticalClearance = 1f;
         lastStressLevel = 0f;
         lastPosAnomaly = 0f;
+        lastPlayerPos = null;
+        lastPlayerVelocity = Vec3d.ZERO;
+        wasOnGround = true;
         Arrays.fill(mobPathCosts, 1.0f);
         synchronized (mobPathCostByTag) {
             mobPathCostByTag.clear();
@@ -931,8 +1035,7 @@ public class Pathfinder {
         pendingPathTaskId = 0L;
         pendingPathTaskStartedMs = 0L;
         computing.set(false);
-        recalcCooldown = 0;
-        ticksSinceRecalc = SAFETY_RECALC;
+        requestImmediateRepath("target_lost_" + reason);
         if (pendingMobCosts != null) pendingMobCosts.cancel(true);
         pendingMobCosts = null;
         pendingMobCostTaskId = 0L;
@@ -975,9 +1078,7 @@ public class Pathfinder {
                         newCost,
                         mobInfo(targetMob)
                     );
-                    // Target changed -> allow immediate path recompute this tick.
-                    recalcCooldown = 0;
-                    ticksSinceRecalc = SAFETY_RECALC;
+                    requestImmediateRepath("target_switch");
                 }
 
                 // Use tag position for navigation (it's directly above the mob)
@@ -1101,6 +1202,8 @@ public class Pathfinder {
             int minY = (int) bounds[1];
             int maxY = (int) bounds[4];
             for (int y = maxY; y >= minY; y--) {
+                Vec3d candidatePos = new Vec3d(x + 0.5, y, z + 0.5);
+                if (!isInFarmZone(candidatePos, targetMode)) continue;
                 if (client.world != null && isStandableWorld(client.world, x, y, z)) {
                     roamingGoal = new BlockPos(x, y, z);
                     eventLog("roaming_goal pos=%s", roamingGoal.toShortString());
@@ -1121,10 +1224,12 @@ public class Pathfinder {
         if (client.world == null || targetMode == 0) return Collections.emptyList();
         Vec3d pPos = player.getEntityPos();
         List<ArmorStandEntity> tags = new ArrayList<>();
+        Box searchBox = getNameTagSearchBox(player, targetMode);
 
         for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(50),
+                LivingEntity.class, searchBox,
                 ent -> ent instanceof ArmorStandEntity)) {
+            if (targetMode != 0 && !isInFarmZone(e.getEntityPos(), targetMode)) continue;
             String name = getMobName(e);
             if (name.isEmpty()) continue;
             boolean match = false;
@@ -1148,6 +1253,19 @@ public class Pathfinder {
         }
         targetMobs = realMobs;
         return tags;
+    }
+
+    private static Box getNameTagSearchBox(ClientPlayerEntity player, int targetMode) {
+        if (targetMode != 0) {
+            double[] bounds = getFarmZoneBounds(targetMode);
+            if (bounds != null) {
+                return new Box(
+                    bounds[0], bounds[1], bounds[2],
+                    bounds[3] + 1.0, bounds[4] + 2.0, bounds[5] + 1.0
+                );
+            }
+        }
+        return player.getBoundingBox().expand(50);
     }
 
     /** Pick the mob with the lowest cached path_cost. Falls back to nearest by distance. */
@@ -1516,8 +1634,6 @@ public class Pathfinder {
     private static void startPathfinding(ClientWorld world, BlockPos start, BlockPos goal, float stressLevel) {
         if (!computing.compareAndSet(false, true)) return;
 
-        ticksSinceRecalc = 0;
-        recalcCooldown = computeRecalcCooldown(stressLevel);
         final long taskId = ++pathTaskSeq;
         final long taskStartMs = System.currentTimeMillis();
         BlockCache cache = snapshotOnClientThread(world, start, goal);
@@ -1525,12 +1641,11 @@ public class Pathfinder {
         pendingPathTaskId = taskId;
         pendingPathTaskStartedMs = taskStartMs;
         eventLog(
-            "path[%d] start from=%s goal=%s snapshotMs=%d cooldown=%d stress=%.3f",
+            "path[%d] start from=%s goal=%s snapshotMs=%d stress=%.3f",
             taskId,
             start.toShortString(),
             goal.toShortString(),
             snapshotMs,
-            recalcCooldown,
             stressLevel
         );
 
@@ -1824,12 +1939,6 @@ public class Pathfinder {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    private static int computeRecalcCooldown(float stressLevel) {
-        float s = clamp01(stressLevel);
-        int cd = Math.round(RECALC_COOLDOWN * (1.0f - 0.75f * s));
-        return Math.max(2, cd);
-    }
-
     private static BlockCache snapshotOnClientThread(ClientWorld world, BlockPos start, BlockPos goal) {
         long now = System.currentTimeMillis();
         synchronized (snapshotLock) {
@@ -1882,9 +1991,11 @@ public class Pathfinder {
         waypointIndex = 0;
         lastGoal = null;
         pendingGoal = null;
+        forcedRepathReason = null;
         bruiserWaypointStage = 0;
-        ticksSinceRecalc = SAFETY_RECALC;
-        recalcCooldown = 0;
+        lastPlayerPos = null;
+        lastPlayerVelocity = Vec3d.ZERO;
+        wasOnGround = true;
         if (pendingFuture != null) pendingFuture.cancel(true);
         pendingFuture = null;
         pendingPathTaskId = 0L;
@@ -1905,7 +2016,6 @@ public class Pathfinder {
         targetMobs = Collections.emptyList();
         mobCostTicks = 0;
         computing.set(false);
-        if (stressLevel > 0.75f) recalcCooldown = 0;
     }
 
     private static float normalizePathDelta(double delta) {

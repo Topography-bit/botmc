@@ -82,11 +82,11 @@ public class ActionExecutor {
     /* ── warmup: skip first N ticks to stabilize GRU ───────────── */
     private static int   warmupTicks    = 0;
     private static final int WARMUP_COUNT = 5;
-    private static final int BASE_FEATURE_COUNT = 86;
-    private static final int MOB_COST_OFFSET = BASE_FEATURE_COUNT; // 86..90
-    private static final int ANOMALY_OFFSET = MOB_COST_OFFSET + Pathfinder.MOB_PATH_COST_COUNT; // 91..95
-    private static final int PATH_OFFSET = ANOMALY_OFFSET + 5; // 96..110
-    private static final int FEATURE_COUNT = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 111
+    private static final int BASE_FEATURE_COUNT = 84;
+    private static final int MOB_COST_OFFSET = BASE_FEATURE_COUNT; // 84..88
+    private static final int ANOMALY_OFFSET = MOB_COST_OFFSET + Pathfinder.MOB_PATH_COST_COUNT; // 89..93
+    private static final int PATH_OFFSET = ANOMALY_OFFSET + 5; // 94..108
+    private static final int FEATURE_COUNT = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 109
 
     /* ================================================================
      *  LIFECYCLE
@@ -507,16 +507,12 @@ public class ActionExecutor {
                 ? clamp01((float) ((f[21] * 10.0) / velHz / 20.0))
                 : 1f;
 
-        /* [35] current_mode */
+        /* Mode is used only by pathfinder logic; not fed into model input. */
         int cm = detectMode(client, player);
-        f[35] = cm / 2f;
-        /* [36] target_mode */
-        f[36] = lastTargetMode / 2f;
-
-        /* [37..39] ground probes */
-        f[37] = RaycastHelper.calcGroundProbe(client, player, 1.5f);
-        f[38] = RaycastHelper.calcGroundProbe(client, player, 3.0f);
-        f[39] = RaycastHelper.calcGroundProbe(client, player, 4.5f);
+        /* [35..37] ground probes */
+        f[35] = RaycastHelper.calcGroundProbe(client, player, 1.5f);
+        f[36] = RaycastHelper.calcGroundProbe(client, player, 3.0f);
+        f[37] = RaycastHelper.calcGroundProbe(client, player, 4.5f);
 
         /* [40] block_below_height — slab=0.5, full=1.0, air=0.0 */
         if (client.world != null) {
@@ -524,31 +520,31 @@ public class ActionExecutor {
             net.minecraft.block.BlockState belowState = client.world.getBlockState(belowPos);
             net.minecraft.util.shape.VoxelShape shape = belowState.getCollisionShape(client.world, belowPos);
             if (!shape.isEmpty()) {
-                f[40] = clamp01((float) shape.getMax(net.minecraft.util.math.Direction.Axis.Y));
+                f[38] = clamp01((float) shape.getMax(net.minecraft.util.math.Direction.Axis.Y));
             }
         }
 
-        /* [41..85] entity block (5 mobs × 9 features) */
+        /* [39..83] entity block (5 mobs × 9 features) */
         boolean inZone = Pathfinder.isInFarmZone(pos, lastTargetMode);
         if (inZone || lastTargetMode == 0) {
             fillEntityBlock(client, player, pos, f);
         } else {
             // Outside farm zone: zero entity block so model ignores mobs in corridors
             for (int i = 0; i < 5; i++) {
-                int base = 41 + i * 9;
+                int base = 39 + i * 9;
                 f[base + 5] = 0.5f; // yaw_diff neutral
                 f[base + 7] = 1f;   // competitor_dist far
                 f[base + 8] = 0.5f; // competitor_intent neutral
             }
         }
 
-        /* [86..90] per-mob path costs (same order as CSV) */
+        /* [84..88] per-mob path costs (same order as CSV) */
         float[] mobCosts = Pathfinder.getMobPathCosts();
         for (int i = 0; i < Pathfinder.MOB_PATH_COST_COUNT; i++) {
             f[MOB_COST_OFFSET + i] = mobCosts[i];
         }
 
-        /* [91..95] anomalies + stress + ping */
+        /* [89..93] anomalies + stress + ping */
         float yawDiffA  = Math.abs(normalizeAngle(yawRaw - prevYaw))  / 180f;
         float pitchDiffA = Math.abs(pitchRaw - prevPitch) / 90f;
         float rotAnomaly = clamp01((yawDiffA + pitchDiffA) / 2f);
@@ -576,8 +572,8 @@ public class ActionExecutor {
         f[ANOMALY_OFFSET + 3] = stress;
         f[ANOMALY_OFFSET + 4] = ping;
 
-        /* [96..110] path horizon from Pathfinder */
-        Pathfinder.update(client, player, lastTargetMode, cm, f[21], f[30], stress, posAnomaly);
+        /* [94..108] path horizon from Pathfinder */
+        Pathfinder.update(client, player, lastTargetMode, cm, f[21], f[30], stress, posAnomaly, velAnomaly);
         float[] pathRel = Pathfinder.getPathRelative(pos);
         int pathCount = Math.min(pathRel.length, Pathfinder.PATH_FEATURE_COUNT);
         for (int i = 0; i < pathCount; i++) {
@@ -593,7 +589,7 @@ public class ActionExecutor {
                                         Vec3d pos, float[] f) {
         List<LivingEntity> mobs = getNearestMobs(client, player);
         for (int i = 0; i < 5; i++) {
-            int base = 41 + i * 9;
+            int base = 39 + i * 9;
             if (i < mobs.size()) {
                 LivingEntity mob = mobs.get(i);
                 Vec3d rel = mob.getEntityPos().subtract(pos);
@@ -628,14 +624,16 @@ public class ActionExecutor {
 
         // Step 1: Find ArmorStand name tags with matching mob names
         List<ArmorStandEntity> nameTags = new ArrayList<>();
+        Box searchBox = getMobSearchBox(player, lastTargetMode);
         for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, player.getBoundingBox().expand(50),
+                LivingEntity.class, searchBox,
                 ent -> ent instanceof ArmorStandEntity)) {
+            if (lastTargetMode != 0 && !Pathfinder.isInFarmZone(e.getEntityPos(), lastTargetMode)) continue;
             String n = getMobName(e);
             if (n.isEmpty()) continue;
             boolean match = false;
             if (lastTargetMode == 1) match = n.contains("Zealot") && !n.contains("Bruiser");
-            else if (lastTargetMode == 2) match = n.contains("Bruiser");
+            else if (lastTargetMode == 2) match = n.contains("Bruiser") || n.contains("Special Zealot");
             else match = n.contains("Zealot") || n.contains("Bruiser");
             if (match) nameTags.add((ArmorStandEntity) e);
         }
@@ -659,16 +657,29 @@ public class ActionExecutor {
         return mobs.size() > 5 ? mobs.subList(0, 5) : mobs;
     }
 
-    /** Find the nearest non-ArmorStand LivingEntity within 4 blocks of a name tag. */
+    private static Box getMobSearchBox(ClientPlayerEntity player, int targetMode) {
+        if (targetMode != 0) {
+            double[] bounds = Pathfinder.getFarmZoneBounds(targetMode);
+            if (bounds != null) {
+                return new Box(
+                    bounds[0], bounds[1], bounds[2],
+                    bounds[3] + 1.0, bounds[4] + 2.0, bounds[5] + 1.0
+                );
+            }
+        }
+        return player.getBoundingBox().expand(50);
+    }
+
+    /** Find the nearest non-ArmorStand LivingEntity within 5 blocks of a name tag. */
     private static LivingEntity findRealMobNear(MinecraftClient client,
                                                   ClientPlayerEntity player,
                                                   ArmorStandEntity nameTag) {
         if (client.world == null) return null;
         LivingEntity closest = null;
-        double closestDist = 4.0;
+        double closestDist = 5.0;
         Vec3d tagPos = nameTag.getEntityPos();
         for (LivingEntity e : client.world.getEntitiesByClass(
-                LivingEntity.class, nameTag.getBoundingBox().expand(4),
+                LivingEntity.class, nameTag.getBoundingBox().expand(5),
                 ent -> !(ent instanceof ArmorStandEntity)
                     && !(ent instanceof PlayerEntity)
                     && ent != player

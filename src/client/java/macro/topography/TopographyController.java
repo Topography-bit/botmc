@@ -35,15 +35,17 @@ public final class TopographyController {
 
     public static boolean toggle(TopographyModuleDefinition module) {
         return switch (module.type()) {
-            case RECORDING -> toggleRecording(module);
-            case COMBAT -> toggleCombat(module);
+            case RECORDING  -> toggleRecording(module);
+            case COMBAT     -> toggleCombat(module);
+            case AUTOPILOT  -> toggleAutopilot(module);
         };
     }
 
     public static boolean isActive(TopographyModuleDefinition module) {
         return switch (module.type()) {
-            case RECORDING -> DataCollector.isRecording && DataCollector.getTargetMode() == module.mode();
-            case COMBAT -> ActionExecutor.active && ActionExecutor.getTargetMode() == module.mode();
+            case RECORDING  -> DataCollector.isRecording && DataCollector.getTargetMode() == module.mode();
+            case COMBAT     -> ActionExecutor.active && ActionExecutor.getTargetMode() == module.mode();
+            case AUTOPILOT  -> Autopilot.isEnabled() && Autopilot.getTargetMode() == module.mode();
         };
     }
 
@@ -53,8 +55,9 @@ public final class TopographyController {
         }
 
         return switch (module.type()) {
-            case RECORDING -> DataCollector.isRecording ? "Busy" : "Idle";
-            case COMBAT -> ActionExecutor.active ? "Busy" : "Idle";
+            case RECORDING  -> DataCollector.isRecording ? "Busy" : "Idle";
+            case COMBAT     -> ActionExecutor.active ? "Busy" : "Idle";
+            case AUTOPILOT  -> Autopilot.isEnabled() ? "Busy" : "Idle";
         };
     }
 
@@ -64,8 +67,9 @@ public final class TopographyController {
         }
 
         return switch (module.type()) {
-            case RECORDING -> DataCollector.isRecording ? 0xFFB77C57 : 0xFF7C879B;
-            case COMBAT -> ActionExecutor.active ? 0xFFB77C57 : 0xFF7C879B;
+            case RECORDING  -> DataCollector.isRecording ? 0xFFB77C57 : 0xFF7C879B;
+            case COMBAT     -> ActionExecutor.active ? 0xFFB77C57 : 0xFF7C879B;
+            case AUTOPILOT  -> Autopilot.isEnabled() ? 0xFFB77C57 : 0xFF7C879B;
         };
     }
 
@@ -172,6 +176,9 @@ public final class TopographyController {
         if (ActionExecutor.active) {
             ActionExecutor.stop();
         }
+        if (Autopilot.isEnabled()) {
+            Autopilot.stop();
+        }
 
         if (!ActionExecutor.loadModel(modelPath)) {
             notify("Model not found: " + modelPath);
@@ -180,6 +187,32 @@ public final class TopographyController {
 
         ActionExecutor.start(module.mode());
         notify(module.title() + " started with " + modelPath + ".");
+        return true;
+    }
+
+    private static boolean toggleAutopilot(TopographyModuleDefinition module) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null || client.world == null) {
+            notify("Join a world before starting autopilot.");
+            return false;
+        }
+
+        if (isActive(module)) {
+            Autopilot.stop();
+            notify(module.title() + " stopped.");
+            return true;
+        }
+
+        // Stop any running autopilot or combat bot
+        if (Autopilot.isEnabled()) {
+            Autopilot.stop();
+        }
+        if (ActionExecutor.active) {
+            ActionExecutor.stop();
+        }
+
+        Autopilot.start(module.mode());
+        notify(module.title() + " started.");
         return true;
     }
 

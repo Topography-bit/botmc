@@ -37,9 +37,20 @@ public class BotCommand {
                             )
                         )
                     )
+                    .then(ClientCommandManager.literal("autopilot")
+                        .then(ClientCommandManager.argument("ap_mode", StringArgumentType.word())
+                            .suggests((ctx, builder) -> {
+                                builder.suggest("zealots");
+                                builder.suggest("bruisers");
+                                return builder.buildFuture();
+                            })
+                            .executes(ctx -> startAutopilot(ctx))
+                        )
+                    )
                     .then(ClientCommandManager.literal("stop")
                         .executes(ctx -> {
-                            ActionExecutor.stop();
+                            if (ActionExecutor.active) ActionExecutor.stop();
+                            if (Autopilot.isEnabled()) Autopilot.stop();
                             ctx.getSource().sendFeedback(Text.literal("§eBot stopped."));
                             return 1;
                         })
@@ -70,6 +81,28 @@ public class BotCommand {
         ActionExecutor.start(modeInt);
         ctx.getSource().sendFeedback(
             Text.literal("§aBot started (" + mode + ") model: " + modelPath));
+        return 1;
+    }
+
+    private static int startAutopilot(com.mojang.brigadier.context.CommandContext<net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource> ctx) {
+        String mode = StringArgumentType.getString(ctx, "ap_mode");
+        int modeInt;
+        switch (mode.toLowerCase()) {
+            case "zealots"  -> modeInt = 1;
+            case "bruisers" -> modeInt = 2;
+            default -> {
+                ctx.getSource().sendFeedback(
+                    Text.literal("§cUnknown mode: " + mode + ". Use zealots or bruisers."));
+                return 0;
+            }
+        }
+
+        if (ActionExecutor.active) ActionExecutor.stop();
+        if (Autopilot.isEnabled()) Autopilot.stop();
+
+        Autopilot.start(modeInt);
+        ctx.getSource().sendFeedback(
+            Text.literal("§aAutopilot started (" + mode + ")"));
         return 1;
     }
 }

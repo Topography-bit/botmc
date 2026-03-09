@@ -11,6 +11,7 @@ public class topographhyClient implements ClientModInitializer {
 		CollectCommand.register();
 		ProxyCommand.register();
 		ActionExecutor.register();
+		Autopilot.register();
 		BotCommand.register();
 		ZoneCommand.register();
 		PosCommand.register();

@@ -86,7 +86,8 @@ public class ActionExecutor {
     private static final int MOB_COST_OFFSET = BASE_FEATURE_COUNT; // 84..88
     private static final int ANOMALY_OFFSET = MOB_COST_OFFSET + Pathfinder.MOB_PATH_COST_COUNT; // 89..93
     private static final int PATH_OFFSET = ANOMALY_OFFSET + 5; // 94..108
-    private static final int FEATURE_COUNT = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 109
+    private static final int NAV_OFFSET = PATH_OFFSET + Pathfinder.PATH_FEATURE_COUNT; // 109
+    private static final int FEATURE_COUNT = NAV_OFFSET + 1; // 110
 
     /* ================================================================
      *  LIFECYCLE
@@ -579,6 +580,9 @@ public class ActionExecutor {
         for (int i = 0; i < pathCount; i++) {
             f[PATH_OFFSET + i] = pathRel[i];
         }
+
+        /* [109] is_navigating: 1 = outside farm zone (following path), 0 = farming */
+        f[NAV_OFFSET] = (cm == 0) ? 1f : 0f;
 
         return f;
     }

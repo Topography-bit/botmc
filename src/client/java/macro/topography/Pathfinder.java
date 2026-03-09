@@ -78,6 +78,9 @@ public class Pathfinder {
     private static final long SNAPSHOT_REUSE_MS = 650L;
     private static final int SNAPSHOT_COVER_MARGIN = 8;
     private static final double HEURISTIC_WEIGHT = 1.05;
+    private static final double PATH_NOISE = 0.3;  // edge cost gaussian noise σ
+    private static final long PATH_NOISE_WINDOW_MS = 10_000L; // same seed within this time window
+    private static final long REPATH_COOLDOWN_MS = 2000L;    // min time between non-critical replans
     private static final int INTERMEDIATE_GOAL_MAX_Y_DELTA = 8; // max Y diff for intermediate goal
 
     /* ── waypoint management ──────────────────────────────────────── */
@@ -156,6 +159,7 @@ public class Pathfinder {
     private static final boolean EVENT_LOG_ENABLED = true;
     private static final long HEARTBEAT_LOG_INTERVAL_MS = 5000L;
     private static long lastHeartbeatLogMs = 0L;
+    private static long lastRepathMs = 0L;
     private static long pathTaskSeq = 0L;
     private static long pendingPathTaskId = 0L;
     private static long pendingPathTaskStartedMs = 0L;
@@ -583,6 +587,7 @@ public class Pathfinder {
             }
 
             pendingGoal = goal;
+            lastRepathMs = System.currentTimeMillis();
             startPathfinding(client.world, start, pathGoal, stressLevel);
                 eventLog(
                     "repath reason=%s goal=%s pathGoal=%s",
@@ -746,12 +751,19 @@ public class Pathfinder {
                                                  float distToWall, float verticalClearance,
                                                  boolean landingValidationOnly) {
         if (goal == null) return null;
+        // Critical reasons — always trigger immediately
         if (currentPath.isEmpty() || waypointIndex >= currentPath.size()) return "path_empty";
         if (isPathBlockedAhead(world)) return "path_blocked";
         if (!landingValidationOnly && isGoalShiftedSignificantly(goal)) return "goal_shifted";
-        if (!landingValidationOnly && hasPlayerDeviatedFromPath(playerPos)) return "player_deviated";
-        if (!landingValidationOnly && distToWall <= WALL_REPLAN_THRESH) return "wall_close";
-        if (!landingValidationOnly && verticalClearance <= VERTICAL_REPLAN_THRESH) return "low_clearance";
+        // Non-critical reasons — respect cooldown to prevent path thrashing
+        if (!landingValidationOnly) {
+            long sinceLastRepath = System.currentTimeMillis() - lastRepathMs;
+            if (sinceLastRepath >= REPATH_COOLDOWN_MS) {
+                if (hasPlayerDeviatedFromPath(playerPos)) return "player_deviated";
+                if (distToWall <= WALL_REPLAN_THRESH) return "wall_close";
+                if (verticalClearance <= VERTICAL_REPLAN_THRESH) return "low_clearance";
+            }
+        }
         return null;
     }
 
@@ -1725,6 +1737,10 @@ public class Pathfinder {
     private static List<BlockPos> astar(BlockCache cache, BlockPos start, BlockPos goal) {
         if (start.equals(goal)) return Collections.singletonList(goal);
 
+        // Seeded RNG: same goal + same 10s window → same random path (stable across replans)
+        long seed = goal.hashCode() * 31L + (System.currentTimeMillis() / PATH_NOISE_WINDOW_MS);
+        Random rng = new Random(seed);
+
         PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(n -> n.f));
         Map<Long, Double> gCosts = new HashMap<>();
         Map<Long, Long> cameFrom = new HashMap<>();
@@ -1750,7 +1766,7 @@ public class Pathfinder {
 
             expanded++;
 
-            for (Neighbor nb : getNeighbors(cache, current.pos)) {
+            for (Neighbor nb : getNeighbors(cache, current.pos, rng)) {
                 long nbKey = posKey(nb.pos);
                 double tentG = curG + nb.cost;
                 if (tentG < gCosts.getOrDefault(nbKey, Double.MAX_VALUE)) {
@@ -1806,7 +1822,7 @@ public class Pathfinder {
 
             if (goalKeys.contains(curKey)) goalsFound++;
 
-            for (Neighbor nb : getNeighbors(cache, current.pos)) {
+            for (Neighbor nb : getNeighbors(cache, current.pos, null)) {
                 long nbKey = posKey(nb.pos);
                 double tentG = curG + nb.cost;
                 if (tentG < gCosts.getOrDefault(nbKey, Double.MAX_VALUE)) {
@@ -1825,7 +1841,7 @@ public class Pathfinder {
         {1,0}, {-1,0}, {0,1}, {0,-1}, {1,1}, {1,-1}, {-1,1}, {-1,-1}
     };
 
-    private static List<Neighbor> getNeighbors(BlockCache cache, BlockPos pos) {
+    private static List<Neighbor> getNeighbors(BlockCache cache, BlockPos pos, Random rng) {
         List<Neighbor> neighbors = new ArrayList<>(24);
         int x = pos.getX(), y = pos.getY(), z = pos.getZ();
 
@@ -1840,10 +1856,12 @@ public class Pathfinder {
                  || !cache.isPassable(x, y, z + d[1]) || !cache.isPassable(x, y + 1, z + d[1])) {
                     continue;
                 }
-                double cost = 1.414 + wallProximityPenalty(cache, nx, y, nz);
+                double cost = 1.414 + wallProximityPenalty(cache, nx, y, nz, rng);
+                if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                 neighbors.add(new Neighbor(new BlockPos(nx, y, nz), cost));
             } else {
-                double cost = 1.0 + wallProximityPenalty(cache, nx, y, nz);
+                double cost = 1.0 + wallProximityPenalty(cache, nx, y, nz, rng);
+                if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                 neighbors.add(new Neighbor(new BlockPos(nx, y, nz), cost));
             }
         }
@@ -1860,10 +1878,12 @@ public class Pathfinder {
                  || !cache.isPassable(x, ny, z + d[1]) || !cache.isPassable(x, ny + 1, z + d[1])) {
                     continue;
                 }
-                double cost = 2.414 + wallProximityPenalty(cache, nx, ny, nz);
+                double cost = 2.414 + wallProximityPenalty(cache, nx, ny, nz, rng);
+                if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                 neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
             } else {
-                double cost = 2.0 + wallProximityPenalty(cache, nx, ny, nz);
+                double cost = 2.0 + wallProximityPenalty(cache, nx, ny, nz, rng);
+                if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                 neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
             }
         }
@@ -1884,7 +1904,8 @@ public class Pathfinder {
                 if (cache.isStandable(nx, ny, nz)) {
                     double cost = (d[0] != 0 && d[1] != 0) ? 1.414 : 1.0;
                     cost += dy * 0.1;
-                    cost += wallProximityPenalty(cache, nx, ny, nz);
+                    cost += wallProximityPenalty(cache, nx, ny, nz, rng);
+                    if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                     neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
                     break;
                 }
@@ -1897,7 +1918,8 @@ public class Pathfinder {
             int ny = y - dy;
             if (ny < -64) break;
             if (cache.isStandable(x, ny, z)) {
-                double cost = dy * 0.1 + wallProximityPenalty(cache, x, ny, z);
+                double cost = dy * 0.1 + wallProximityPenalty(cache, x, ny, z, rng);
+                if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                 neighbors.add(new Neighbor(new BlockPos(x, ny, z), cost));
                 break;
             }
@@ -2069,7 +2091,7 @@ public class Pathfinder {
         return clamp01((float) (((delta / 50.0) + 1.0) / 2.0));
     }
 
-    private static double wallProximityPenalty(BlockCache cache, int x, int y, int z) {
+    private static double wallProximityPenalty(BlockCache cache, int x, int y, int z, Random rng) {
         double minDistSq = Double.MAX_VALUE;
         for (int dx = -WALL_COST_RADIUS; dx <= WALL_COST_RADIUS; dx++) {
             for (int dz = -WALL_COST_RADIUS; dz <= WALL_COST_RADIUS; dz++) {
@@ -2084,7 +2106,10 @@ public class Pathfinder {
         if (minDistSq == Double.MAX_VALUE) return 0.0;
         double minDist = Math.sqrt(minDistSq);
         double norm = clamp01((float) ((WALL_COST_RADIUS + 1.0 - minDist) / (WALL_COST_RADIUS + 1.0)));
-        return WALL_PROXIMITY_COST * norm * norm;
+        double wallCost = rng != null
+            ? WALL_PROXIMITY_COST * (0.3 + rng.nextDouble() * 1.4)
+            : WALL_PROXIMITY_COST;
+        return wallCost * norm * norm;
     }
 
     /**

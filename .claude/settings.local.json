@@ -22,7 +22,13 @@
       "Bash(xargs unzip:*)",
       "Read(//mnt/c/Users/Ghost/Videos/**)",
       "Bash(./gradlew.bat compileJava)",
-      "Bash(./gradlew compileJava:*)"
+      "Bash(./gradlew compileJava:*)",
+      "Read(//c/Users/Ghost/anaconda3/**)",
+      "Read(//c/Users/Ghost/miniconda3/**)",
+      "Read(//c/ProgramData/anaconda3/**)",
+      "Bash(rm:*)",
+      "Bash(xargs grep:*)",
+      "Bash(echo exit: $?:*)"
     ]
   }
 }

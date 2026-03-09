@@ -2,7 +2,8 @@ package macro.topography;
 
 public enum TopographyModuleType {
     RECORDING("Recording", "Recording"),
-    COMBAT("Combat", "Active");
+    COMBAT("Combat", "Active"),
+    AUTOPILOT("Autopilot", "Driving");
 
     private final String label;
     private final String activeBadge;

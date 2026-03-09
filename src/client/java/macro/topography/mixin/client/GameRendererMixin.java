@@ -1,6 +1,7 @@
 package macro.topography.mixin.client;
 
 import macro.topography.ActionExecutor;
+import macro.topography.Autopilot;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -16,6 +17,7 @@ public class GameRendererMixin {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player != null) {
             ActionExecutor.onFrameRender();
+            Autopilot.onFrameRender();
         }
     }
 }

@@ -43,6 +43,26 @@ public enum TopographyModuleDefinition {
         false,
         2,
         ""
+    ),
+    AUTOPILOT_ZEALOTS(
+        "autopilot_zealots",
+        TopographyTab.MOVEMENT,
+        TopographyModuleType.AUTOPILOT,
+        "Autopilot Zealots",
+        "Rule-based autopilot that follows paths with human-like movement and combat.",
+        false,
+        1,
+        ""
+    ),
+    AUTOPILOT_BRUISERS(
+        "autopilot_bruisers",
+        TopographyTab.MOVEMENT,
+        TopographyModuleType.AUTOPILOT,
+        "Autopilot Bruisers",
+        "Rule-based autopilot for bruiser routes with natural movement patterns.",
+        false,
+        2,
+        ""
     );
 
     private final String id;

@@ -74,7 +74,8 @@ public class DataCollector {
         "path1_rel_x,path1_rel_y,path1_rel_z," +
         "path2_rel_x,path2_rel_y,path2_rel_z," +
         "path3_rel_x,path3_rel_y,path3_rel_z," +
-        "path4_rel_x,path4_rel_y,path4_rel_z";
+        "path4_rel_x,path4_rel_y,path4_rel_z," +
+        "is_navigating";
 
     private static Vec3d prevVelocity = Vec3d.ZERO;
     private static Vec3d prevPos = null;
@@ -307,11 +308,14 @@ public class DataCollector {
             float[] pathRel = Pathfinder.getPathRelative(pos);
             for (int i = 0; i < Pathfinder.PATH_FEATURE_COUNT; i++) {
                 float v = (i < pathRel.length) ? pathRel[i] : 0f;
-                sb.append(String.format(Locale.ROOT, "%.4f", v));
-                if (i < Pathfinder.PATH_FEATURE_COUNT - 1) {
-                    sb.append(",");
-                }
+                sb.append(String.format(Locale.ROOT, "%.4f,", v));
             }
+
+            // === IS_NAVIGATING (col 109) ===
+            // currentMode == 0 means outside farm zone → navigating
+            // currentMode != 0 means inside farm zone → farming
+            int isNavigating = (currentMode == 0) ? 1 : 0;
+            sb.append(isNavigating);
             sb.append(System.lineSeparator());
 
             csvWriter.print(sb);

@@ -36,18 +36,18 @@ public final class Autopilot {
      * ══════════════════════════════════════════════════════════════ */
 
     // ── Pure Pursuit ────────────────────────────────────────────
-    private static final double LOOKAHEAD_MIN = 2.5;
-    private static final double LOOKAHEAD_MAX = 6.0;
-    private static final double LOOKAHEAD_SPEED_K = 10.0;
+    private static final double LOOKAHEAD_MIN = 5.0;
+    private static final double LOOKAHEAD_MAX = 20.0;          // speed 500 covers ~28 bl/s
+    private static final double LOOKAHEAD_SPEED_K = 0.6;       // scale by hSpeed: 28*0.6=16.8
 
     // ── Ornstein-Uhlenbeck yaw noise ────────────────────────────
     private static final double OU_THETA = 2.5;    // mean-reversion rate
-    private static final double OU_SIGMA = 4.0;    // noise amplitude (degrees)
+    private static final double OU_SIGMA = 1.5;    // noise amplitude (lowered — no vibration)
     private static final double OU_DT    = 0.05;   // tick = 50 ms
 
     // ── Sprint control ──────────────────────────────────────────
     private static final double SPRINT_ANGLE_THRESH = 35.0;      // deg — release sprint above this
-    private static final double SPRINT_LOOKAHEAD_DIST = 4.0;     // blocks ahead to check turn
+    private static final double SPRINT_LOOKAHEAD_DIST = 12.0;    // blocks ahead to check turn (speed 500)
     private static final double SPRINT_DELTA_YAW_MAX = 45.0;     // deg — too much turning → no sprint
 
     // ── Jumps ───────────────────────────────────────────────────
@@ -58,21 +58,21 @@ public final class Autopilot {
 
     // ── Combat ──────────────────────────────────────────────────
     private static final double ATTACK_RANGE       = 3.8;
-    private static final double PRE_AIM_RANGE      = 8.0;
-    private static final double COMBAT_STOP_RANGE  = 3.2;       // stop W and strafe inside this
+    private static final double PRE_AIM_RANGE      = 16.0;       // start aiming earlier at high speed
+    private static final double BRAKE_RANGE        = 6.0;        // stop sprint to not overshoot mob
+    private static final double COMBAT_CHASE_RANGE = 2.5;        // closer than this → stop W, just strafe
     private static final double AIM_BLEND_FAR      = 0.3;        // blend factor at pre-aim edge
-    private static final int    ATTACK_CD_MIN      = 2;          // ticks
-    private static final int    ATTACK_CD_MAX      = 4;
-    private static final double ATTACK_AIM_TOLERANCE = 30.0;     // deg — must face mob to swing
+    private static final int    ATTACK_CD_MIN      = 0;          // ticks — speed 500: every tick counts
+    private static final int    ATTACK_CD_MAX      = 1;
+    private static final double ATTACK_AIM_TOLERANCE = 12.0;     // deg — tight for raycast hits
     private static final double FIDGET_SWING_CHANCE = 0.0005;    // per tick → ~1 %/s
-    private static final double COMBAT_STRAFE_CHANCE = 0.06;     // per tick — chance to switch strafe dir
     private static final int    COMBAT_STRAFE_MIN  = 10;         // ticks min in one direction
     private static final int    COMBAT_STRAFE_MAX  = 30;         // ticks max
+    private static final double COMBAT_PITCH_OMEGA = 14.0;       // faster pitch in combat, but not twitchy
 
-    // ── Fall look-down ──────────────────────────────────────────
-    private static final double FALL_SPEED_THRESH  = -0.5;       // start looking down at this vel.y
-    private static final double FALL_PITCH_MAX     = 40.0;       // max pitch-down when falling (degrees)
-    private static final double FALL_PITCH_K       = 25.0;       // degrees per block/tick fall speed
+    // ── Fall: look at landing point ─────────────────────────────
+    private static final double FALL_SPEED_THRESH  = -0.3;       // vel.y to trigger fall aim
+    private static final double FALL_AIM_BLEND     = 0.8;        // how much to override yaw/pitch toward landing
 
     // ── Head scanning ───────────────────────────────────────────
     private static final int    SCAN_INTERVAL_MIN = 100;         // 5 s
@@ -96,14 +96,14 @@ public final class Autopilot {
     //    ω = natural frequency: higher → snappier, lower → lazier
     //    Critical damping: ζ = 1 → fastest convergence without oscillation
     //    Semi-implicit Euler: stable for ω·dt < 2 (max ω = 40 at 20Hz)
-    private static final double YAW_OMEGA        = 10.0;        // yaw spring frequency
-    private static final double PITCH_OMEGA       = 5.0;        // pitch — lazier, more human
+    private static final double YAW_OMEGA        = 10.0;        // snappy yaw for speed 500
+    private static final double PITCH_OMEGA       = 7.0;       // faster pitch tracking
     private static final double SPRING_DT         = 0.05;       // tick = 50 ms
-    private static final double MAX_TURN_RATE     = 18.0;       // deg/tick safety cap (~360°/s)
+    private static final double MAX_TURN_RATE     = 55.0;       // deg/tick cap (~1100°/s) for speed 500
 
     // ── Strafe correction ───────────────────────────────────────
-    private static final double STRAFE_ANGLE_MAX  = 12.0;       // degrees — small delta → strafe
-    private static final double STRAFE_ANGLE_MIN  = 2.0;
+    private static final double STRAFE_ANGLE_MAX  = 20.0;       // degrees — wider for speed 500
+    private static final double STRAFE_ANGLE_MIN  = 3.0;
 
     // ── Stuck detection ─────────────────────────────────────────
     private static final int    STUCK_THRESHOLD = 20;            // ticks stationary
@@ -244,7 +244,6 @@ public final class Autopilot {
 
         /* ── L2: Combat aim blending ───────────────────────────── */
         boolean inCombat = false;
-        boolean combatStop = false;  // close enough to stop and strafe
         double  mobDist  = Double.MAX_VALUE;
         Vec3d   mobPos   = null;
 
@@ -255,10 +254,9 @@ public final class Autopilot {
             if (mobDist < PRE_AIM_RANGE) {
                 double mobYaw = yawTo(pos, mobPos);
                 if (mobDist < ATTACK_RANGE) {
-                    // In melee range: aim 100% at mob, ignore path
+                    // In melee range: aim 100% at mob, stop running, strafe
                     inCombat = true;
                     goalYaw = mobYaw;
-                    if (mobDist < COMBAT_STOP_RANGE) combatStop = true;
                 } else {
                     // Approaching: gradually blend toward mob
                     double t = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
@@ -267,10 +265,13 @@ public final class Autopilot {
             }
         }
 
+        // Freeze waypoint advance while fighting — don't let path pull past mob
+        Pathfinder.setFreezeWaypoint(inCombat);
+
         /* ── L3: OU-process yaw noise ──────────────────────────── */
         ouYaw += OU_THETA * (0 - ouYaw) * OU_DT
                + OU_SIGMA * Math.sqrt(OU_DT) * rng.nextGaussian();
-        goalYaw += ouYaw * (inCombat ? 0.2 : 1.0);
+        goalYaw += ouYaw * (inCombat ? 0.0 : 1.0);
 
         /* ── L4: Head scanning ─────────────────────────────────── */
         if (scanTicksLeft > 0) {
@@ -302,25 +303,43 @@ public final class Autopilot {
             }
         }
 
-        // Aim at mob center
-        if (inCombat && mobPos != null) {
+        // Aim at mob center — blend gradually across pre-aim range (no sudden snap)
+        if (mob != null && mob.isAlive() && mobPos != null && mobDist < PRE_AIM_RANGE) {
             double dy = mobPos.y - (pos.y + player.getStandingEyeHeight());
             double dh = Math.sqrt(sq(mobPos.x - pos.x) + sq(mobPos.z - pos.z));
             if (dh > 0.1) {
-                goalPitch = -Math.toDegrees(Math.atan2(dy, dh));
+                double mobPitch = -Math.toDegrees(Math.atan2(dy, dh));
+                // Smooth blend: 0 at PRE_AIM edge → 1.0 at ATTACK_RANGE
+                double blend = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
+                goalPitch = goalPitch * (1.0 - blend) + mobPitch * blend;
             }
         }
 
-        // Look down when falling — proportional to fall speed
+        // When falling: aim at landing waypoint (both yaw + pitch)
         double velY = player.getVelocity().y;
-        if (!player.isOnGround() && velY < FALL_SPEED_THRESH) {
-            double fallIntensity = Math.min((-velY - (-FALL_SPEED_THRESH)) * FALL_PITCH_K, FALL_PITCH_MAX);
-            goalPitch += fallIntensity;  // positive pitch = look down
+        boolean falling = !player.isOnGround() && velY < FALL_SPEED_THRESH;
+        if (falling && hasPath) {
+            // Find the next waypoint that's at or below the player (landing target)
+            Vec3d landingTarget = findLandingTarget(path, wpIdx, pos);
+            if (landingTarget != null) {
+                double landYaw = yawTo(pos, landingTarget);
+                Vec3d eyePos = pos.add(0, player.getStandingEyeHeight(), 0);
+                double ddy = landingTarget.y - eyePos.y;
+                double ddh = Math.sqrt(sq(landingTarget.x - eyePos.x) + sq(landingTarget.z - eyePos.z));
+                double landPitch = (ddh > 0.3)
+                    ? -Math.toDegrees(Math.atan2(ddy, ddh))
+                    : 45.0; // straight down if directly below
+
+                // Override both yaw and pitch toward landing point
+                goalYaw   = lerpAngle(goalYaw, landYaw, FALL_AIM_BLEND);
+                goalPitch = goalPitch * (1.0 - FALL_AIM_BLEND) + landPitch * FALL_AIM_BLEND;
+            }
         }
 
-        // Layered sine noise
-        goalPitch += Math.sin(tickCount * PITCH_WAVE1_FREQ) * PITCH_WAVE1_AMP
-                   + Math.sin(tickCount * PITCH_WAVE2_FREQ) * PITCH_WAVE2_AMP;
+        // Layered sine noise (off in combat, reduced during fall)
+        double noiseScale = inCombat ? 0.0 : (falling ? 0.3 : 1.0);
+        goalPitch += (Math.sin(tickCount * PITCH_WAVE1_FREQ) * PITCH_WAVE1_AMP
+                    + Math.sin(tickCount * PITCH_WAVE2_FREQ) * PITCH_WAVE2_AMP) * noiseScale;
 
         /* ══════════════════════════════════════════════════════════
          *  CRITICALLY DAMPED SPRING — smooths raw goals into output
@@ -328,7 +347,7 @@ public final class Autopilot {
          *  and deceleration like a human hand on a mouse.
          * ══════════════════════════════════════════════════════════ */
         stepYawSpring(goalYaw);
-        stepPitchSpring(goalPitch);
+        stepPitchSpring(goalPitch, inCombat ? COMBAT_PITCH_OMEGA : PITCH_OMEGA);
 
         // Safety: cap turn rate (handles teleports, extreme stuck turns)
         double yawDelta = MathHelper.wrapDegrees((float)(springYawPos - startYaw));
@@ -350,6 +369,7 @@ public final class Autopilot {
         }
         if (Math.abs(deltaYaw) > SPRINT_DELTA_YAW_MAX) shouldSprint = false;
         if (inCombat)                                    shouldSprint = false;
+        if (mob != null && mob.isAlive() && mobDist < BRAKE_RANGE) shouldSprint = false; // brake before mob
         if (pauseTicksLeft > 0)                          shouldSprint = false;
 
         /* ── L6: Micro-pauses ──────────────────────────────────── */
@@ -385,7 +405,12 @@ public final class Autopilot {
         boolean attack = false;
         if (attackCooldown > 0) attackCooldown--;
 
-        if (inCombat && attackCooldown <= 0 && Math.abs(deltaYaw) < ATTACK_AIM_TOLERANCE) {
+        // Check actual angle between player facing and mob — NOT the spring delta
+        double aimErrorToMob = (inCombat && mobPos != null)
+            ? Math.abs(MathHelper.wrapDegrees((float)(yawTo(pos, mobPos) - player.getYaw())))
+            : 999;
+
+        if (inCombat && attackCooldown <= 0 && aimErrorToMob < ATTACK_AIM_TOLERANCE) {
             attack = true;
             attackCooldown = ATTACK_CD_MIN + rng.nextInt(ATTACK_CD_MAX - ATTACK_CD_MIN + 1);
         }
@@ -398,20 +423,19 @@ public final class Autopilot {
         /* ── L9: Strafe correction / combat strafe ─────────────── */
         boolean strafeLeft = false, strafeRight = false;
 
-        if (combatStop) {
-            // In melee: circle-strafe around mob
+        if (inCombat && mobDist < COMBAT_CHASE_RANGE) {
+            // Only strafe when very close — at speed 500, strafe from far = orbit
             combatStrafeTicks--;
-            if (combatStrafeTicks <= 0 || rng.nextDouble() < COMBAT_STRAFE_CHANCE) {
-                combatStrafeDir = -combatStrafeDir; // flip direction
+            if (combatStrafeTicks <= 0) {
+                combatStrafeDir = -combatStrafeDir;
                 combatStrafeTicks = COMBAT_STRAFE_MIN
                     + rng.nextInt(COMBAT_STRAFE_MAX - COMBAT_STRAFE_MIN + 1);
             }
             if (combatStrafeDir > 0) strafeRight = true;
             else                     strafeLeft  = true;
-        } else if (!inCombat && hasPath
+        } else if (hasPath
                 && Math.abs(deltaYaw) > STRAFE_ANGLE_MIN
                 && Math.abs(deltaYaw) < STRAFE_ANGLE_MAX) {
-            // Walking: small angular corrections via strafe
             if (deltaYaw > 0) strafeRight = true;
             else              strafeLeft  = true;
         }
@@ -438,7 +462,9 @@ public final class Autopilot {
         hasTarget   = true;
 
         /* ── Apply keys ────────────────────────────────────────── */
-        boolean forward = hasPath && !paused && !combatStop;
+        // In combat: walk forward to close gap if mob is far, stop when close enough
+        boolean combatChase = inCombat && mobDist > COMBAT_CHASE_RANGE;
+        boolean forward = hasPath && !paused && (!inCombat || combatChase);
         GameOptions o = client.options;
         o.forwardKey .setPressed(forward);
         o.backKey    .setPressed(false);
@@ -524,9 +550,9 @@ public final class Autopilot {
         springYawPos += springYawVel * SPRING_DT;
     }
 
-    private static void stepPitchSpring(double target) {
+    private static void stepPitchSpring(double target, double omega) {
         double error = target - springPitchPos;
-        double accel = PITCH_OMEGA * PITCH_OMEGA * error - 2.0 * PITCH_OMEGA * springPitchVel;
+        double accel = omega * omega * error - 2.0 * omega * springPitchVel;
         springPitchVel += accel * SPRING_DT;
         springPitchPos += springPitchVel * SPRING_DT;
         springPitchPos = Math.max(-90, Math.min(90, springPitchPos));
@@ -535,6 +561,38 @@ public final class Autopilot {
     /* ══════════════════════════════════════════════════════════════
      *  HELPERS
      * ══════════════════════════════════════════════════════════════ */
+
+    /**
+     * Find the best waypoint to aim at during a fall.
+     * Searches forward from current waypoint for a point that's below the player
+     * (the expected landing area). Returns the closest such waypoint center.
+     */
+    private static Vec3d findLandingTarget(List<BlockPos> path, int wpIdx, Vec3d playerPos) {
+        // Look for the first waypoint that's at or below the player
+        Vec3d best = null;
+        double bestDistSq = Double.MAX_VALUE;
+
+        int searchEnd = Math.min(path.size(), wpIdx + 15); // don't search too far ahead
+        for (int i = wpIdx; i < searchEnd; i++) {
+            BlockPos wp = path.get(i);
+            if (wp.getY() < playerPos.y - 1.0) {
+                // Below player — candidate landing point
+                Vec3d wpCenter = Vec3d.ofCenter(wp);
+                double dSq = playerPos.squaredDistanceTo(wpCenter);
+                if (dSq < bestDistSq) {
+                    bestDistSq = dSq;
+                    best = wpCenter;
+                }
+            }
+        }
+
+        // If no waypoint below, use the next waypoint anyway (shallow fall)
+        if (best == null && wpIdx < path.size()) {
+            best = Vec3d.ofCenter(path.get(Math.min(wpIdx + 1, path.size() - 1)));
+        }
+
+        return best;
+    }
 
     /** Compute the total turn angle at a lookahead distance along the path. */
     private static double computeTurnAngleAhead(List<BlockPos> path, int wpIdx,

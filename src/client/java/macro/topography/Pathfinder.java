@@ -118,6 +118,7 @@ public class Pathfinder {
     /* ── state ────────────────────────────────────────────────────── */
     private static List<BlockPos> currentPath = Collections.emptyList();
     private static int waypointIndex = 0;
+    private static boolean freezeWaypoint = false; // Autopilot sets true during combat
     private static final AtomicBoolean computing = new AtomicBoolean(false);
     private static CompletableFuture<List<BlockPos>> pendingFuture = null;
     private static BlockPos lastGoal = null;
@@ -492,8 +493,8 @@ public class Pathfinder {
             pendingPathTaskStartedMs = 0L;
         }
 
-        // Advance waypoint (dynamic radius + corner cutting)
-        if (!currentPath.isEmpty() && waypointIndex < currentPath.size()) {
+        // Advance waypoint (dynamic radius + corner cutting) — frozen during combat
+        if (!freezeWaypoint && !currentPath.isEmpty() && waypointIndex < currentPath.size()) {
             BlockPos wp = currentPath.get(waypointIndex);
             double dist = pos.distanceTo(Vec3d.ofCenter(wp));
             boolean isFinal = waypointIndex == currentPath.size() - 1;
@@ -924,6 +925,7 @@ public class Pathfinder {
 
     public static List<BlockPos> getCurrentPath() { return currentPath; }
     public static int getWaypointIndex() { return waypointIndex; }
+    public static void setFreezeWaypoint(boolean freeze) { freezeWaypoint = freeze; }
 
     /**
      * Get smooth Catmull-Rom curve points for rendering.

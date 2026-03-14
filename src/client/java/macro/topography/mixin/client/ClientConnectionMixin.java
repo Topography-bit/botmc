@@ -19,6 +19,7 @@ public class ClientConnectionMixin {
     private void injectSocks5Proxy(Channel channel, CallbackInfo ci) {
         ProxyConfig.lastConnectionUsedProxy = false;
         ProxyConfig.lastProxyAddress = "";
+        ProxyConfig.lastProxyError = "";
 
         if (!ProxyConfig.isEnabled()) return;
 
@@ -38,10 +39,14 @@ public class ClientConnectionMixin {
                 handler = (ChannelHandler) ctor.newInstance(proxyAddr);
             }
         } catch (ClassNotFoundException e) {
-            System.err.println("[TopographyProxy] netty-handler-proxy not found on classpath, SOCKS5 proxy unavailable");
+            System.err.println("[TopographyProxy] CRITICAL: netty-handler-proxy not found on classpath!");
+            ProxyConfig.lastProxyError = "Proxy library missing — connection blocked";
+            channel.close();
             return;
         } catch (Exception e) {
-            System.err.println("[TopographyProxy] Failed to create Socks5ProxyHandler: " + e.getMessage());
+            System.err.println("[TopographyProxy] CRITICAL: Failed to create Socks5ProxyHandler: " + e.getMessage());
+            ProxyConfig.lastProxyError = "Proxy init failed — connection blocked";
+            channel.close();
             return;
         }
 

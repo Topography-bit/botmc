@@ -82,6 +82,17 @@ public final class TopographyUiConfig {
     public static boolean isMobEspEnabled() { return data.mobEsp; }
     public static void setMobEspEnabled(boolean v) { data.mobEsp = v; save(); }
 
+    // ── Auto-join ─────────────────────────────────────────────────
+
+    public static boolean isAutoJoinEnabled() { return data.autoJoin; }
+    public static void setAutoJoinEnabled(boolean v) { data.autoJoin = v; save(); }
+
+    public static String getAutoJoinServer() { return data.autoJoinServer; }
+    public static void setAutoJoinServer(String s) { data.autoJoinServer = s; save(); }
+
+    public static int getAutoJoinModeId() { return data.autoJoinModeId; }
+    public static void setAutoJoinModeId(int id) { data.autoJoinModeId = id; save(); }
+
     // ── Internals ────────────────────────────────────────────────
 
     private static void ensureDefaults() {
@@ -94,6 +105,9 @@ public final class TopographyUiConfig {
         d.modeKeybinds = new HashMap<>();
         d.pathRender = true;
         d.mobEsp = true;
+        d.autoJoin = false;
+        d.autoJoinServer = "mc.hypixel.net";
+        d.autoJoinModeId = 1;
         return d;
     }
 
@@ -101,6 +115,9 @@ public final class TopographyUiConfig {
         Map<Integer, Integer> modeKeybinds = new HashMap<>();
         boolean pathRender = true;
         boolean mobEsp = true;
+        boolean autoJoin = false;
+        String autoJoinServer = "mc.hypixel.net";
+        int autoJoinModeId = 1;
 
         // Legacy fields — Gson will populate these if present in old config
         transient int zealotsKeyCode = GLFW.GLFW_KEY_UNKNOWN;

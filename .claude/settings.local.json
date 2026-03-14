@@ -45,7 +45,18 @@
       "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.input.MouseInput 2>&1)",
       "Bash(grep -r \"getTextureManager\" --include=\"*.java\" src/ 2>/dev/null | head -5)",
       "Bash(git add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(find:*)",
+      "Bash(./gradlew compileClientJava 2>&1 | grep -E \"error:|warning:.*RenderTest\" | head -20)",
+      "Bash(./gradlew compileClientJava 2>&1 | grep \"error:\")",
+      "Bash(./gradlew compileClientJava 2>&1 | grep -A1 \"cannot find\")",
+      "Bash(./gradlew compileClientJava 2>&1 | grep -A1 \"error:\")",
+      "Bash(git checkout:*)",
+      "Bash(cd:*)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "WebFetch(domain:maven.fabricmc.net)",
+      "Bash(awk:*)"
     ]
   }
 }

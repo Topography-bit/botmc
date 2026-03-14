@@ -9,6 +9,7 @@
 		"MouseDeltaMixin",
 		"ClientConnectionMixin",
 		"MultiplayerScreenMixin",
+		"MultiplayerScreenAccessor",
 		"ClientPlayNetworkHandlerMixin",
 		"MinecraftClientInvoker",
 		"GameRendererMixin"

@@ -147,7 +147,7 @@ public final class TopographySmoothTextRenderer {
         for (int i = 0; i < text.length(); i++) {
             String ch = String.valueOf(text.charAt(i));
             draw(context, ch, cx, y, color);
-            cx += width(ch) + tracking;
+            if (i < text.length() - 1) cx += width(ch) + tracking;
         }
     }
 

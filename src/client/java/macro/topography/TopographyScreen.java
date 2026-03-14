@@ -12,6 +12,8 @@ import org.lwjgl.glfw.GLFW;
 import java.awt.Font;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
+
 
 public class TopographyScreen extends Screen {
 
@@ -44,8 +46,8 @@ public class TopographyScreen extends Screen {
 
     // ── Computed layout ──────────────────────────────────────────
     private float panelW, panelH;
-    private float pad, headerH, cardGap, settingsH;
-    private float modesHeaderY, settingsHeaderY;
+    private float pad, headerH, cardGap, bottomCardH;
+    private float modesHeaderY, settingsHeaderY, miscHeaderY;
 
     private final Screen parent;
     private long openTimeNanos;
@@ -65,6 +67,11 @@ public class TopographyScreen extends Screen {
     private ToggleWidget mobToggle;
     private ClickableLabel closeLabel;
 
+    // Misc card
+    private CardWidget miscCard;
+    private ToggleWidget autoJoinToggle;
+    private DropdownWidget autoJoinModeSelector;
+
     public TopographyScreen(Screen parent) {
         super(Text.literal("Topography"));
         this.parent = parent;
@@ -72,7 +79,7 @@ public class TopographyScreen extends Screen {
 
     @Override
     protected void init() {
-        openTimeNanos = System.nanoTime();
+        openTimeNanos = 0; // deferred to first render
         buildWidgetTree();
     }
 
@@ -135,6 +142,41 @@ public class TopographyScreen extends Screen {
 
         root.add(settingsCard);
 
+        // ── Misc card ─────────────────────────────────────────────
+        miscCard = new CardWidget();
+        miscCard.setPadding(20);
+
+        autoJoinToggle = new ToggleWidget(LABEL_FONT, "Auto-Join: ",
+                TopographyUiConfig::isAutoJoinEnabled, TopographyUiConfig::setAutoJoinEnabled);
+        miscCard.add(autoJoinToggle);
+
+        List<String> modeNames = new ArrayList<>();
+        modeNames.add("None");
+        modeNames.addAll(ModeRegistry.getModes().stream()
+                .map(Mode::getName).collect(Collectors.toList()));
+
+        autoJoinModeSelector = new DropdownWidget(LABEL_FONT, "Mode: ",
+                modeNames,
+                () -> {
+                    int id = TopographyUiConfig.getAutoJoinModeId();
+                    // id 0 = none (index 0), id 1 = first mode (index 1), etc.
+                    for (int i = 0; i < ModeRegistry.getModes().size(); i++) {
+                        if (ModeRegistry.getModes().get(i).getId() == id) return i + 1;
+                    }
+                    return 0;
+                },
+                idx -> {
+                    if (idx == 0) {
+                        TopographyUiConfig.setAutoJoinModeId(0);
+                    } else {
+                        TopographyUiConfig.setAutoJoinModeId(
+                                ModeRegistry.getModes().get(idx - 1).getId());
+                    }
+                });
+        miscCard.add(autoJoinModeSelector);
+
+        root.add(miscCard);
+
         // ── Close × ─────────────────────────────────────────────
         closeLabel = new ClickableLabel(LABEL_FONT, "\u00D7", TEXT_SECONDARY, TEXT_PRIMARY);
         closeLabel.setOnClick(this::close);
@@ -161,7 +203,7 @@ public class TopographyScreen extends Screen {
         pad = compact ? 16 : (medium ? 22 : 32);
         headerH = compact ? 34 : (medium ? 42 : 50);
         cardGap = compact ? 10 : (medium ? 14 : 20);
-        settingsH = compact ? 60 : (medium ? 70 : 80);
+        bottomCardH = compact ? 60 : (medium ? 70 : 80);
     }
 
     private void layout(float px, float py) {
@@ -180,18 +222,25 @@ public class TopographyScreen extends Screen {
         float contentTop = py + headerH + headerGap;
         float contentBottom = py + panelH - pad;
 
-        // Settings card at bottom
+        // Bottom area: SETTINGS (left) and MISC (right) side by side
         float sectionHeaderH = SECTION_FONT.lineHeight() + (height < 400 ? 6 : 10);
-        float settingsBlockH = sectionHeaderH + settingsH;
-        float settingsTopY = contentBottom - settingsBlockH;
-        settingsHeaderY = settingsTopY;
-        float sCardY = settingsTopY + sectionHeaderH;
+        float bottomBlockH = sectionHeaderH + bottomCardH;
+        float bottomTopY = contentBottom - bottomBlockH;
+        float bottomCardY = bottomTopY + sectionHeaderH;
+
+        // Split bottom into two columns
+        float bottomGap = cardGap;
+        float settingsW = contentW * 0.55f - bottomGap / 2f;
+        float miscW = contentW - settingsW - bottomGap;
+
+        settingsHeaderY = bottomTopY;
+        miscHeaderY = bottomTopY;
 
         // Mode cards fill remaining space
         modesHeaderY = contentTop;
         float cardsY = contentTop + sectionHeaderH;
         float cardSettingsGap = height < 400 ? 12 : 24;
-        float cardH = settingsTopY - cardsY - cardSettingsGap;
+        float cardH = bottomTopY - cardsY - cardSettingsGap;
         cardH = Math.max(80, cardH);
 
         int cardCount = modeCards.size();
@@ -201,24 +250,24 @@ public class TopographyScreen extends Screen {
             modeCards.get(i).setBounds(contentX + i * (cardW + cardGap), cardsY, cardW, cardH);
         }
 
-        // Settings card
+        // ── Settings card (left) ──────────────────────────────────
         float sPad = Math.min(20, pad);
-        settingsCard.setBounds(contentX, sCardY, contentW, settingsH);
+        settingsCard.setBounds(contentX, bottomCardY, settingsW, bottomCardH);
 
-        float sy = sCardY + sPad;
+        float sy = bottomCardY + sPad;
         float proxyLabelW = LABEL_FONT.width("Proxy:");
         proxyLabel.setBounds(contentX + sPad, sy, proxyLabelW, LABEL_FONT.lineHeight());
 
         float configW = SMALL_FONT.width("[Configure]");
         float proxyValueX = contentX + sPad + proxyLabelW + 8;
-        float proxyValueMaxW = contentW - sPad * 2 - proxyLabelW - 8 - configW - 12;
+        float proxyValueMaxW = settingsW - sPad * 2 - proxyLabelW - 8 - configW - 12;
         proxyValue.setBounds(proxyValueX, sy, proxyValueMaxW, LABEL_FONT.lineHeight());
 
-        configBtn.setBounds(contentX + contentW - sPad - configW, sy,
+        configBtn.setBounds(contentX + settingsW - sPad - configW, sy,
                 configW, SMALL_FONT.lineHeight() + 4);
 
-        // Toggles
-        float toggleY = sCardY + sPad + LABEL_FONT.lineHeight() + (height < 400 ? 6 : 10);
+        // Toggles row
+        float toggleY = bottomCardY + sPad + LABEL_FONT.lineHeight() + (height < 400 ? 6 : 10);
         float toggleX = contentX + sPad;
         float pillW = 26;
         float pathW = LABEL_FONT.width("Path Render: ") + 4 + pillW;
@@ -228,6 +277,17 @@ public class TopographyScreen extends Screen {
         float mobX = toggleX + pathW + toggleGap;
         float mobW = LABEL_FONT.width("Mob ESP: ") + 4 + pillW;
         mobToggle.setBounds(mobX, toggleY, mobW, LABEL_FONT.lineHeight() + 4);
+
+        // ── Misc card (right) ─────────────────────────────────────
+        float miscX = contentX + settingsW + bottomGap;
+        miscCard.setBounds(miscX, bottomCardY, miscW, bottomCardH);
+
+        float my = bottomCardY + sPad;
+        float autoJoinW = LABEL_FONT.width("Auto-Join: ") + 4 + pillW;
+        autoJoinToggle.setBounds(miscX + sPad, my, autoJoinW, LABEL_FONT.lineHeight() + 4);
+
+        float selectorY = bottomCardY + sPad + LABEL_FONT.lineHeight() + (height < 400 ? 6 : 10);
+        autoJoinModeSelector.setBounds(miscX + sPad, selectorY, miscW - sPad * 2, LABEL_FONT.lineHeight() + 4);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -236,6 +296,9 @@ public class TopographyScreen extends Screen {
 
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+        // ── Defer open timestamp to first actual render (avoids AWT init stutter) ──
+        if (openTimeNanos == 0) openTimeNanos = System.nanoTime();
+
         // ── Open animation (nanoTime for smooth interpolation) ────
         float openElapsed = Math.min(1f, (System.nanoTime() - openTimeNanos) / (OPEN_DURATION_MS * 1_000_000f));
         float openInv = 1f - openElapsed;
@@ -290,17 +353,17 @@ public class TopographyScreen extends Screen {
         LOGO_FONT.drawWithTracking(ctx, "TOPOGRAPHY", contentX, logoY,
                 applyAlpha(TEXT_PRIMARY, alpha), 3f);
 
-        // Breadcrumb: "Modules / Dashboard"
+        // Breadcrumb: "Modules / Dashboard" — baseline-aligned with logo bottom
         float breadcrumbX = contentX + LOGO_FONT.widthWithTracking("TOPOGRAPHY", 3f) + 20;
-        float breadcrumbBaseY = logoY + LOGO_FONT.ascent() - TITLE_FONT.ascent();
-        TITLE_FONT.draw(ctx, "Modules", breadcrumbX, breadcrumbBaseY,
+        float logoBaseline = logoY + LOGO_FONT.ascent();
+        float breadcrumbY = logoBaseline - TITLE_FONT.ascent();
+        TITLE_FONT.draw(ctx, "Modules", breadcrumbX, breadcrumbY,
                 applyAlpha(TEXT_DIM, alpha));
         float modulesW = TITLE_FONT.width("Modules");
-        float smallBaseY = logoY + LOGO_FONT.ascent() - SMALL_FONT.ascent();
-        SMALL_FONT.draw(ctx, " / ", breadcrumbX + modulesW, smallBaseY,
+        TITLE_FONT.draw(ctx, " / ", breadcrumbX + modulesW, breadcrumbY,
                 applyAlpha(TEXT_DIM, alpha));
-        float slashW = SMALL_FONT.width(" / ");
-        SMALL_FONT.draw(ctx, "Dashboard", breadcrumbX + modulesW + slashW, smallBaseY,
+        float slashW = TITLE_FONT.width(" / ");
+        TITLE_FONT.draw(ctx, "Dashboard", breadcrumbX + modulesW + slashW, breadcrumbY,
                 applyAlpha(TEXT_SECONDARY, alpha));
 
         // Header separator line (single clean line, no segments)
@@ -309,8 +372,14 @@ public class TopographyScreen extends Screen {
                 applyAlpha(BORDER_DEFAULT, (int) (alpha * 0.7f)));
 
         // ── Section headers ──────────────────────────────────────
+        float bottomGap = cardGap;
+        float settingsW = contentW * 0.55f - bottomGap / 2f;
+        float miscW = contentW - settingsW - bottomGap;
+        float miscX = contentX + settingsW + bottomGap;
+
         renderSectionHeader(ctx, "MODES", contentX, modesHeaderY, contentW, alpha);
-        renderSectionHeader(ctx, "SETTINGS", contentX, settingsHeaderY, contentW, alpha);
+        renderSectionHeader(ctx, "SETTINGS", contentX, settingsHeaderY, settingsW, alpha);
+        renderSectionHeader(ctx, "MISC", miscX, miscHeaderY, miscW, alpha);
 
         // ── Status ribbon at bottom ─────────────────────────────
         float ribbonH = 2f;
@@ -346,6 +415,9 @@ public class TopographyScreen extends Screen {
         // ── Render widgets ───────────────────────────────────────
         root.updateHover(mouseX, mouseY);
         root.render(ctx, mouseX, mouseY, alpha);
+
+        // ── Dropdown overlay (renders on top of everything) ───
+        autoJoinModeSelector.renderOverlay(ctx, mouseX, mouseY, alpha);
     }
 
     private void renderSectionHeader(DrawContext ctx, String text, float hx, float hy,
@@ -372,6 +444,12 @@ public class TopographyScreen extends Screen {
 
         double mx = click.x();
         double my = click.y();
+
+        // Dropdown gets priority when open
+        if (autoJoinModeSelector.isOpen()) {
+            autoJoinModeSelector.mouseClicked(mx, my, 0);
+            return true;
+        }
 
         boolean clickedKeybind = false;
         for (ModeCardWidget card : modeCards) {

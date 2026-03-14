@@ -15,10 +15,10 @@ public abstract class Widget {
     private long lastAnimNanos = -1;
 
     // Time constants in ms (reaches ~95% in 3×tau)
-    private static final float HOVER_IN_TAU  = 50f;   // ~150ms to settle
-    private static final float HOVER_OUT_TAU = 70f;   // ~210ms to settle
-    private static final float PRESS_IN_TAU  = 20f;   // ~60ms to settle
-    private static final float PRESS_OUT_TAU = 40f;   // ~120ms to settle
+    private static final float HOVER_IN_TAU  = 90f;   // ~270ms to settle
+    private static final float HOVER_OUT_TAU = 130f;  // ~390ms to settle
+    private static final float PRESS_IN_TAU  = 35f;   // ~105ms to settle
+    private static final float PRESS_OUT_TAU = 65f;   // ~195ms to settle
 
     public void setBounds(float x, float y, float w, float h) {
         this.x = x;

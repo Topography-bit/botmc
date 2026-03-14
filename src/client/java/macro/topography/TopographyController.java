@@ -106,8 +106,8 @@ public final class TopographyController {
             return;
         }
 
-        // Don't process keybinds while in our screen (capturing binds)
-        if (client.currentScreen instanceof TopographyScreen) return;
+        // Don't process keybinds while any screen is open (chat, inventory, our menu, etc.)
+        if (client.currentScreen != null) return;
 
         checkZoneTransitions(client);
 

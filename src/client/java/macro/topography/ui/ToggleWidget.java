@@ -29,8 +29,8 @@ public class ToggleWidget extends Widget {
     private float toggleProgress = -1;
     private long lastToggleNanos = -1;
 
-    private static final float TOGGLE_ON_TAU = 60f;   // ~180ms to settle
-    private static final float TOGGLE_OFF_TAU = 80f;  // ~240ms to settle
+    private static final float TOGGLE_ON_TAU = 100f;   // ~300ms to settle
+    private static final float TOGGLE_OFF_TAU = 140f;  // ~420ms to settle
 
     public ToggleWidget(TopographySmoothTextRenderer font, String label,
                         BooleanSupplier getter, Consumer<Boolean> setter) {

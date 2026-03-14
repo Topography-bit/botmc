@@ -16,6 +16,7 @@ public class ProxyConfig {
     private static List<ProxyEntry> proxies = new ArrayList<>();
     public static volatile boolean lastConnectionUsedProxy = false;
     public static volatile String lastProxyAddress = "";
+    public static volatile String lastProxyError = "";
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Path CONFIG_FILE = FabricLoader.getInstance()

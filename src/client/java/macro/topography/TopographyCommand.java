@@ -3,6 +3,9 @@ package macro.topography;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.text.Text;
+
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
 
 public final class TopographyCommand {
@@ -30,6 +33,15 @@ public final class TopographyCommand {
                 .then(literal("open")
                     .executes(context -> {
                         TopographyController.openScreen();
+                        return 1;
+                    }))
+                .then(literal("fakekick")
+                    .executes(context -> {
+                        MinecraftClient client = MinecraftClient.getInstance();
+                        if (client != null && client.player != null) {
+                            client.player.networkHandler.getConnection()
+                                    .disconnect(Text.literal("Fake kick for reconnect test"));
+                        }
                         return 1;
                     })))
         );

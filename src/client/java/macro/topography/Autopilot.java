@@ -119,6 +119,7 @@ public final class Autopilot {
 
     private static boolean enabled = false;
     private static int     targetMode = 0;
+    private static volatile boolean limboDetected = false;
     private static final Random rng = new Random();
     private static long tickCount = 0;
 
@@ -162,6 +163,16 @@ public final class Autopilot {
     public static boolean isEnabled()      { return enabled; }
     public static int     getTargetMode()  { return targetMode; }
 
+    /** Called from ClientPlayNetworkHandlerMixin when a chat message arrives. */
+    public static void onChatMessage(String message) {
+        if (!enabled) return;
+        String lower = message.toLowerCase();
+        if (lower.contains("limbo") || lower.contains("you were spawned in limbo")
+                || lower.contains("afk") || lower.contains("you are afk")) {
+            limboDetected = true;
+        }
+    }
+
     public static void start(int mode) {
         targetMode = mode;
         reset();
@@ -180,6 +191,7 @@ public final class Autopilot {
 
     public static void stop() {
         enabled = false;
+        limboDetected = false;
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc != null) releaseAllKeys(mc);
         Pathfinder.stop();
@@ -207,6 +219,16 @@ public final class Autopilot {
     private static void onTick(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) return;
+
+        // Limbo detection: chat message or sudden location change
+        if (limboDetected) {
+            limboDetected = false;
+            System.out.println("[Autopilot] Limbo detected via chat, stopping macro → /lobby");
+            int mode = targetMode;
+            stop();
+            ReconnectManager.startPostJoinFlow(mode, true);
+            return;
+        }
 
         tickCount++;
         tickStartNano = System.nanoTime();

@@ -151,10 +151,10 @@ public class ModeCardWidget extends CardWidget {
         float statsH = active ? (SMALL.lineHeight() + 4) * 2 : 0;
 
         // Calculate ideal total
-        float idealGap1 = 4;   // after title
-        float idealGap2 = 12;  // after subtitle
-        float idealGap3 = 12;  // after separator
-        float idealGap4 = 8;   // after status
+        float idealGap1 = 6;   // after title
+        float idealGap2 = 14;  // after subtitle
+        float idealGap3 = 14;  // after separator
+        float idealGap4 = 10;  // after status
         float idealTotal = titleH + idealGap1 + subtitleH + idealGap2 + sepH + idealGap3 + statusH + idealGap4 + statsH;
 
         // Scale gaps if too tight
@@ -163,12 +163,12 @@ public class ModeCardWidget extends CardWidget {
         float gap1 = idealGap1, gap2 = idealGap2, gap3 = idealGap3, gap4 = idealGap4;
 
         if (idealTotal > contentH) {
-            // First: shrink gaps
+            // Shrink gaps proportionally, but keep minimum spacing
             float shrink = Math.min(1f, Math.max(0f, contentH / idealTotal));
-            gap1 = idealGap1 * shrink;
-            gap2 = idealGap2 * shrink;
-            gap3 = idealGap3 * shrink;
-            gap4 = idealGap4 * shrink;
+            gap1 = Math.max(2, idealGap1 * shrink);
+            gap2 = Math.max(4, idealGap2 * shrink);
+            gap3 = Math.max(4, idealGap3 * shrink);
+            gap4 = Math.max(4, idealGap4 * shrink);
             float shrunkTotal = titleH + gap1 + subtitleH + gap2 + sepH + gap3 + statusH + gap4 + statsH;
 
             if (shrunkTotal > contentH) {

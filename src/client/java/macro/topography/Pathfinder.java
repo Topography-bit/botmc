@@ -70,8 +70,8 @@ public class Pathfinder {
     private static final int CACHE_RADIUS = 80;
     private static final double MAX_PATHFIND_DIST = 50.0; // intermediate goal distance
     private static final int MAX_CACHE_AREA = 250 * 250;
-    private static final double WALL_PROXIMITY_COST = 0.45;
-    private static final int WALL_COST_RADIUS = 2;
+    private static final double WALL_PROXIMITY_COST = 0.8;      // stronger wall avoidance
+    private static final int WALL_COST_RADIUS = 3;             // detect walls further away
     private static final float WALL_REPLAN_THRESH = 0.08f;
     private static final float VERTICAL_REPLAN_THRESH = 0.15f;
     private static final float POS_ANOMALY_RESET_THRESH = 0.15f;
@@ -80,23 +80,25 @@ public class Pathfinder {
     private static final double HEURISTIC_WEIGHT = 1.05;
     private static final double PATH_NOISE = 0.3;  // edge cost gaussian noise σ
     private static final long PATH_NOISE_WINDOW_MS = 10_000L; // same seed within this time window
-    private static final long REPATH_COOLDOWN_MS = 2000L;    // min time between non-critical replans
+    private static final long REPATH_COOLDOWN_MS = 4000L;    // min time between non-critical replans
     private static final int INTERMEDIATE_GOAL_MAX_Y_DELTA = 8; // max Y diff for intermediate goal
 
     /* ── waypoint management ──────────────────────────────────────── */
-    private static final double ADVANCE_RADIUS_BASE = 1.5;
-    private static final double ADVANCE_RADIUS_MAX = 3.0;
-    private static final double FINAL_RADIUS = 0.3;
+    // At speed 500 (~1.4 bl/tick) player moves 1.4 blocks per tick.
+    // Radius must exceed per-tick movement to avoid overshooting waypoints.
+    private static final double ADVANCE_RADIUS_BASE = 3.0;
+    private static final double ADVANCE_RADIUS_MAX = 6.0;
+    private static final double FINAL_RADIUS = 1.5;
     private static final double WAYPOINT_PROGRESS_EPS_SQ = 0.05;
     private static final double GOAL_TIGHTEN_DIST = 5.0; // start tightening radius within this distance
     public static final int PATH_HORIZON_POINTS = 5;
     public static final int PATH_FEATURE_COUNT = PATH_HORIZON_POINTS * 3;
 
     /* ── async control ────────────────────────────────────────────── */
-    private static final double DEVIATE_DIST = 5.0;
-    private static final double GOAL_SHIFT_REPLAN_DIST = 3.0;
+    private static final double DEVIATE_DIST = 10.0;  // speed 500: 5 blocks in 3 ticks, need larger margin
+    private static final double GOAL_SHIFT_REPLAN_DIST = 6.0;   // mob needs to move 6+ blocks to trigger repath
     private static final double GOAL_SHIFT_REPLAN_DIST_SQ = GOAL_SHIFT_REPLAN_DIST * GOAL_SHIFT_REPLAN_DIST;
-    private static final int BLOCK_VALIDATION_POINTS = 4;
+    private static final int BLOCK_VALIDATION_POINTS = 2;  // reduced: End terrain causes false positives with 4
     private static final float KNOCKBACK_REPLAN_VEL_ANOMALY = 0.12f;
     private static final double LANDING_FALL_SPEED_THRESH = -0.12;
 
@@ -110,7 +112,7 @@ public class Pathfinder {
     private static final float FOV_BIAS_WEIGHT = 0.5f;        // angular cost multiplier
     private static final float HIDDEN_MOB_PENALTY = 1.8f;     // cost multiplier for non-visible mobs
     private static final float SPECIAL_ZEALOT_DISCOUNT = 0.15f; // Special Zealots get cost * 0.15 (massive priority)
-    private static final double COMMITMENT_RADIUS = 15.0;      // don't switch if closer than this
+    private static final double COMMITMENT_RADIUS = 25.0;      // don't switch targets when this close
     private static final float SOFT_CHOICE_THRESHOLD = 0.15f;  // 15% cost margin for randomization
     private static final float REACHABLE_COST_THRESHOLD = 0.95f; // mobs with cost >= this are considered unreachable
     public static final int MOB_PATH_COST_COUNT = 5;
@@ -1890,7 +1892,8 @@ public class Pathfinder {
             }
         }
 
-        // 3. Fall (8 directions)
+        // 3. Fall (8 directions) — cost scales quadratically with fall height
+        //    to strongly discourage large falls (bot can miss landing)
         for (int[] d : DIRS_8) {
             int nx = x + d[0], nz = z + d[1];
             // Diagonal corner check at current Y
@@ -1905,7 +1908,8 @@ public class Pathfinder {
                 if (ny < -64) break;
                 if (cache.isStandable(nx, ny, nz)) {
                     double cost = (d[0] != 0 && d[1] != 0) ? 1.414 : 1.0;
-                    cost += dy * 0.1;
+                    // Quadratic fall penalty: 1bl=0.5, 2bl=2.0, 3bl=4.5, 5bl=12.5
+                    cost += dy * dy * 0.5;
                     cost += wallProximityPenalty(cache, nx, ny, nz, rng);
                     if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                     neighbors.add(new Neighbor(new BlockPos(nx, ny, nz), cost));
@@ -1915,12 +1919,12 @@ public class Pathfinder {
             }
         }
 
-        // 4. Drop straight down
+        // 4. Drop straight down — same quadratic cost
         for (int dy = 1; dy <= MAX_FALL; dy++) {
             int ny = y - dy;
             if (ny < -64) break;
             if (cache.isStandable(x, ny, z)) {
-                double cost = dy * 0.1 + wallProximityPenalty(cache, x, ny, z, rng);
+                double cost = dy * dy * 0.5 + wallProximityPenalty(cache, x, ny, z, rng);
                 if (rng != null) cost = Math.max(0.1, cost * (1.0 + rng.nextGaussian() * PATH_NOISE));
                 neighbors.add(new Neighbor(new BlockPos(x, ny, z), cost));
                 break;
@@ -1933,7 +1937,7 @@ public class Pathfinder {
 
     /* ── path smoothing — conservative, max 6 node skip ────────── */
 
-    private static final int MAX_SMOOTH_SKIP = 3;
+    private static final int MAX_SMOOTH_SKIP = 4;
 
     private static List<BlockPos> smoothPath(BlockCache cache, List<BlockPos> raw) {
         if (raw == null || raw.size() <= 2) return raw;
@@ -1959,8 +1963,9 @@ public class Pathfinder {
         return smooth;
     }
 
-    /** Check if the full player hitbox can WALK in a straight line.
-     *  Checks: passability, wall clearance (5 rays), ground below, same Y level. */
+    /** Check if the player can walk in a straight line without hitting walls
+     *  AND without losing ground (no gaps/cliffs along the way).
+     *  Checks passability at feet+head level with hitbox-width rays. Same Y only. */
     private static boolean hasLineOfSight(BlockCache cache, BlockPos from, BlockPos to) {
         int dx = to.getX() - from.getX();
         int dz = to.getZ() - from.getZ();
@@ -1973,18 +1978,15 @@ public class Pathfinder {
         double perpX = -dz / len;
         double perpZ =  dx / len;
 
-        // 5 rays: center + 4 offsets (player hitbox ~0.6 wide)
+        // 3 rays: center + sides (player hitbox ~0.6 wide)
         double[][] offsets = {
             {0, 0},
             { perpX * 0.35,  perpZ * 0.35},
             {-perpX * 0.35, -perpZ * 0.35},
-            { dx / len * 0.35,  dz / len * 0.35},  // forward
-            {-dx / len * 0.35, -dz / len * 0.35},  // backward
         };
 
         int y = from.getY();
-        // Check every block along the line, not just every step
-        int checks = Math.max(dist * 3, 6); // denser sampling to avoid corner clipping
+        int checks = Math.max(dist * 2, 4);
 
         for (double[] off : offsets) {
             for (int s = 1; s <= checks; s++) {
@@ -1992,13 +1994,19 @@ public class Pathfinder {
                 int cx = (int) Math.floor(from.getX() + 0.5 + dx * t + off[0]);
                 int cz = (int) Math.floor(from.getZ() + 0.5 + dz * t + off[1]);
 
-                // Keep smoothing only on truly walkable cells, not just passable rays.
-                if (!cache.isStandable(cx, y, cz)) {
+                // Check no wall at feet or head level
+                if (!cache.isPassable(cx, y, cz) || !cache.isPassable(cx, y + 1, cz)) {
+                    return false;
+                }
+                // Check ground exists (solid block below feet) — prevents smoothing over gaps
+                if (!cache.isSolid(cx, y - 1, cz)) {
                     return false;
                 }
             }
         }
-        return true;
+        // Also verify start and end are standable (have ground)
+        return cache.isStandable(from.getX(), y, from.getZ())
+            && cache.isStandable(to.getX(), y, to.getZ());
     }
 
     /* ── helpers ──────────────────────────────────────────────────── */
@@ -2121,9 +2129,9 @@ public class Pathfinder {
     private static double computeAdvanceRadius(List<BlockPos> path, int wpIdx, Vec3d playerPos, double hSpeed) {
         double radius = ADVANCE_RADIUS_BASE;
 
-        // Speed factor: walking ~0.22 blocks/tick, sprinting ~0.28
-        // Scale radius up when moving fast
-        double speedFactor = clamp01((float)(hSpeed / 0.22)) * 0.5 + 0.75; // 0.75..1.25
+        // Speed factor: hSpeed is blocks/tick.
+        // At speed 500: ~1.4 bl/tick. Radius must exceed per-tick distance.
+        double speedFactor = 1.0 + Math.min(1.0, hSpeed / 1.4); // 1.0..2.0
         radius *= speedFactor;
 
         // Turn angle factor: dot product of incoming vs outgoing direction

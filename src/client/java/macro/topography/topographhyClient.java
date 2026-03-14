@@ -7,12 +7,8 @@ public class topographhyClient implements ClientModInitializer {
 	public void onInitializeClient() {
 		ProxyConfig.load();
 		TopographyUiConfig.load();
-		DataCollector.register();
-		CollectCommand.register();
 		ProxyCommand.register();
-		ActionExecutor.register();
 		Autopilot.register();
-		BotCommand.register();
 		ZoneCommand.register();
 		PosCommand.register();
 		PathRenderer.register();
@@ -20,4 +16,3 @@ public class topographhyClient implements ClientModInitializer {
 		TopographyCommand.register();
 	}
 }
-

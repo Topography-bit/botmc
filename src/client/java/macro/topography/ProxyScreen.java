@@ -12,8 +12,10 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.proxy.Socks5ProxyHandler;
+import io.netty.channel.ChannelHandler;
+import java.lang.reflect.Constructor;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.List;
 
 public class ProxyScreen extends Screen {
@@ -225,10 +227,16 @@ public class ProxyScreen extends Screen {
             NioEventLoopGroup group = new NioEventLoopGroup(1);
             try {
                 InetSocketAddress proxyAddr = new InetSocketAddress(host, port);
-                Socks5ProxyHandler proxyHandler = hasAuth
-                    ? new Socks5ProxyHandler(proxyAddr, user, pass)
-                    : new Socks5ProxyHandler(proxyAddr);
-                proxyHandler.setConnectTimeoutMillis(TEST_TIMEOUT_MS);
+                Class<?> clazz = Class.forName("io.netty.handler.proxy.Socks5ProxyHandler");
+                ChannelHandler proxyHandler;
+                if (hasAuth) {
+                    Constructor<?> ctor = clazz.getConstructor(SocketAddress.class, String.class, String.class);
+                    proxyHandler = (ChannelHandler) ctor.newInstance(proxyAddr, user, pass);
+                } else {
+                    Constructor<?> ctor = clazz.getConstructor(SocketAddress.class);
+                    proxyHandler = (ChannelHandler) ctor.newInstance(proxyAddr);
+                }
+                clazz.getMethod("setConnectTimeoutMillis", long.class).invoke(proxyHandler, (long) TEST_TIMEOUT_MS);
 
                 long t0 = System.currentTimeMillis();
                 ChannelFuture cf = new Bootstrap()

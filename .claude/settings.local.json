@@ -28,7 +28,21 @@
       "Read(//c/ProgramData/anaconda3/**)",
       "Bash(rm:*)",
       "Bash(xargs grep:*)",
-      "Bash(echo exit: $?:*)"
+      "Bash(echo exit: $?:*)",
+      "Bash(cd \"C:\\\\Users\\\\Ghost\\\\Videos\\\\topography\" && ./gradlew clean build 2>&1 | tail -15)",
+      "Bash(cd \"C:\\\\Users\\\\Ghost\\\\Videos\\\\topography\" && python -c \"import zipfile; z=zipfile.ZipFile\\('build/libs/template-mod-1.0.0.jar'\\); [print\\(n\\) for n in z.namelist\\(\\) if 'netty' in n.lower\\(\\) and n.endswith\\('.class'\\)]\" | head -15)",
+      "Bash(cd \"C:\\\\Users\\\\Ghost\\\\Videos\\\\topography\" && ./gradlew clean build 2>&1 | tail -5)",
+      "Bash(cd \"C:\\\\Users\\\\Ghost\\\\Videos\\\\topography/src/client/java/macro/topography\" && rm -f ActionExecutor.java DataCollector.java CollectCommand.java BotCommand.java TopographyModuleDefinition.java TopographyModuleType.java TopographyTab.java MyFirstButton.java)",
+      "Bash(cd /mnt/c/Users/Ghost/Videos/topography && grep -r \"class Click\" build/loom-cache/ --include=\"*.java\" -l 2>/dev/null | head -5; grep -r \"class KeyInput\" build/loom-cache/ --include=\"*.java\" -l 2>/dev/null | head -5)",
+      "Bash(echo $JAVA_HOME)",
+      "Read(//c/Users/Ghost/Videos/topography/$JAVA_HOME/bin/**)",
+      "Bash(\"/c/Program Files/Java/jdk-25.0.2/bin/jar\" tf \"C:/Users/Ghost/Videos/topography/.gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" 2>&1 | grep -iE \"Click|KeyInput\" | head -20)",
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.Click 2>&1)",
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.input.KeyInput 2>&1)",
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.screen.Screen 2>&1 | grep -E \"mouseClicked|keyPressed\")",
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.screen.Screen 2>&1 | grep -E \"mouseClicked|mouse\")",
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.ParentElement 2>&1 | grep -i click)",
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.input.MouseInput 2>&1)"
     ]
   }
 }

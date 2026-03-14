@@ -30,6 +30,10 @@ loom {
 
 }
 
+configurations {
+	bundleNetty
+}
+
 dependencies {
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
@@ -39,8 +43,10 @@ dependencies {
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-	include(implementation("io.netty:netty-handler-proxy:4.1.118.Final"))
-	include(implementation("io.netty:netty-codec-socks:4.1.118.Final"))
+	implementation("io.netty:netty-handler-proxy:4.1.118.Final")
+	implementation("io.netty:netty-codec-socks:4.1.118.Final")
+	bundleNetty("io.netty:netty-handler-proxy:4.1.118.Final") { transitive = false }
+	bundleNetty("io.netty:netty-codec-socks:4.1.118.Final") { transitive = false }
 
 	include(implementation("com.microsoft.onnxruntime:onnxruntime:1.17.0"))
 }
@@ -72,6 +78,12 @@ jar {
 
 	from("LICENSE") {
 		rename { "${it}_${inputs.properties.archivesName}"}
+	}
+
+	// Bundle netty-handler-proxy & netty-codec-socks classes directly into the jar
+	// (Fabric Loom filters io.netty from Jar-in-Jar since Minecraft already bundles netty)
+	from(configurations.bundleNetty.collect { zipTree(it) }) {
+		exclude "META-INF/**"
 	}
 }
 

@@ -3,109 +3,122 @@ package macro.topography;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
-import net.minecraft.client.util.InputUtil;
 import net.minecraft.text.Text;
-
-import java.util.EnumMap;
-import java.util.Map;
 
 public final class TopographyController {
 
-    private static final Map<TopographyModuleDefinition, Boolean> KEY_STATE = new EnumMap<>(TopographyModuleDefinition.class);
     private static boolean screenOpenScheduled;
+    private static boolean zealotKeyWasPressed;
+    private static boolean bruiserKeyWasPressed;
 
     // Zone transition tracking
     private static boolean wasInZealotZone = false;
     private static boolean wasInBruiserZone = false;
 
-    private TopographyController() {
-    }
+    // Runtime stats
+    private static long startTimeMs = 0;
+    private static int killCount = 0;
+    private static int deathCount = 0;
+    private static int activeMode = 0; // 0=none, 1=zealots, 2=bruisers
+
+    private TopographyController() {}
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(TopographyController::onClientTick);
     }
 
     public static void openScreen() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null) {
-            return;
-        }
         screenOpenScheduled = true;
     }
 
-    public static boolean toggle(TopographyModuleDefinition module) {
-        return switch (module.type()) {
-            case RECORDING  -> toggleRecording(module);
-            case COMBAT     -> toggleCombat(module);
-            case AUTOPILOT  -> toggleAutopilot(module);
-        };
-    }
+    // ── Toggle ────────────────────────────────────────────────────
 
-    public static boolean isActive(TopographyModuleDefinition module) {
-        return switch (module.type()) {
-            case RECORDING  -> DataCollector.isRecording && DataCollector.getTargetMode() == module.mode();
-            case COMBAT     -> ActionExecutor.active && ActionExecutor.getTargetMode() == module.mode();
-            case AUTOPILOT  -> Autopilot.isEnabled() && Autopilot.getTargetMode() == module.mode();
-        };
-    }
+    public static boolean toggleZealots() { return toggleAutopilot(1); }
+    public static boolean toggleBruisers() { return toggleAutopilot(2); }
 
-    public static String getStatusLabel(TopographyModuleDefinition module) {
-        if (isActive(module)) {
-            return module.activeBadge();
+    private static boolean toggleAutopilot(int mode) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null || client.player == null || client.world == null) {
+            notify("Join a world first.");
+            return false;
         }
 
-        return switch (module.type()) {
-            case RECORDING  -> DataCollector.isRecording ? "Busy" : "Idle";
-            case COMBAT     -> ActionExecutor.active ? "Busy" : "Idle";
-            case AUTOPILOT  -> Autopilot.isEnabled() ? "Busy" : "Idle";
-        };
-    }
-
-    public static int getStatusColor(TopographyModuleDefinition module) {
-        if (isActive(module)) {
-            return module.type() == TopographyModuleType.RECORDING ? 0xFFD68E3E : 0xFF49D28B;
+        // Already running this mode → stop
+        if (Autopilot.isEnabled() && Autopilot.getTargetMode() == mode) {
+            Autopilot.stop();
+            activeMode = 0;
+            notify((mode == 1 ? "Zealots" : "Bruisers") + " stopped.");
+            return true;
         }
 
-        return switch (module.type()) {
-            case RECORDING  -> DataCollector.isRecording ? 0xFFB77C57 : 0xFF7C879B;
-            case COMBAT     -> ActionExecutor.active ? 0xFFB77C57 : 0xFF7C879B;
-            case AUTOPILOT  -> Autopilot.isEnabled() ? 0xFFB77C57 : 0xFF7C879B;
-        };
+        // Stop any running autopilot
+        if (Autopilot.isEnabled()) {
+            Autopilot.stop();
+        }
+
+        Autopilot.start(mode);
+        activeMode = mode;
+        startTimeMs = System.currentTimeMillis();
+        killCount = 0;
+        deathCount = 0;
+        notify((mode == 1 ? "Zealots" : "Bruisers") + " started.");
+        return true;
     }
+
+    // ── Status queries ────────────────────────────────────────────
+
+    public static boolean isZealotsActive()  { return Autopilot.isEnabled() && Autopilot.getTargetMode() == 1; }
+    public static boolean isBruisersActive() { return Autopilot.isEnabled() && Autopilot.getTargetMode() == 2; }
+    public static boolean isAnyActive()      { return Autopilot.isEnabled(); }
+
+    public static String getUptime() {
+        if (!Autopilot.isEnabled() || startTimeMs == 0) return "--:--";
+        long elapsed = System.currentTimeMillis() - startTimeMs;
+        long totalSec = elapsed / 1000;
+        long min = totalSec / 60;
+        long sec = totalSec % 60;
+        return String.format("%02d:%02d", min, sec);
+    }
+
+    public static int getKillCount() { return killCount; }
+    public static int getDeathCount() { return deathCount; }
+    public static void incrementKills() { killCount++; }
+    public static void incrementDeaths() { deathCount++; }
+
+    // ── Tick ──────────────────────────────────────────────────────
 
     private static void onClientTick(MinecraftClient client) {
-        if (client == null || client.getWindow() == null) {
-            return;
-        }
+        if (client == null || client.getWindow() == null) return;
+
         if (screenOpenScheduled) {
             screenOpenScheduled = false;
             Screen parent = client.currentScreen;
-            System.out.println("[Topography] Opening menu screen");
             client.setScreen(new TopographyScreen(parent));
             return;
         }
-        if (client.currentScreen instanceof TopographyScreen screen && screen.isCapturingBind()) {
-            return;
-        }
+
+        // Don't process keybinds while in our screen (capturing binds)
+        if (client.currentScreen instanceof TopographyScreen) return;
 
         checkZoneTransitions(client);
 
-        for (TopographyModuleDefinition module : TopographyModuleDefinition.values()) {
-            if (!TopographyUiConfig.isBindEnabled(module)) {
-                KEY_STATE.put(module, false);
-                continue;
-            }
+        // Keybind polling
+        long window = client.getWindow().getHandle();
 
-            int keyCode = TopographyUiConfig.getKeyCode(module);
-            boolean pressed = keyCode != InputUtil.UNKNOWN_KEY.getCode() && InputUtil.isKeyPressed(client.getWindow(), keyCode);
-            boolean wasPressed = KEY_STATE.getOrDefault(module, false);
+        int zealotKey = TopographyUiConfig.getZealotsKeyCode();
+        boolean zealotPressed = zealotKey != org.lwjgl.glfw.GLFW.GLFW_KEY_UNKNOWN
+            && org.lwjgl.glfw.GLFW.glfwGetKey(window, zealotKey) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+        if (zealotPressed && !zealotKeyWasPressed) toggleZealots();
+        zealotKeyWasPressed = zealotPressed;
 
-            if (pressed && !wasPressed) {
-                toggle(module);
-            }
+        int bruiserKey = TopographyUiConfig.getBruisersKeyCode();
+        boolean bruiserPressed = bruiserKey != org.lwjgl.glfw.GLFW.GLFW_KEY_UNKNOWN
+            && org.lwjgl.glfw.GLFW.glfwGetKey(window, bruiserKey) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+        if (bruiserPressed && !bruiserKeyWasPressed) toggleBruisers();
+        bruiserKeyWasPressed = bruiserPressed;
 
-            KEY_STATE.put(module, pressed);
-        }
+        // Sync render toggles
+        PathRenderer.enabled = TopographyUiConfig.isPathRenderEnabled();
     }
 
     private static void checkZoneTransitions(MinecraftClient client) {
@@ -116,118 +129,25 @@ public final class TopographyController {
         boolean inZealot  = Pathfinder.isInFarmZone(pos, 1);
         boolean inBruiser = Pathfinder.isInFarmZone(pos, 2);
 
-        if (inZealot && !wasInZealotZone) {
-            client.inGameHud.getChatHud().addMessage(Text.literal("§a[ВОШЁЛ] Zealot zone | " + x + " " + y + " " + z));
-        } else if (!inZealot && wasInZealotZone) {
-            client.inGameHud.getChatHud().addMessage(Text.literal("§c[ВЫШЕЛ] Zealot zone | " + x + " " + y + " " + z));
-        }
+        if (inZealot && !wasInZealotZone)
+            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7a[IN] Zealot zone | " + x + " " + y + " " + z));
+        else if (!inZealot && wasInZealotZone)
+            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7c[OUT] Zealot zone | " + x + " " + y + " " + z));
         wasInZealotZone = inZealot;
 
-        if (inBruiser && !wasInBruiserZone) {
-            client.inGameHud.getChatHud().addMessage(Text.literal("§a[ВОШЁЛ] Bruiser zone | " + x + " " + y + " " + z));
-        } else if (!inBruiser && wasInBruiserZone) {
-            client.inGameHud.getChatHud().addMessage(Text.literal("§c[ВЫШЕЛ] Bruiser zone | " + x + " " + y + " " + z));
-        }
+        if (inBruiser && !wasInBruiserZone)
+            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7a[IN] Bruiser zone | " + x + " " + y + " " + z));
+        else if (!inBruiser && wasInBruiserZone)
+            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7c[OUT] Bruiser zone | " + x + " " + y + " " + z));
         wasInBruiserZone = inBruiser;
-    }
-
-    private static boolean toggleRecording(TopographyModuleDefinition module) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.player == null || client.world == null) {
-            notify("Join a world before starting recording.");
-            return false;
-        }
-
-        if (isActive(module)) {
-            DataCollector.stopCollecting();
-            notify(module.title() + " stopped.");
-            return true;
-        }
-
-        if (DataCollector.isRecording) {
-            DataCollector.stopCollecting();
-        }
-
-        DataCollector.startCollecting(module.mode());
-        if (!DataCollector.isRecording) {
-            notify("Failed to start " + module.title() + ".");
-            return false;
-        }
-
-        notify(module.title() + " started.");
-        return true;
-    }
-
-    private static boolean toggleCombat(TopographyModuleDefinition module) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.player == null || client.world == null) {
-            notify("Join a world before starting a bot.");
-            return false;
-        }
-
-        String modelPath = TopographyUiConfig.getModelPath(module);
-
-        if (isActive(module)) {
-            ActionExecutor.stop();
-            notify(module.title() + " stopped.");
-            return true;
-        }
-
-        if (ActionExecutor.active) {
-            ActionExecutor.stop();
-        }
-        if (Autopilot.isEnabled()) {
-            Autopilot.stop();
-        }
-
-        if (!ActionExecutor.loadModel(modelPath)) {
-            notify("Model not found: " + modelPath);
-            return false;
-        }
-
-        ActionExecutor.start(module.mode());
-        notify(module.title() + " started with " + modelPath + ".");
-        return true;
-    }
-
-    private static boolean toggleAutopilot(TopographyModuleDefinition module) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.player == null || client.world == null) {
-            notify("Join a world before starting autopilot.");
-            return false;
-        }
-
-        if (isActive(module)) {
-            Autopilot.stop();
-            notify(module.title() + " stopped.");
-            return true;
-        }
-
-        // Stop any running autopilot or combat bot
-        if (Autopilot.isEnabled()) {
-            Autopilot.stop();
-        }
-        if (ActionExecutor.active) {
-            ActionExecutor.stop();
-        }
-
-        Autopilot.start(module.mode());
-        notify(module.title() + " started.");
-        return true;
     }
 
     private static void notify(String message) {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null) {
-            return;
-        }
-
+        if (client == null) return;
         client.execute(() -> {
-            if (client.inGameHud != null) {
+            if (client.inGameHud != null)
                 client.inGameHud.getChatHud().addMessage(Text.literal("[Topography] " + message));
-            } else {
-                System.out.println("[Topography] " + message);
-            }
         });
     }
 }

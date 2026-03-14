@@ -24,21 +24,47 @@ public final class TopographySurfaceRenderer {
         int top = Math.round(y);
         int right = Math.round(x + width);
         int bottom = Math.round(y + height);
-        int roundedRadius = Math.max(0, Math.min(Math.round(radius), Math.min((right - left) / 2, (bottom - top) / 2)));
+        int r = Math.max(0, Math.min(Math.round(radius), Math.min((right - left) / 2, (bottom - top) / 2)));
 
-        if (roundedRadius <= 1) {
+        if (r <= 1) {
             context.fill(left, top, right, bottom, color);
             return;
         }
 
-        context.fill(left + roundedRadius, top, right - roundedRadius, bottom, color);
-        context.fill(left, top + roundedRadius, right, bottom - roundedRadius, color);
+        int baseAlpha = (color >>> 24) & 0xFF;
 
-        for (int row = 0; row < roundedRadius; row++) {
-            float dy = roundedRadius - row - 0.5f;
-            int inset = Math.max(0, Math.round(roundedRadius - (float) Math.sqrt(roundedRadius * roundedRadius - dy * dy)));
-            context.fill(left + inset, top + row, right - inset, top + row + 1, color);
-            context.fill(left + inset, bottom - row - 1, right - inset, bottom - row, color);
+        // Center body (no corners)
+        context.fill(left + r, top, right - r, bottom, color);
+        context.fill(left, top + r, left + r, bottom - r, color);
+        context.fill(right - r, top + r, right, bottom - r, color);
+
+        // Corner rows with sub-pixel anti-aliasing
+        for (int row = 0; row < r; row++) {
+            float dy = r - row - 0.5f;
+            float dx = (float) Math.sqrt((float) r * r - dy * dy);
+            float exactInset = r - dx;
+
+            int solidInset = (int) Math.ceil(exactInset);
+            float coverage = 1.0f - (exactInset - (float) Math.floor(exactInset));
+
+            // Fully covered interior pixels
+            if (left + solidInset < right - solidInset) {
+                context.fill(left + solidInset, top + row, right - solidInset, top + row + 1, color);
+                context.fill(left + solidInset, bottom - row - 1, right - solidInset, bottom - row, color);
+            }
+
+            // Anti-aliased edge pixels (left & right, top & bottom corners)
+            int edgePixel = (int) Math.floor(exactInset);
+            if (coverage > 0.01f && edgePixel >= 0 && edgePixel < r) {
+                int edgeAlpha = Math.max(1, Math.round(baseAlpha * coverage));
+                int edgeColor = withAlpha(color, edgeAlpha);
+                // Top-left & top-right
+                context.fill(left + edgePixel, top + row, left + edgePixel + 1, top + row + 1, edgeColor);
+                context.fill(right - edgePixel - 1, top + row, right - edgePixel, top + row + 1, edgeColor);
+                // Bottom-left & bottom-right
+                context.fill(left + edgePixel, bottom - row - 1, left + edgePixel + 1, bottom - row, edgeColor);
+                context.fill(right - edgePixel - 1, bottom - row - 1, right - edgePixel, bottom - row, edgeColor);
+            }
         }
     }
 

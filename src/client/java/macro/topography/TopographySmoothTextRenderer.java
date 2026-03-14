@@ -28,40 +28,41 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class TopographySmoothTextRenderer {
 
     private static final AtomicInteger TEXTURE_COUNTER = new AtomicInteger();
-    private static final int TEXT_PADDING = 4;
+    private static final int BASE_PADDING = 3;
 
-    // HiDPI: render at 2x internally, display at correct size
-    private static final int RENDER_SCALE = 2;
-    private static final int SCALED_PADDING = TEXT_PADDING * RENDER_SCALE;
+    private final String family;
+    private final int baseFontSize;
+    private final int style;
 
-    private final Font font;           // at RENDER_SCALE resolution
-    private final FontMetrics metrics;  // at RENDER_SCALE resolution
+    // Lazily initialized at current guiScale
+    private int activeScale = -1;
+    private Font font;
+    private FontMetrics metrics;
+    private int scaledPadding;
     private final Map<String, CachedText> cache = new HashMap<>();
-    private final int lineHeight;   // GUI coords (1x)
-    private final int ascent;       // GUI coords (1x)
 
     public TopographySmoothTextRenderer(String preferredFamily, int fontSize, int style) {
-        this.font = resolveFont(preferredFamily, fontSize * RENDER_SCALE, style);
-        BufferedImage probe = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D graphics = configureGraphics(probe.createGraphics());
-        graphics.setFont(font);
-        this.metrics = graphics.getFontMetrics();
-        this.lineHeight = (metrics.getHeight() + RENDER_SCALE - 1) / RENDER_SCALE;
-        this.ascent = (metrics.getAscent() + RENDER_SCALE - 1) / RENDER_SCALE;
-        graphics.dispose();
+        this.family = preferredFamily;
+        this.baseFontSize = fontSize;
+        this.style = style;
     }
 
+    // ── Public API (all values in GUI coordinates) ──────────────
+
     public int lineHeight() {
-        return lineHeight;
+        ensureReady();
+        return Math.round(metrics.getHeight() / (float) activeScale);
     }
 
     public int ascent() {
-        return ascent;
+        ensureReady();
+        return Math.round(metrics.getAscent() / (float) activeScale);
     }
 
     public float width(String text) {
         if (text == null || text.isEmpty()) return 0f;
-        return metrics.stringWidth(text) / (float) RENDER_SCALE;
+        ensureReady();
+        return metrics.stringWidth(text) / (float) activeScale;
     }
 
     public String ellipsize(String text, int maxWidth) {
@@ -114,23 +115,25 @@ public final class TopographySmoothTextRenderer {
 
     public void draw(DrawContext context, String text, float x, float y, int color) {
         if (text == null || text.isEmpty()) return;
+        ensureReady();
         CachedText cached = getOrCreate(text, color);
-        // Use 12-param overload: display at GUI size, sample full texture
-        int displayW = cached.texW / RENDER_SCALE;
-        int displayH = cached.texH / RENDER_SCALE;
+
+        // Display size in GUI coords = texture pixels / guiScale
+        // textureWidth/Height also set to the same value so UV maps 0→1 (full texture coverage)
+        int displayW = Math.round(cached.texPixelsW / (float) activeScale);
+        int displayH = Math.round(cached.texPixelsH / (float) activeScale);
+        int guiPad = Math.round(scaledPadding / (float) activeScale);
+
         context.drawTexture(
             RenderPipelines.GUI_TEXTURED,
             cached.textureId,
-            Math.round(x) - TEXT_PADDING,
-            Math.round(y) - TEXT_PADDING,
-            displayW,           // display width on screen
-            displayH,           // display height on screen
-            0,                  // u offset
-            0,                  // v offset
-            cached.texW,        // region width (full texture)
-            cached.texH,        // region height (full texture)
-            cached.texW,        // texture total width
-            cached.texH         // texture total height
+            Math.round(x) - guiPad,
+            Math.round(y) - guiPad,
+            0f, 0f,
+            displayW,
+            displayH,
+            displayW,
+            displayH
         );
     }
 
@@ -167,6 +170,51 @@ public final class TopographySmoothTextRenderer {
         draw(context, text, rightX - width(text), y, color);
     }
 
+    // ── Lazy initialization & scale tracking ────────────────────
+
+    private void ensureReady() {
+        int scale = currentGuiScale();
+        if (scale != activeScale) {
+            rebuildForScale(scale);
+        }
+    }
+
+    private void rebuildForScale(int scale) {
+        // Destroy old textures
+        if (!cache.isEmpty()) {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc != null) {
+                for (CachedText ct : cache.values()) {
+                    mc.getTextureManager().destroyTexture(ct.textureId);
+                }
+            }
+            cache.clear();
+        }
+
+        activeScale = scale;
+        scaledPadding = BASE_PADDING * scale;
+
+        int scaledFontSize = baseFontSize * scale;
+        this.font = resolveFont(family, scaledFontSize, style);
+
+        BufferedImage probe = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = configureGraphics(probe.createGraphics());
+        g.setFont(font);
+        this.metrics = g.getFontMetrics();
+        g.dispose();
+    }
+
+    private static int currentGuiScale() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc != null && mc.getWindow() != null) {
+            int s = (int) mc.getWindow().getScaleFactor();
+            if (s >= 1) return s;
+        }
+        return 2; // safe default
+    }
+
+    // ── Texture cache ───────────────────────────────────────────
+
     private CachedText getOrCreate(String text, int color) {
         String key = text + '\u0000' + Integer.toHexString(color);
         return cache.computeIfAbsent(key, ignored -> createTexture(text, color));
@@ -175,14 +223,14 @@ public final class TopographySmoothTextRenderer {
     private CachedText createTexture(String text, int color) {
         int rawWidth = Math.max(1, metrics.stringWidth(text));
         int rawHeight = Math.max(1, metrics.getHeight());
-        int texW = rawWidth + SCALED_PADDING * 2;
-        int texH = rawHeight + SCALED_PADDING * 2;
+        int texW = rawWidth + scaledPadding * 2;
+        int texH = rawHeight + scaledPadding * 2;
 
         BufferedImage image = new BufferedImage(texW, texH, BufferedImage.TYPE_INT_ARGB);
         Graphics2D graphics = configureGraphics(image.createGraphics());
         graphics.setFont(font);
         graphics.setColor(toAwtColor(color));
-        graphics.drawString(text, SCALED_PADDING, SCALED_PADDING + metrics.getAscent());
+        graphics.drawString(text, scaledPadding, scaledPadding + metrics.getAscent());
         graphics.dispose();
 
         try {
@@ -192,13 +240,15 @@ public final class TopographySmoothTextRenderer {
             int textureIndex = TEXTURE_COUNTER.incrementAndGet();
             NativeImageBackedTexture texture = new NativeImageBackedTexture(
                     () -> "topography_text_" + textureIndex, nativeImage);
-            Identifier id = Identifier.of("topographhy", "ui/text/" + textureIndex);
+            Identifier id = Identifier.of("topography", "ui/text/" + textureIndex);
             MinecraftClient.getInstance().getTextureManager().registerTexture(id, texture);
             return new CachedText(id, texW, texH);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to build smooth text texture for '" + text + "'", e);
         }
     }
+
+    // ── Helpers ──────────────────────────────────────────────────
 
     private static Graphics2D configureGraphics(Graphics2D graphics) {
         graphics.setRenderingHint(RenderingHints.KEY_ALPHA_INTERPOLATION, RenderingHints.VALUE_ALPHA_INTERPOLATION_QUALITY);
@@ -229,5 +279,5 @@ public final class TopographySmoothTextRenderer {
         return new Color((color >>> 16) & 0xFF, (color >>> 8) & 0xFF, color & 0xFF, (color >>> 24) & 0xFF);
     }
 
-    private record CachedText(Identifier textureId, int texW, int texH) {}
+    private record CachedText(Identifier textureId, int texPixelsW, int texPixelsH) {}
 }

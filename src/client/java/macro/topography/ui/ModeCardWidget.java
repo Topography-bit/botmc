@@ -27,12 +27,13 @@ public class ModeCardWidget extends CardWidget {
     private static final int ACCENT        = 0xFF818CF8;
     private static final int ACCENT_HOVER  = 0xFF9BA3FF;
     private static final int TEXT_PRIMARY  = 0xFFE8E8F0;
-    private static final int TEXT_DIM      = 0xFF3E4150;
+    private static final int TEXT_DIM      = 0xFF6E7388;
     private static final int TEXT_SECONDARY = 0xFF6B6F80;
     private static final int SEPARATOR     = 0xFF1C1C24;
     private static final int CARD_BORDER   = 0xFF1E1E26;
 
-    private static final float BTN_H = 36;
+    private static final float BTN_H_DEFAULT = 36;
+    private static final float BTN_H_COMPACT = 28;
 
     private final String title;
     private final String subtitle;
@@ -44,7 +45,7 @@ public class ModeCardWidget extends CardWidget {
     private final ButtonWidget actionButton;
     private final KeybindWidget keybindWidget;
     private int staggerIndex = 0;
-    private long firstRenderTime = 0;
+    private long firstRenderNanos = 0;
 
     public ModeCardWidget(String title, String subtitle,
                           BooleanSupplier activeSupplier,
@@ -78,12 +79,13 @@ public class ModeCardWidget extends CardWidget {
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, int alpha) {
         if (!visible) return;
-        if (firstRenderTime == 0) firstRenderTime = System.currentTimeMillis();
+        if (firstRenderNanos == 0) firstRenderNanos = System.nanoTime();
 
-        long delay = staggerIndex * 60L;
-        float elapsed = (System.currentTimeMillis() - firstRenderTime - delay) / 300f;
-        float ease = Math.max(0f, Math.min(1f, elapsed));
-        ease = 1f - (1f - ease) * (1f - ease);
+        float delayMs = staggerIndex * 60f;
+        float elapsedMs = (System.nanoTime() - firstRenderNanos) / 1_000_000f - delayMs;
+        float elapsed = Math.max(0f, Math.min(1f, elapsedMs / 300f));
+        float inv = 1f - elapsed;
+        float ease = 1f - inv * inv * inv;  // cubic ease-out
 
         if (ease <= 0f) return;
 
@@ -98,13 +100,16 @@ public class ModeCardWidget extends CardWidget {
     }
 
     private void layoutChildren() {
-        float pad = getPadding();
+        float pad = h < 180 ? 12 : getPadding();
+        float btnH = h < 180 ? BTN_H_COMPACT : BTN_H_DEFAULT;
+        float gap = h < 180 ? 3 : 6;
         float btnW = w - pad * 2;
         float btnX = x + pad;
-        float btnY = y + h - pad - BTN_H - SMALL.lineHeight() - 8;
+        float bindH = SMALL.lineHeight() + 4;
+        float btnY = y + h - pad - btnH - bindH - gap;
 
-        actionButton.setBounds(btnX, btnY, btnW, BTN_H);
-        keybindWidget.setBounds(btnX, btnY + BTN_H + 8, btnW, SMALL.lineHeight() + 4);
+        actionButton.setBounds(btnX, btnY, btnW, btnH);
+        keybindWidget.setBounds(btnX, btnY + btnH + gap, btnW, bindH);
     }
 
     @Override
@@ -115,11 +120,11 @@ public class ModeCardWidget extends CardWidget {
         // ── Ambient glow ─────────────────────────────────────────
         if (active) {
             float pulse = (float) (0.6 + 0.4 * Math.sin(System.currentTimeMillis() / 1500.0));
-            int innerGlowA = (int) (25 * pulse * alpha / 255f);
-            S.drawGlow(ctx, x, y, w, h, getRadius(), 12,
+            int innerGlowA = (int) (20 * pulse * alpha / 255f);
+            S.drawGlow(ctx, x, y, w, h, getRadius(), 6,
                     TopographySurfaceRenderer.withAlpha(GREEN, innerGlowA));
-            int ambientGlowA = (int) (10 * pulse * alpha / 255f);
-            S.drawGlow(ctx, x, y, w, h, getRadius(), 28,
+            int ambientGlowA = (int) (8 * pulse * alpha / 255f);
+            S.drawGlow(ctx, x, y, w, h, getRadius(), 12,
                     TopographySurfaceRenderer.withAlpha(GREEN, ambientGlowA));
         }
 
@@ -132,80 +137,125 @@ public class ModeCardWidget extends CardWidget {
 
         float pad = getPadding();
         float innerW = w - pad * 2;
-        float cy = y + pad;
+
+        // ── Compute available content zone (above button) ────────
+        float contentTop = y + pad;
+        float btnTop = actionButton.getY();
+        float contentH = btnTop - contentTop - 4; // 4px margin above button
+
+        // Decide what fits
+        float titleH = HEADING.lineHeight();
+        float subtitleH = SMALL.lineHeight();
+        float sepH = 1;
+        float statusH = BODY.lineHeight();
+        float statsH = active ? (SMALL.lineHeight() + 4) * 2 : 0;
+
+        // Calculate ideal total
+        float idealGap1 = 4;   // after title
+        float idealGap2 = 12;  // after subtitle
+        float idealGap3 = 12;  // after separator
+        float idealGap4 = 8;   // after status
+        float idealTotal = titleH + idealGap1 + subtitleH + idealGap2 + sepH + idealGap3 + statusH + idealGap4 + statsH;
+
+        // Scale gaps if too tight
+        boolean showSep = true;
+        boolean showStats = active;
+        float gap1 = idealGap1, gap2 = idealGap2, gap3 = idealGap3, gap4 = idealGap4;
+
+        if (idealTotal > contentH) {
+            // First: shrink gaps
+            float shrink = Math.min(1f, Math.max(0f, contentH / idealTotal));
+            gap1 = idealGap1 * shrink;
+            gap2 = idealGap2 * shrink;
+            gap3 = idealGap3 * shrink;
+            gap4 = idealGap4 * shrink;
+            float shrunkTotal = titleH + gap1 + subtitleH + gap2 + sepH + gap3 + statusH + gap4 + statsH;
+
+            if (shrunkTotal > contentH) {
+                // Remove separator
+                showSep = false;
+                gap2 = 4;
+                gap3 = 0;
+                float noSepTotal = titleH + gap1 + subtitleH + gap2 + statusH + gap4 + statsH;
+                if (noSepTotal > contentH && active) {
+                    // Remove stats
+                    showStats = false;
+                }
+            }
+        }
+
+        float cy = contentTop;
 
         // ── Title ────────────────────────────────────────────────
         String displayTitle = HEADING.ellipsize(title, (int) innerW);
         HEADING.draw(ctx, displayTitle, x + pad, cy, applyAlpha(TEXT_PRIMARY, alpha));
-        cy += HEADING.lineHeight() + 4;
+        cy += titleH + gap1;
 
         // ── Subtitle ─────────────────────────────────────────────
         String displaySubtitle = SMALL.ellipsize(subtitle, (int) innerW);
         SMALL.draw(ctx, displaySubtitle, x + pad, cy, applyAlpha(TEXT_DIM, alpha));
-        cy += SMALL.lineHeight() + 16;
+        cy += subtitleH + gap2;
 
         // ── Separator ────────────────────────────────────────────
-        int sepBase = active
-                ? TopographySurfaceRenderer.lerpColor(SEPARATOR, GREEN_DIM, 0.4f)
-                : SEPARATOR;
-        int sepSegs = 8;
-        float sepSegW = innerW / sepSegs;
-        float sepCenter = sepSegs / 2f;
-        for (int i = 0; i < sepSegs; i++) {
-            float distFromCenter = Math.abs(i + 0.5f - sepCenter) / sepCenter;
-            float fade = 1f - distFromCenter * distFromCenter;
-            int segAlpha = (int) (alpha * fade);
-            S.drawRounded(ctx, x + pad + i * sepSegW, cy, sepSegW + 1, 1, 0,
-                    applyAlpha(sepBase, segAlpha));
+        if (showSep) {
+            int sepBase = active
+                    ? TopographySurfaceRenderer.lerpColor(SEPARATOR, GREEN_DIM, 0.4f)
+                    : SEPARATOR;
+            S.drawRoundedFast(ctx, x + pad, cy, innerW, 1, 0,
+                    applyAlpha(sepBase, (int) (alpha * 0.7f)));
+            cy += sepH + gap3;
         }
-        cy += 16;
 
         // ── Status indicator ─────────────────────────────────────
-        int statusColor = active ? GREEN : (otherBusy ? YELLOW : TEXT_SECONDARY);
-        String statusText = active ? "Running" : (otherBusy ? "Busy" : "Idle");
+        if (cy + statusH <= btnTop) {
+            int statusColor = active ? GREEN : (otherBusy ? YELLOW : TEXT_SECONDARY);
+            String statusText = active ? "Running" : (otherBusy ? "Busy" : "Idle");
 
-        float dotX = x + pad;
-        float dotY = cy + 4;
-        float dotSize = 7;
-        float dotR = dotSize / 2f;
+            float dotX = x + pad;
+            float dotY = cy + 4;
+            float dotSize = 7;
+            float dotR = dotSize / 2f;
 
-        if (active) {
-            double pulse = (Math.sin(System.currentTimeMillis() / 400.0) + 1.0) / 2.0;
-            int ringAlpha = (int) (30 * pulse * alpha / 255f);
-            S.drawGlow(ctx, dotX - 1, dotY - 1, dotSize + 2, dotSize + 2, dotR + 1, 5,
-                    TopographySurfaceRenderer.withAlpha(statusColor, ringAlpha));
-            int dotAlpha = (int) (alpha * (0.5 + 0.5 * pulse));
-            S.drawRounded(ctx, dotX, dotY, dotSize, dotSize, dotR, applyAlpha(statusColor, dotAlpha));
-            int hlA = (int) (alpha * 0.20f);
-            S.drawRounded(ctx, dotX + 1, dotY + 1, 2, 2, 1,
-                    TopographySurfaceRenderer.withAlpha(0xFFFFFF, hlA));
-        } else if (otherBusy) {
-            double flicker = (Math.sin(System.currentTimeMillis() / 100.0) + 1.0) / 2.0;
-            int dotAlpha = (int) (alpha * (0.3 + 0.7 * flicker));
-            S.drawRounded(ctx, dotX, dotY, dotSize, dotSize, dotR, applyAlpha(statusColor, dotAlpha));
-        } else {
-            int dimBorder = applyAlpha(0xFF1A1A22, alpha);
-            S.drawOutlinedRounded(ctx, dotX, dotY, dotSize, dotSize, dotR,
-                    applyAlpha(TopographySurfaceRenderer.brighten(statusColor, -30), alpha),
-                    dimBorder, 1f);
-        }
+            if (active) {
+                double pulse = (Math.sin(System.currentTimeMillis() / 400.0) + 1.0) / 2.0;
+                int ringAlpha = (int) (30 * pulse * alpha / 255f);
+                S.drawGlow(ctx, dotX - 1, dotY - 1, dotSize + 2, dotSize + 2, dotR + 1, 3,
+                        TopographySurfaceRenderer.withAlpha(statusColor, ringAlpha));
+                int dotAlpha = (int) (alpha * (0.5 + 0.5 * pulse));
+                S.drawRounded(ctx, dotX, dotY, dotSize, dotSize, dotR, applyAlpha(statusColor, dotAlpha));
+                int hlA = (int) (alpha * 0.20f);
+                S.drawRounded(ctx, dotX + 1, dotY + 1, 2, 2, 1,
+                        TopographySurfaceRenderer.withAlpha(0xFFFFFF, hlA));
+            } else if (otherBusy) {
+                double flicker = (Math.sin(System.currentTimeMillis() / 100.0) + 1.0) / 2.0;
+                int dotAlpha = (int) (alpha * (0.3 + 0.7 * flicker));
+                S.drawRounded(ctx, dotX, dotY, dotSize, dotSize, dotR, applyAlpha(statusColor, dotAlpha));
+            } else {
+                int dimBorder = applyAlpha(0xFF1A1A22, alpha);
+                S.drawOutlinedRounded(ctx, dotX, dotY, dotSize, dotSize, dotR,
+                        applyAlpha(TopographySurfaceRenderer.brighten(statusColor, -30), alpha),
+                        dimBorder, 1f);
+            }
 
-        String statusLine = BODY.ellipsize("Status: " + statusText, (int) (innerW - 16));
-        BODY.draw(ctx, statusLine, x + pad + 14, cy, applyAlpha(statusColor, alpha));
-        cy += BODY.lineHeight() + 8;
+            String statusLine = BODY.ellipsize("Status: " + statusText, (int) (innerW - 16));
+            BODY.draw(ctx, statusLine, x + pad + 14, cy, applyAlpha(statusColor, alpha));
+            cy += statusH + gap4;
 
-        // ── Stats ────────────────────────────────────────────────
-        if (active) {
-            float labelW = SMALL.width("Uptime: ");
-            SMALL.draw(ctx, "Uptime: ", x + pad, cy, applyAlpha(TEXT_SECONDARY, alpha));
-            MONO.draw(ctx, MONO.ellipsize(uptimeSupplier.get(), (int) (innerW - labelW)),
-                    x + pad + labelW, cy, applyAlpha(TEXT_SECONDARY, alpha));
-            cy += SMALL.lineHeight() + 4;
+            // ── Stats ────────────────────────────────────────────
+            if (showStats && cy + SMALL.lineHeight() <= btnTop) {
+                float labelW = SMALL.width("Uptime: ");
+                SMALL.draw(ctx, "Uptime: ", x + pad, cy, applyAlpha(TEXT_SECONDARY, alpha));
+                MONO.draw(ctx, MONO.ellipsize(uptimeSupplier.get(), (int) (innerW - labelW)),
+                        x + pad + labelW, cy, applyAlpha(TEXT_SECONDARY, alpha));
+                cy += SMALL.lineHeight() + 4;
 
-            float killsLabelW = SMALL.width("Kills: ");
-            SMALL.draw(ctx, "Kills: ", x + pad, cy, applyAlpha(TEXT_SECONDARY, alpha));
-            MONO.draw(ctx, MONO.ellipsize(killsSupplier.get(), (int) (innerW - killsLabelW)),
-                    x + pad + killsLabelW, cy, applyAlpha(TEXT_SECONDARY, alpha));
+                if (cy + SMALL.lineHeight() <= btnTop) {
+                    float killsLabelW = SMALL.width("Kills: ");
+                    SMALL.draw(ctx, "Kills: ", x + pad, cy, applyAlpha(TEXT_SECONDARY, alpha));
+                    MONO.draw(ctx, MONO.ellipsize(killsSupplier.get(), (int) (innerW - killsLabelW)),
+                            x + pad + killsLabelW, cy, applyAlpha(TEXT_SECONDARY, alpha));
+                }
+            }
         }
 
         updateButtonState(active, otherBusy);

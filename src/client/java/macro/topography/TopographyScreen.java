@@ -26,7 +26,7 @@ public class TopographyScreen extends Screen {
     private static final int BG_BASE         = 0xF00C0C10;
     private static final int BG_ELEVATED     = 0xFF141419;
 
-    private static final int BORDER_DEFAULT  = 0xFF1E1E28;
+    private static final int BORDER_DEFAULT  = 0xFF1A1A24;
     private static final int BORDER_SUBTLE   = 0xFF16161E;
 
     private static final int ACCENT          = 0xFF818CF8;
@@ -34,29 +34,25 @@ public class TopographyScreen extends Screen {
 
     private static final int TEXT_PRIMARY    = 0xFFE8E8F0;
     private static final int TEXT_SECONDARY  = 0xFF6B6F80;
-    private static final int TEXT_DIM        = 0xFF3E4150;
+    private static final int TEXT_DIM        = 0xFF6E7388;
 
     private static final int HIGHLIGHT_TOP   = 0x14FFFFFF;
-    private static final int HIGHLIGHT_EDGE  = 0x0FFFFFFF;
-    private static final int SHADOW_CONTACT  = 0x66000000;
-    private static final int SHADOW_MID      = 0x40000000;
     private static final int SHADOW_AMBIENT  = 0x1F000000;
 
-    // ── Layout constants ─────────────────────────────────────────
-    private static final float PANEL_W_RATIO   = 0.78f;
-    private static final float PANEL_H_RATIO   = 0.80f;
-    private static final float PANEL_RADIUS    = 14f;
-    private static final float HEADER_H        = 50f;
-    private static final float PANEL_PAD       = 32f;
-    private static final float CARD_GAP        = 20f;
-    private static final float SETTINGS_H      = 80f;
+    // ── Layout constants (base values, scale down for small windows) ──
+    private static final float PANEL_RADIUS    = 18f;
 
     // ── Computed layout ──────────────────────────────────────────
     private float panelW, panelH;
+    private float pad, headerH, cardGap, settingsH;
     private float modesHeaderY, settingsHeaderY;
 
     private final Screen parent;
-    private long openTimeMs;
+    private long openTimeNanos;
+    private long closeTimeNanos = 0;
+    private boolean closing = false;
+    private static final float OPEN_DURATION_MS = 350f;
+    private static final float CLOSE_DURATION_MS = 250f;
 
     // ── Widgets ──────────────────────────────────────────────────
     private WidgetContainer root;
@@ -76,7 +72,7 @@ public class TopographyScreen extends Screen {
 
     @Override
     protected void init() {
-        openTimeMs = System.currentTimeMillis();
+        openTimeNanos = System.nanoTime();
         buildWidgetTree();
     }
 
@@ -152,30 +148,41 @@ public class TopographyScreen extends Screen {
     // ═══════════════════════════════════════════════════════════════
 
     private void computeLayout() {
-        panelW = Math.max(400, Math.round(width * PANEL_W_RATIO));
-        panelH = Math.max(300, Math.round(height * PANEL_H_RATIO));
+        // Adaptive: use more space at small windows, less at large
+        boolean compact = height < 350;
+        boolean medium = height < 500;
+
+        float wRatio = width < 600 ? 0.92f : (width < 900 ? 0.85f : 0.78f);
+        float hRatio = height < 400 ? 0.92f : (height < 600 ? 0.87f : 0.80f);
+
+        panelW = Math.max(320, Math.round(width * wRatio));
+        panelH = Math.max(240, Math.round(height * hRatio));
+
+        pad = compact ? 16 : (medium ? 22 : 32);
+        headerH = compact ? 34 : (medium ? 42 : 50);
+        cardGap = compact ? 10 : (medium ? 14 : 20);
+        settingsH = compact ? 60 : (medium ? 70 : 80);
     }
 
     private void layout(float px, float py) {
         root.setBounds(px, py, panelW, panelH);
 
-        float pad = PANEL_PAD;
         float contentX = px + pad;
         float contentW = panelW - pad * 2;
 
         // ── Header: logo left, close right ──────────────────────
-        float headerBaseY = py + (HEADER_H - LOGO_FONT.lineHeight()) / 2f;
         float closeW = LABEL_FONT.width("\u00D7") + 16;
-        closeLabel.setBounds(px + panelW - pad - closeW + 8, py + (HEADER_H - LABEL_FONT.lineHeight() - 8) / 2f,
+        closeLabel.setBounds(px + panelW - pad - closeW + 8, py + (headerH - LABEL_FONT.lineHeight() - 8) / 2f,
                 closeW, LABEL_FONT.lineHeight() + 8);
 
         // ── Content area below header ───────────────────────────
-        float contentTop = py + HEADER_H + 16;
+        float headerGap = height < 400 ? 8 : 16;
+        float contentTop = py + headerH + headerGap;
         float contentBottom = py + panelH - pad;
 
         // Settings card at bottom
-        float sectionHeaderH = SECTION_FONT.lineHeight() + 10;
-        float settingsBlockH = sectionHeaderH + SETTINGS_H;
+        float sectionHeaderH = SECTION_FONT.lineHeight() + (height < 400 ? 6 : 10);
+        float settingsBlockH = sectionHeaderH + settingsH;
         float settingsTopY = contentBottom - settingsBlockH;
         settingsHeaderY = settingsTopY;
         float sCardY = settingsTopY + sectionHeaderH;
@@ -183,19 +190,20 @@ public class TopographyScreen extends Screen {
         // Mode cards fill remaining space
         modesHeaderY = contentTop;
         float cardsY = contentTop + sectionHeaderH;
-        float cardH = settingsTopY - cardsY - 24; // 24px gap before settings
-        cardH = Math.max(120, cardH);
+        float cardSettingsGap = height < 400 ? 12 : 24;
+        float cardH = settingsTopY - cardsY - cardSettingsGap;
+        cardH = Math.max(80, cardH);
 
         int cardCount = modeCards.size();
-        float cardW = (contentW - CARD_GAP * (cardCount - 1)) / cardCount;
+        float cardW = (contentW - cardGap * (cardCount - 1)) / cardCount;
 
         for (int i = 0; i < modeCards.size(); i++) {
-            modeCards.get(i).setBounds(contentX + i * (cardW + CARD_GAP), cardsY, cardW, cardH);
+            modeCards.get(i).setBounds(contentX + i * (cardW + cardGap), cardsY, cardW, cardH);
         }
 
         // Settings card
-        float sPad = 20;
-        settingsCard.setBounds(contentX, sCardY, contentW, SETTINGS_H);
+        float sPad = Math.min(20, pad);
+        settingsCard.setBounds(contentX, sCardY, contentW, settingsH);
 
         float sy = sCardY + sPad;
         float proxyLabelW = LABEL_FONT.width("Proxy:");
@@ -210,7 +218,7 @@ public class TopographyScreen extends Screen {
                 configW, SMALL_FONT.lineHeight() + 4);
 
         // Toggles
-        float toggleY = sCardY + sPad + LABEL_FONT.lineHeight() + 10;
+        float toggleY = sCardY + sPad + LABEL_FONT.lineHeight() + (height < 400 ? 6 : 10);
         float toggleX = contentX + sPad;
         float pillW = 26;
         float pathW = LABEL_FONT.width("Path Render: ") + 4 + pillW;
@@ -228,13 +236,28 @@ public class TopographyScreen extends Screen {
 
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
-        float elapsed = (System.currentTimeMillis() - openTimeMs) / 350f;
-        float ease = Math.min(1f, elapsed);
-        ease = 1f - (1f - ease) * (1f - ease);
+        // ── Open animation (nanoTime for smooth interpolation) ────
+        float openElapsed = Math.min(1f, (System.nanoTime() - openTimeNanos) / (OPEN_DURATION_MS * 1_000_000f));
+        float openInv = 1f - openElapsed;
+        float openEase = 1f - openInv * openInv * openInv;  // cubic ease-out
+
+        // ── Close animation ───────────────────────────────────────
+        float closeFactor = 1f;
+        if (closing) {
+            float closeElapsed = (System.nanoTime() - closeTimeNanos) / (CLOSE_DURATION_MS * 1_000_000f);
+            if (closeElapsed >= 1f) {
+                client.setScreen(parent);
+                return;
+            }
+            float closeEase = closeElapsed * closeElapsed;  // quadratic ease-in
+            closeFactor = 1f - closeEase;
+        }
+
+        float ease = openEase * closeFactor;
         int alpha = (int) (ease * 255);
 
-        // ── Background overlay (multi-layer fake frosted glass) ──
-        ctx.fill(0, 0, width, height, applyAlpha(0xFF000000, (int) (alpha * 0.60f)));
+        // ── Background overlay (near-opaque — prevents bleed at rounded corners) ──
+        ctx.fill(0, 0, width, height, applyAlpha(0xFF000000, (int) (alpha * 0.92f)));
 
         computeLayout();
 
@@ -242,41 +265,26 @@ public class TopographyScreen extends Screen {
         float py = (height - panelH) / 2f + (1f - ease) * 25f;
         layout(px, py);
 
-        // ── Panel shadow (3 layers) ─────────────────────────────
-        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 4,
-                applyAlpha(SHADOW_CONTACT, alpha));
-        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 14,
-                applyAlpha(SHADOW_MID, alpha));
-        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 32,
+        // ── Panel shadow (soft ambient) ─────────────────────────
+        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 8,
                 applyAlpha(SHADOW_AMBIENT, alpha));
 
-        // ── Panel background ─────────────────────────────────────
+        // ── Panel background with thin visible border ────────────
         S.drawOutlinedRounded(ctx, px, py, panelW, panelH, PANEL_RADIUS,
                 applyAlpha(BG_BASE, alpha),
-                applyAlpha(BORDER_DEFAULT, alpha), 1f);
+                applyAlpha(0xFF2A2A36, alpha), 1f);
 
-        // ── Top edge highlight ───────────────────────────────────
-        S.drawRounded(ctx, px + PANEL_RADIUS, py + 1, panelW - PANEL_RADIUS * 2, 1, 0,
-                applyAlpha(HIGHLIGHT_TOP, alpha));
-
-        // ── Side highlights ──────────────────────────────────────
-        S.drawRounded(ctx, px + 1, py + PANEL_RADIUS, 1, panelH - PANEL_RADIUS * 2, 0,
-                applyAlpha(HIGHLIGHT_EDGE, alpha));
-        S.drawRounded(ctx, px + panelW - 2, py + PANEL_RADIUS, 1, panelH - PANEL_RADIUS * 2, 0,
-                TopographySurfaceRenderer.withAlpha(0xFFFFFF, (int) (3 * alpha / 255f)));
-
-        // ── Inner gradient ───────────────────────────────────────
-        S.drawGradientRounded(ctx, px + 1, py + 2, panelW - 2, panelH * 0.10f,
+        // ── Subtle inner gradient (top only) ───────────────────
+        S.drawGradientRounded(ctx, px + 1, py + 2, panelW - 2, panelH * 0.08f,
                 PANEL_RADIUS - 1,
                 applyAlpha(HIGHLIGHT_TOP, alpha),
                 TopographySurfaceRenderer.withAlpha(0xFFFFFF, 0), 1f);
 
-        float pad = PANEL_PAD;
         float contentX = px + pad;
         float contentW = panelW - pad * 2;
 
         // ── Header bar ──────────────────────────────────────────
-        float logoY = py + (HEADER_H - LOGO_FONT.lineHeight()) / 2f;
+        float logoY = py + (headerH - LOGO_FONT.lineHeight()) / 2f;
 
         // Logo with tracking
         LOGO_FONT.drawWithTracking(ctx, "TOPOGRAPHY", contentX, logoY,
@@ -284,24 +292,21 @@ public class TopographyScreen extends Screen {
 
         // Breadcrumb: "Modules / Dashboard"
         float breadcrumbX = contentX + LOGO_FONT.widthWithTracking("TOPOGRAPHY", 3f) + 20;
-        TITLE_FONT.draw(ctx, "Modules", breadcrumbX, logoY + 3,
+        float breadcrumbBaseY = logoY + LOGO_FONT.ascent() - TITLE_FONT.ascent();
+        TITLE_FONT.draw(ctx, "Modules", breadcrumbX, breadcrumbBaseY,
                 applyAlpha(TEXT_DIM, alpha));
         float modulesW = TITLE_FONT.width("Modules");
-        SMALL_FONT.draw(ctx, " / ", breadcrumbX + modulesW, logoY + 5,
+        float smallBaseY = logoY + LOGO_FONT.ascent() - SMALL_FONT.ascent();
+        SMALL_FONT.draw(ctx, " / ", breadcrumbX + modulesW, smallBaseY,
                 applyAlpha(TEXT_DIM, alpha));
         float slashW = SMALL_FONT.width(" / ");
-        SMALL_FONT.draw(ctx, "Dashboard", breadcrumbX + modulesW + slashW, logoY + 5,
+        SMALL_FONT.draw(ctx, "Dashboard", breadcrumbX + modulesW + slashW, smallBaseY,
                 applyAlpha(TEXT_SECONDARY, alpha));
 
-        // Header separator line (full width)
-        float sepY = py + HEADER_H;
+        // Header separator line (single clean line, no segments)
+        float sepY = py + headerH;
         S.drawRounded(ctx, contentX, sepY, contentW, 1, 0,
-                applyAlpha(BORDER_DEFAULT, alpha));
-
-        // Subtle accent glow on header line
-        float accentLineW = Math.min(120, contentW * 0.15f);
-        S.drawRounded(ctx, contentX, sepY, accentLineW, 1, 0,
-                applyAlpha(ACCENT_DIM, (int) (alpha * 0.5f)));
+                applyAlpha(BORDER_DEFAULT, (int) (alpha * 0.7f)));
 
         // ── Section headers ──────────────────────────────────────
         renderSectionHeader(ctx, "MODES", contentX, modesHeaderY, contentW, alpha);
@@ -315,31 +320,27 @@ public class TopographyScreen extends Screen {
         float ribbonW = panelW - ribbonInset * 2;
 
         if (TopographyController.isAnyActive()) {
-            float pulse = (float) (0.7 + 0.3 * Math.sin(System.currentTimeMillis() / 1200.0));
             int green = 0xFF34D399;
-            int cA = (int) (alpha * 0.7f * pulse);
-            int eA = (int) (alpha * 0.15f * pulse);
-            float seg = ribbonW / 3f;
-            S.drawGradientRounded(ctx, ribbonX, ribbonY, seg, ribbonH, 1,
-                    TopographySurfaceRenderer.withAlpha(green, eA),
-                    TopographySurfaceRenderer.withAlpha(green, cA), 1f);
-            S.drawRounded(ctx, ribbonX + seg, ribbonY, seg, ribbonH, 0,
-                    TopographySurfaceRenderer.withAlpha(green, cA));
-            S.drawGradientRounded(ctx, ribbonX + seg * 2, ribbonY, seg, ribbonH, 1,
-                    TopographySurfaceRenderer.withAlpha(green, cA),
-                    TopographySurfaceRenderer.withAlpha(green, eA), 1f);
-        } else {
-            int segs = 7;
-            float rsw = ribbonW / segs;
-            float center = segs / 2f;
-            for (int i = 0; i < segs; i++) {
-                float dist = Math.abs(i + 0.5f - center) / center;
-                float fade = 1f - dist * dist;
-                int sa = (int) (alpha * 0.35f * fade);
-                S.drawRounded(ctx, ribbonX + i * rsw, ribbonY, rsw + 1, ribbonH,
-                        (i == 0 || i == segs - 1) ? 1 : 0,
-                        TopographySurfaceRenderer.withAlpha(ACCENT_DIM, sa));
+            // Base ribbon (dim)
+            int baseA = (int) (alpha * 0.3f);
+            S.drawRounded(ctx, ribbonX, ribbonY, ribbonW, ribbonH, 1,
+                    TopographySurfaceRenderer.withAlpha(green, baseA));
+            // Bright spot traveling left-to-right (single overlay, no segments)
+            float wavePos = (System.currentTimeMillis() % 2000L) / 2000f;
+            float spotW = ribbonW * 0.25f;
+            float spotX = ribbonX + wavePos * ribbonW - spotW / 2f;
+            // Clamp to ribbon bounds
+            float drawX = Math.max(ribbonX, spotX);
+            float drawEnd = Math.min(ribbonX + ribbonW, spotX + spotW);
+            if (drawEnd > drawX) {
+                int spotA = (int) (alpha * 0.5f);
+                S.drawRounded(ctx, drawX, ribbonY, drawEnd - drawX, ribbonH, 1,
+                        TopographySurfaceRenderer.withAlpha(green, spotA));
             }
+        } else {
+            int rA = (int) (alpha * 0.2f);
+            S.drawRounded(ctx, ribbonX, ribbonY, ribbonW, ribbonH, 1,
+                    TopographySurfaceRenderer.withAlpha(ACCENT_DIM, rA));
         }
 
         // ── Render widgets ───────────────────────────────────────
@@ -351,21 +352,14 @@ public class TopographyScreen extends Screen {
                                      float maxW, int alpha) {
         SECTION_FONT.draw(ctx, text, hx, hy, applyAlpha(TEXT_DIM, alpha));
 
-        // Full-width line from text end to right edge
+        // Clean single line from text end to right edge
         float textEnd = hx + SECTION_FONT.width(text) + 12;
         float fadeLineY = hy + SECTION_FONT.lineHeight() / 2f;
         float lineLen = hx + maxW - textEnd;
         if (lineLen <= 0) return;
 
-        // Solid line that fades out
-        int segments = 8;
-        float segW = lineLen / segments;
-        for (int i = 0; i < segments; i++) {
-            float frac = 1f - (float) i / (segments - 1);
-            int segAlpha = (int) (alpha * frac * 0.12f);
-            S.drawRounded(ctx, textEnd + i * segW, fadeLineY, segW + 1, 1, 0,
-                    TopographySurfaceRenderer.withAlpha(0xFFFFFF, segAlpha));
-        }
+        S.drawRounded(ctx, textEnd, fadeLineY, lineLen, 1, 0,
+                applyAlpha(BORDER_DEFAULT, (int) (alpha * 0.5f)));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -415,7 +409,10 @@ public class TopographyScreen extends Screen {
 
     @Override
     public void close() {
-        client.setScreen(parent);
+        if (!closing) {
+            closing = true;
+            closeTimeNanos = System.nanoTime();
+        }
     }
 
     @Override

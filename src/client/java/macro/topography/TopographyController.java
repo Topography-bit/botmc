@@ -14,6 +14,7 @@ public final class TopographyController {
 
     // Per-mode keybind state: modeId -> wasPressed
     private static final Map<Integer, Boolean> keyWasPressed = new HashMap<>();
+    private static boolean rshiftWasPressed;
 
     // Zone transition tracking
     private static final Map<Integer, Boolean> wasInZone = new HashMap<>();
@@ -110,8 +111,17 @@ public final class TopographyController {
 
         checkZoneTransitions(client);
 
-        // Keybind polling — iterate all registered modes
+        // RSHIFT opens menu
         long window = client.getWindow().getHandle();
+        {
+            boolean rshiftDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT_SHIFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            if (rshiftDown && !rshiftWasPressed && client.currentScreen == null) {
+                openScreen();
+            }
+            rshiftWasPressed = rshiftDown;
+        }
+
+        // Keybind polling — iterate all registered modes
         for (Mode mode : ModeRegistry.getModes()) {
             int modeId = mode.getId();
             int keyCode = TopographyUiConfig.getModeKeyCode(modeId);

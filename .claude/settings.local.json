@@ -42,7 +42,10 @@
       "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.screen.Screen 2>&1 | grep -E \"mouseClicked|keyPressed\")",
       "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.screen.Screen 2>&1 | grep -E \"mouseClicked|mouse\")",
       "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.gui.ParentElement 2>&1 | grep -i click)",
-      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.input.MouseInput 2>&1)"
+      "Bash(cd \"C:/Users/Ghost/Videos/topography\" && \"/c/Program Files/Java/jdk-25.0.2/bin/javap\" -cp \".gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-clientOnly-6227aad8ee/1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2/minecraft-clientOnly-6227aad8ee-1.21.10-net.fabricmc.yarn.1_21_10.1.21.10+build.3-v2.jar\" net.minecraft.client.input.MouseInput 2>&1)",
+      "Bash(grep -r \"getTextureManager\" --include=\"*.java\" src/ 2>/dev/null | head -5)",
+      "Bash(git add:*)",
+      "Bash(git push:*)"
     ]
   }
 }

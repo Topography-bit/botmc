@@ -27,7 +27,10 @@ public class ToggleWidget extends Widget {
     private int labelColor = 0xFF6B6F80;
 
     private float toggleProgress = -1;
-    private long lastToggleTime = 0;
+    private long lastToggleNanos = -1;
+
+    private static final float TOGGLE_ON_TAU = 60f;   // ~180ms to settle
+    private static final float TOGGLE_OFF_TAU = 80f;  // ~240ms to settle
 
     public ToggleWidget(TopographySmoothTextRenderer font, String label,
                         BooleanSupplier getter, Consumer<Boolean> setter) {
@@ -50,17 +53,23 @@ public class ToggleWidget extends Widget {
         if (!visible) return;
         boolean on = getter.getAsBoolean();
 
-        // ── Animate toggle position ──────────────────────────────
-        long now = System.currentTimeMillis();
+        // ── Animate toggle position (exponential smoothing) ──────
+        long now = System.nanoTime();
         if (toggleProgress < 0) {
             toggleProgress = on ? 1f : 0f;
-        } else if (lastToggleTime > 0) {
-            float dt = Math.min(50, now - lastToggleTime) / 1000f;
+            lastToggleNanos = now;
+        } else if (lastToggleNanos >= 0) {
+            float dtMs = Math.min(50f, (now - lastToggleNanos) / 1_000_000f);
             float target = on ? 1f : 0f;
-            toggleProgress += (target - toggleProgress) * Math.min(1f, 10f * dt);
-            if (Math.abs(toggleProgress - target) < 0.01f) toggleProgress = target;
+            if (Math.abs(toggleProgress - target) > 0.001f) {
+                float tau = on ? TOGGLE_ON_TAU : TOGGLE_OFF_TAU;
+                float decay = (float) Math.exp(-dtMs / tau);
+                toggleProgress = target + (toggleProgress - target) * decay;
+            } else {
+                toggleProgress = target;
+            }
         }
-        lastToggleTime = now;
+        lastToggleNanos = now;
 
         // ── Label text ───────────────────────────────────────────
         int lblCol = applyAlpha(labelColor, alpha);

@@ -11,7 +11,7 @@ public class CardWidget extends WidgetContainer {
 
     private int fillColor = 0xFF141419;
     private IntSupplier borderColorSupplier = () -> 0xFF1E1E28;
-    private float radius = 10;
+    private float radius = 14;
     private float borderWidth = 1f;
     private float padding = 20;
 
@@ -42,39 +42,37 @@ public class CardWidget extends WidgetContainer {
 
     @Override
     protected void renderSelf(DrawContext ctx, int mouseX, int mouseY, int alpha) {
-        // ── Hover-responsive shadow (rest → elevated) ────────────
-        float shadowSpread = 6 + 6 * hoverProgress;
-        int shadowAlpha = (int) ((20 + 10 * hoverProgress) * alpha / 255f);
-        S.drawShadow(ctx, x, y, w, h, radius, Math.round(shadowSpread),
+        // ── Hover lift: Y offset for "raised" feel ─────────────
+        float lift = hoverProgress * 2f;
+        float ry = y - lift;
+
+        // ── Hover-responsive shadow (deeper when lifted) ────────
+        float shadowSpread = 4 + 4 * hoverProgress;
+        int shadowAlpha = (int) ((18 + 12 * hoverProgress) * alpha / 255f);
+        S.drawShadow(ctx, x, ry + lift * 0.5f, w, h, radius, Math.round(shadowSpread),
                 TopographySurfaceRenderer.withAlpha(0xFF000000, shadowAlpha));
 
         // ── Border (brightens on hover) ──────────────────────────
         int baseBorder = borderColorSupplier.getAsInt();
         int border = applyAlpha(TopographySurfaceRenderer.lerpColor(
-                baseBorder, TopographySurfaceRenderer.brighten(baseBorder, 10),
+                baseBorder, TopographySurfaceRenderer.brighten(baseBorder, 15),
                 hoverProgress), alpha);
 
         // ── Card fill ────────────────────────────────────────────
         int fill = applyAlpha(fillColor, alpha);
-        S.drawOutlinedRounded(ctx, x, y, w, h, radius, fill, border, borderWidth);
+        S.drawOutlinedRounded(ctx, x, ry, w, h, radius, fill, border, borderWidth);
 
-        // ── Gradient top (lighter top → standard, adds volume) ───
-        int topBright = TopographySurfaceRenderer.brighten(fillColor, 6);
-        S.drawGradientRounded(ctx, x + borderWidth, y + borderWidth,
-                w - borderWidth * 2, (h - borderWidth * 2) * 0.4f,
+        // ── Gradient top (subtle volume) ─────────────────────────
+        int topBright = TopographySurfaceRenderer.brighten(fillColor, 4 + (int)(3 * hoverProgress));
+        S.drawGradientRounded(ctx, x + borderWidth, ry + borderWidth,
+                w - borderWidth * 2, (h - borderWidth * 2) * 0.25f,
                 Math.max(0, radius - borderWidth),
                 applyAlpha(topBright, alpha), fill, 1f);
 
-        // ── Inner highlight (glass edge — double border top) ─────
+        // ── Inner highlight (glass edge) ─────────────────────────
         float hlInset = Math.max(4, radius);
-        S.drawRounded(ctx, x + hlInset, y + borderWidth, w - hlInset * 2, 1, 0,
-                TopographySurfaceRenderer.withAlpha(0xFFFFFF, (int) (5 * alpha / 255f)));
-
-        // ── Inset shadow ─────────────────────────────────────────
-        float innerR = Math.max(0, radius - borderWidth);
-        S.drawInsetShadow(ctx, x + borderWidth, y + borderWidth,
-                w - borderWidth * 2, h - borderWidth * 2,
-                innerR, 3, applyAlpha(0xFF000000, alpha));
+        S.drawRounded(ctx, x + hlInset, ry + borderWidth, w - hlInset * 2, 1, 0,
+                TopographySurfaceRenderer.withAlpha(0xFFFFFF, (int) ((3 + 3 * hoverProgress) * alpha / 255f)));
     }
 
     private static int applyAlpha(int color, int alpha) {

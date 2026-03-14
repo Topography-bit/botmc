@@ -12,7 +12,13 @@ public abstract class Widget {
 
     protected float hoverProgress = 0f;
     protected float pressProgress = 0f;
-    private long lastAnimTime = 0;
+    private long lastAnimNanos = -1;
+
+    // Time constants in ms (reaches ~95% in 3×tau)
+    private static final float HOVER_IN_TAU  = 50f;   // ~150ms to settle
+    private static final float HOVER_OUT_TAU = 70f;   // ~210ms to settle
+    private static final float PRESS_IN_TAU  = 20f;   // ~60ms to settle
+    private static final float PRESS_OUT_TAU = 40f;   // ~120ms to settle
 
     public void setBounds(float x, float y, float w, float h) {
         this.x = x;
@@ -44,19 +50,34 @@ public abstract class Widget {
     public void updateHover(int mouseX, int mouseY) {
         hovered = visible && enabled && containsPoint(mouseX, mouseY);
 
-        long now = System.currentTimeMillis();
-        if (lastAnimTime > 0) {
-            float dt = Math.min(50, now - lastAnimTime) / 1000f;
-
-            float hoverTarget = hovered ? 1f : 0f;
-            hoverProgress += (hoverTarget - hoverProgress) * Math.min(1f, 10f * dt);
-            if (Math.abs(hoverProgress - hoverTarget) < 0.005f) hoverProgress = hoverTarget;
-
-            float pressTarget = pressed ? 1f : 0f;
-            pressProgress += (pressTarget - pressProgress) * Math.min(1f, 16f * dt);
-            if (Math.abs(pressProgress - pressTarget) < 0.005f) pressProgress = pressTarget;
+        long now = System.nanoTime();
+        if (lastAnimNanos < 0) {
+            lastAnimNanos = now;
+            return;
         }
-        lastAnimTime = now;
+
+        float dtMs = Math.min(50f, (now - lastAnimNanos) / 1_000_000f);
+        lastAnimNanos = now;
+
+        // Hover: exponential smoothing (frame-rate independent, no micro-stutter)
+        float hoverTarget = hovered ? 1f : 0f;
+        if (Math.abs(hoverProgress - hoverTarget) > 0.001f) {
+            float tau = hovered ? HOVER_IN_TAU : HOVER_OUT_TAU;
+            float decay = (float) Math.exp(-dtMs / tau);
+            hoverProgress = hoverTarget + (hoverProgress - hoverTarget) * decay;
+        } else {
+            hoverProgress = hoverTarget;
+        }
+
+        // Press: exponential smoothing
+        float pressTarget = pressed ? 1f : 0f;
+        if (Math.abs(pressProgress - pressTarget) > 0.001f) {
+            float tau = pressed ? PRESS_IN_TAU : PRESS_OUT_TAU;
+            float decay = (float) Math.exp(-dtMs / tau);
+            pressProgress = pressTarget + (pressProgress - pressTarget) * decay;
+        } else {
+            pressProgress = pressTarget;
+        }
     }
 
     public abstract void render(DrawContext ctx, int mouseX, int mouseY, int alpha);

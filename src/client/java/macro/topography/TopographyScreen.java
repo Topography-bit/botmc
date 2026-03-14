@@ -16,33 +16,49 @@ import java.util.List;
 public class TopographyScreen extends Screen {
 
     private static final TopographySurfaceRenderer S = new TopographySurfaceRenderer();
-    private static final TopographySmoothTextRenderer LOGO_FONT  = new TopographySmoothTextRenderer("Inter", 22, Font.BOLD);
-    private static final TopographySmoothTextRenderer SMALL_FONT = new TopographySmoothTextRenderer("Inter", 10, Font.PLAIN);
-    private static final TopographySmoothTextRenderer LABEL_FONT = new TopographySmoothTextRenderer("Inter", 10, Font.BOLD);
+    private static final TopographySmoothTextRenderer LOGO_FONT      = new TopographySmoothTextRenderer("Inter", 20, Font.BOLD);
+    private static final TopographySmoothTextRenderer TITLE_FONT     = new TopographySmoothTextRenderer("Inter", 14, Font.PLAIN);
+    private static final TopographySmoothTextRenderer SMALL_FONT     = new TopographySmoothTextRenderer("Inter", 10, Font.PLAIN);
+    private static final TopographySmoothTextRenderer LABEL_FONT     = new TopographySmoothTextRenderer("Inter", 10, Font.BOLD);
+    private static final TopographySmoothTextRenderer SECTION_FONT   = new TopographySmoothTextRenderer("Inter", 11, Font.BOLD);
 
-    // ── Colors ────────────────────────────────────────────────────
-    private static final int BG          = 0xF20D0D0F;
-    private static final int CARD_BG     = 0xFF141418;
-    private static final int CARD_BORDER = 0xFF1E1E24;
-    private static final int ACCENT      = 0xFF00C8FF;
-    private static final int TEXT_PRIMARY   = 0xFFEAEAEF;
-    private static final int TEXT_SECONDARY = 0xFF6B6F80;
+    // ── Dark Crystal palette ─────────────────────────────────────
+    private static final int BG_BASE         = 0xF00C0C10;
+    private static final int BG_ELEVATED     = 0xFF141419;
 
-    // ── Layout (base values, scaled at runtime) ────────────────
-    private static final float BASE_PANEL_W       = 480;
-    private static final float BASE_PANEL_PADDING = 24;
-    private static final float BASE_CARD_GAP      = 16;
-    private static final float BASE_CARD_H        = 190;
-    private static final float BASE_BTN_H         = 30;
-    private static final float BASE_SETTINGS_H    = 60;
+    private static final int BORDER_DEFAULT  = 0xFF1E1E28;
+    private static final int BORDER_SUBTLE   = 0xFF16161E;
 
-    // ── Computed layout values (updated each frame) ──────────
-    private float panelW, panelPad, cardGap, cardH, btnH, settingsH;
+    private static final int ACCENT          = 0xFF818CF8;
+    private static final int ACCENT_DIM      = 0xFF5C65C7;
+
+    private static final int TEXT_PRIMARY    = 0xFFE8E8F0;
+    private static final int TEXT_SECONDARY  = 0xFF6B6F80;
+    private static final int TEXT_DIM        = 0xFF3E4150;
+
+    private static final int HIGHLIGHT_TOP   = 0x14FFFFFF;
+    private static final int HIGHLIGHT_EDGE  = 0x0FFFFFFF;
+    private static final int SHADOW_CONTACT  = 0x66000000;
+    private static final int SHADOW_MID      = 0x40000000;
+    private static final int SHADOW_AMBIENT  = 0x1F000000;
+
+    // ── Layout constants ─────────────────────────────────────────
+    private static final float PANEL_W_RATIO   = 0.78f;
+    private static final float PANEL_H_RATIO   = 0.80f;
+    private static final float PANEL_RADIUS    = 14f;
+    private static final float HEADER_H        = 50f;
+    private static final float PANEL_PAD       = 32f;
+    private static final float CARD_GAP        = 20f;
+    private static final float SETTINGS_H      = 80f;
+
+    // ── Computed layout ──────────────────────────────────────────
+    private float panelW, panelH;
+    private float modesHeaderY, settingsHeaderY;
 
     private final Screen parent;
     private long openTimeMs;
 
-    // ── Widgets (stored as fields for clean relayout) ────────────
+    // ── Widgets ──────────────────────────────────────────────────
     private WidgetContainer root;
     private final List<ModeCardWidget> modeCards = new ArrayList<>();
     private CardWidget settingsCard;
@@ -51,7 +67,7 @@ public class TopographyScreen extends Screen {
     private ClickableLabel configBtn;
     private ToggleWidget pathToggle;
     private ToggleWidget mobToggle;
-    private ButtonWidget closeBtn;
+    private ClickableLabel closeLabel;
 
     public TopographyScreen(Screen parent) {
         super(Text.literal("Topography"));
@@ -76,7 +92,8 @@ public class TopographyScreen extends Screen {
         root = new WidgetContainer();
         modeCards.clear();
 
-        // ── Mode cards (from registry) ────────────────────────────
+        // ── Mode cards ───────────────────────────────────────────
+        int cardIndex = 0;
         for (Mode mode : ModeRegistry.getModes()) {
             int id = mode.getId();
             KeybindWidget bind = new KeybindWidget(SMALL_FONT,
@@ -89,14 +106,15 @@ public class TopographyScreen extends Screen {
                     TopographyController::getUptime,
                     () -> String.valueOf(TopographyController.getKillCount()),
                     bind);
-            card.setPadding(14);
+            card.setPadding(20);
+            card.setStaggerIndex(cardIndex++);
             root.add(card);
             modeCards.add(card);
         }
 
-        // ── Settings card ───────────────────────────────────────
+        // ── Settings card ────────────────────────────────────────
         settingsCard = new CardWidget();
-        settingsCard.setPadding(12);
+        settingsCard.setPadding(20);
 
         proxyLabel = new LabelWidget(LABEL_FONT, "Proxy:", TEXT_SECONDARY);
         settingsCard.add(proxyLabel);
@@ -121,87 +139,87 @@ public class TopographyScreen extends Screen {
 
         root.add(settingsCard);
 
-        // ── Close button ────────────────────────────────────────
-        closeBtn = new ButtonWidget(LABEL_FONT, "CLOSE", ButtonWidget.Style.OUTLINED);
-        closeBtn.setColors(CARD_BG, 0xFF1E1E24, TEXT_SECONDARY);
-        closeBtn.setBorderColor(CARD_BORDER);
-        closeBtn.setOnClick(this::close);
-        root.add(closeBtn);
+        // ── Close × ─────────────────────────────────────────────
+        closeLabel = new ClickableLabel(LABEL_FONT, "\u00D7", TEXT_SECONDARY, TEXT_PRIMARY);
+        closeLabel.setOnClick(this::close);
+        root.add(closeLabel);
 
-        // Initial layout
-        computeScaledSizes();
-        layout((height - computePanelH()) / 2f);
-    }
-
-    private void computeScaledSizes() {
-        // Scale panel to fit window — cap at base size, shrink on small screens
-        panelW = Math.min(BASE_PANEL_W, width * 0.65f);
-        float scale = panelW / BASE_PANEL_W;
-        panelPad = BASE_PANEL_PADDING * scale;
-        cardGap = BASE_CARD_GAP * scale;
-        cardH = BASE_CARD_H * scale;
-        btnH = Math.max(22, BASE_BTN_H * scale);
-        settingsH = BASE_SETTINGS_H * scale;
-    }
-
-    private float computePanelH() {
-        return panelPad * 2 + 40 + 12 + cardH + 16 + settingsH + 16 + btnH;
+        computeLayout();
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  LAYOUT — all bounds in one place
+    //  LAYOUT
     // ═══════════════════════════════════════════════════════════════
 
-    private void layout(float py) {
-        float px = (width - panelW) / 2f;
-        float pH = computePanelH();
-        root.setBounds(px, py, panelW, pH);
+    private void computeLayout() {
+        panelW = Math.max(400, Math.round(width * PANEL_W_RATIO));
+        panelH = Math.max(300, Math.round(height * PANEL_H_RATIO));
+    }
 
-        // Cards
-        float lineY = py + panelPad + LOGO_FONT.lineHeight() + 4;
-        float cardsY = lineY + 14;
-        float cardLeft = px + panelPad;
+    private void layout(float px, float py) {
+        root.setBounds(px, py, panelW, panelH);
+
+        float pad = PANEL_PAD;
+        float contentX = px + pad;
+        float contentW = panelW - pad * 2;
+
+        // ── Header: logo left, close right ──────────────────────
+        float headerBaseY = py + (HEADER_H - LOGO_FONT.lineHeight()) / 2f;
+        float closeW = LABEL_FONT.width("\u00D7") + 16;
+        closeLabel.setBounds(px + panelW - pad - closeW + 8, py + (HEADER_H - LABEL_FONT.lineHeight() - 8) / 2f,
+                closeW, LABEL_FONT.lineHeight() + 8);
+
+        // ── Content area below header ───────────────────────────
+        float contentTop = py + HEADER_H + 16;
+        float contentBottom = py + panelH - pad;
+
+        // Settings card at bottom
+        float sectionHeaderH = SECTION_FONT.lineHeight() + 10;
+        float settingsBlockH = sectionHeaderH + SETTINGS_H;
+        float settingsTopY = contentBottom - settingsBlockH;
+        settingsHeaderY = settingsTopY;
+        float sCardY = settingsTopY + sectionHeaderH;
+
+        // Mode cards fill remaining space
+        modesHeaderY = contentTop;
+        float cardsY = contentTop + sectionHeaderH;
+        float cardH = settingsTopY - cardsY - 24; // 24px gap before settings
+        cardH = Math.max(120, cardH);
+
         int cardCount = modeCards.size();
-        float cardW = (panelW - panelPad * 2 - cardGap * (cardCount - 1)) / cardCount;
+        float cardW = (contentW - CARD_GAP * (cardCount - 1)) / cardCount;
 
         for (int i = 0; i < modeCards.size(); i++) {
-            modeCards.get(i).setBounds(cardLeft + i * (cardW + cardGap), cardsY, cardW, cardH);
+            modeCards.get(i).setBounds(contentX + i * (cardW + CARD_GAP), cardsY, cardW, cardH);
         }
 
-        // Settings
-        float sGap = 16;
-        float sY = cardsY + cardH + sGap;
-        float sW = panelW - panelPad * 2;
-        float sPad = 12;
-        settingsCard.setBounds(cardLeft, sY, sW, settingsH);
+        // Settings card
+        float sPad = 20;
+        settingsCard.setBounds(contentX, sCardY, contentW, SETTINGS_H);
 
-        float sy = sY + sPad;
+        float sy = sCardY + sPad;
         float proxyLabelW = LABEL_FONT.width("Proxy:");
-        proxyLabel.setBounds(cardLeft + sPad, sy, proxyLabelW, LABEL_FONT.lineHeight());
+        proxyLabel.setBounds(contentX + sPad, sy, proxyLabelW, LABEL_FONT.lineHeight());
 
-        // Proxy value gets remaining space between label and [Configure]
         float configW = SMALL_FONT.width("[Configure]");
-        float proxyValueX = cardLeft + sPad + proxyLabelW + 6;
-        float proxyValueMaxW = sW - sPad * 2 - proxyLabelW - 6 - configW - 8;
+        float proxyValueX = contentX + sPad + proxyLabelW + 8;
+        float proxyValueMaxW = contentW - sPad * 2 - proxyLabelW - 8 - configW - 12;
         proxyValue.setBounds(proxyValueX, sy, proxyValueMaxW, LABEL_FONT.lineHeight());
 
-        configBtn.setBounds(cardLeft + sW - sPad - configW, sy,
+        configBtn.setBounds(contentX + contentW - sPad - configW, sy,
                 configW, SMALL_FONT.lineHeight() + 4);
 
-        // Toggles — positioned by actual text width, no magic numbers
-        float toggleY = sY + sPad + LABEL_FONT.lineHeight() + 8;
-        float toggleX = cardLeft + sPad;
-        float pathW = LABEL_FONT.width("Path Render: ") + LABEL_FONT.width("[OFF]");
+        // Toggles
+        float toggleY = sCardY + sPad + LABEL_FONT.lineHeight() + 10;
+        float toggleX = contentX + sPad;
+        float pillW = 26;
+        float pathW = LABEL_FONT.width("Path Render: ") + 4 + pillW;
         pathToggle.setBounds(toggleX, toggleY, pathW, LABEL_FONT.lineHeight() + 4);
 
-        float toggleGap = 24;
+        float toggleGap = 40;
         float mobX = toggleX + pathW + toggleGap;
-        float mobW = LABEL_FONT.width("Mob ESP: ") + LABEL_FONT.width("[OFF]");
+        float mobW = LABEL_FONT.width("Mob ESP: ") + 4 + pillW;
         mobToggle.setBounds(mobX, toggleY, mobW, LABEL_FONT.lineHeight() + 4);
-
-        // Close
-        float closeBtnW = Math.min(100, panelW * 0.25f);
-        closeBtn.setBounds(px + (panelW - closeBtnW) / 2, sY + settingsH + sGap, closeBtnW, btnH);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -210,42 +228,144 @@ public class TopographyScreen extends Screen {
 
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
-        float elapsed = (System.currentTimeMillis() - openTimeMs) / 300f;
+        float elapsed = (System.currentTimeMillis() - openTimeMs) / 350f;
         float ease = Math.min(1f, elapsed);
         ease = 1f - (1f - ease) * (1f - ease);
-        int alpha = (int)(ease * 255);
+        int alpha = (int) (ease * 255);
 
-        ctx.fill(0, 0, width, height, 0xA0000000);
+        // ── Background overlay (multi-layer fake frosted glass) ──
+        ctx.fill(0, 0, width, height, applyAlpha(0xFF000000, (int) (alpha * 0.60f)));
 
-        // Recompute sizes (handles window resize)
-        computeScaledSizes();
+        computeLayout();
 
-        // Animated panel Y
-        float pH = computePanelH();
-        float py = (height - pH) / 2f + (1f - ease) * 20f;
-        layout(py);
+        float px = (width - panelW) / 2f;
+        float py = (height - panelH) / 2f + (1f - ease) * 25f;
+        layout(px, py);
 
-        float px = root.getX();
+        // ── Panel shadow (3 layers) ─────────────────────────────
+        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 4,
+                applyAlpha(SHADOW_CONTACT, alpha));
+        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 14,
+                applyAlpha(SHADOW_MID, alpha));
+        S.drawShadow(ctx, px, py, panelW, panelH, PANEL_RADIUS, 32,
+                applyAlpha(SHADOW_AMBIENT, alpha));
 
-        // Panel background
-        S.drawShadow(ctx, px, py, panelW, pH, 12, 20,
-                TopographySurfaceRenderer.withAlpha(0x000000, alpha / 3));
-        S.drawOutlinedRounded(ctx, px, py, panelW, pH, 12,
-                TopographySurfaceRenderer.withAlpha(BG & 0x00FFFFFF, alpha),
-                TopographySurfaceRenderer.withAlpha(CARD_BORDER & 0x00FFFFFF, alpha), 1f);
+        // ── Panel background ─────────────────────────────────────
+        S.drawOutlinedRounded(ctx, px, py, panelW, panelH, PANEL_RADIUS,
+                applyAlpha(BG_BASE, alpha),
+                applyAlpha(BORDER_DEFAULT, alpha), 1f);
 
-        // Logo + accent line
-        float logoY = py + panelPad;
-        LOGO_FONT.drawCentered(ctx, "TOPOGRAPHY", px + panelW / 2, logoY,
-                applyAlpha(TEXT_PRIMARY, alpha));
-        float lineW = 60;
-        float lineY = logoY + LOGO_FONT.lineHeight() + 4;
-        S.drawRounded(ctx, px + panelW / 2 - lineW / 2, lineY, lineW, 2, 1,
-                applyAlpha(ACCENT, alpha));
+        // ── Top edge highlight ───────────────────────────────────
+        S.drawRounded(ctx, px + PANEL_RADIUS, py + 1, panelW - PANEL_RADIUS * 2, 1, 0,
+                applyAlpha(HIGHLIGHT_TOP, alpha));
 
-        // Render all widgets
+        // ── Side highlights ──────────────────────────────────────
+        S.drawRounded(ctx, px + 1, py + PANEL_RADIUS, 1, panelH - PANEL_RADIUS * 2, 0,
+                applyAlpha(HIGHLIGHT_EDGE, alpha));
+        S.drawRounded(ctx, px + panelW - 2, py + PANEL_RADIUS, 1, panelH - PANEL_RADIUS * 2, 0,
+                TopographySurfaceRenderer.withAlpha(0xFFFFFF, (int) (3 * alpha / 255f)));
+
+        // ── Inner gradient ───────────────────────────────────────
+        S.drawGradientRounded(ctx, px + 1, py + 2, panelW - 2, panelH * 0.10f,
+                PANEL_RADIUS - 1,
+                applyAlpha(HIGHLIGHT_TOP, alpha),
+                TopographySurfaceRenderer.withAlpha(0xFFFFFF, 0), 1f);
+
+        float pad = PANEL_PAD;
+        float contentX = px + pad;
+        float contentW = panelW - pad * 2;
+
+        // ── Header bar ──────────────────────────────────────────
+        float logoY = py + (HEADER_H - LOGO_FONT.lineHeight()) / 2f;
+
+        // Logo with tracking
+        LOGO_FONT.drawWithTracking(ctx, "TOPOGRAPHY", contentX, logoY,
+                applyAlpha(TEXT_PRIMARY, alpha), 3f);
+
+        // Breadcrumb: "Modules / Dashboard"
+        float breadcrumbX = contentX + LOGO_FONT.widthWithTracking("TOPOGRAPHY", 3f) + 20;
+        TITLE_FONT.draw(ctx, "Modules", breadcrumbX, logoY + 3,
+                applyAlpha(TEXT_DIM, alpha));
+        float modulesW = TITLE_FONT.width("Modules");
+        SMALL_FONT.draw(ctx, " / ", breadcrumbX + modulesW, logoY + 5,
+                applyAlpha(TEXT_DIM, alpha));
+        float slashW = SMALL_FONT.width(" / ");
+        SMALL_FONT.draw(ctx, "Dashboard", breadcrumbX + modulesW + slashW, logoY + 5,
+                applyAlpha(TEXT_SECONDARY, alpha));
+
+        // Header separator line (full width)
+        float sepY = py + HEADER_H;
+        S.drawRounded(ctx, contentX, sepY, contentW, 1, 0,
+                applyAlpha(BORDER_DEFAULT, alpha));
+
+        // Subtle accent glow on header line
+        float accentLineW = Math.min(120, contentW * 0.15f);
+        S.drawRounded(ctx, contentX, sepY, accentLineW, 1, 0,
+                applyAlpha(ACCENT_DIM, (int) (alpha * 0.5f)));
+
+        // ── Section headers ──────────────────────────────────────
+        renderSectionHeader(ctx, "MODES", contentX, modesHeaderY, contentW, alpha);
+        renderSectionHeader(ctx, "SETTINGS", contentX, settingsHeaderY, contentW, alpha);
+
+        // ── Status ribbon at bottom ─────────────────────────────
+        float ribbonH = 2f;
+        float ribbonInset = 18;
+        float ribbonY = py + panelH - ribbonH - 3;
+        float ribbonX = px + ribbonInset;
+        float ribbonW = panelW - ribbonInset * 2;
+
+        if (TopographyController.isAnyActive()) {
+            float pulse = (float) (0.7 + 0.3 * Math.sin(System.currentTimeMillis() / 1200.0));
+            int green = 0xFF34D399;
+            int cA = (int) (alpha * 0.7f * pulse);
+            int eA = (int) (alpha * 0.15f * pulse);
+            float seg = ribbonW / 3f;
+            S.drawGradientRounded(ctx, ribbonX, ribbonY, seg, ribbonH, 1,
+                    TopographySurfaceRenderer.withAlpha(green, eA),
+                    TopographySurfaceRenderer.withAlpha(green, cA), 1f);
+            S.drawRounded(ctx, ribbonX + seg, ribbonY, seg, ribbonH, 0,
+                    TopographySurfaceRenderer.withAlpha(green, cA));
+            S.drawGradientRounded(ctx, ribbonX + seg * 2, ribbonY, seg, ribbonH, 1,
+                    TopographySurfaceRenderer.withAlpha(green, cA),
+                    TopographySurfaceRenderer.withAlpha(green, eA), 1f);
+        } else {
+            int segs = 7;
+            float rsw = ribbonW / segs;
+            float center = segs / 2f;
+            for (int i = 0; i < segs; i++) {
+                float dist = Math.abs(i + 0.5f - center) / center;
+                float fade = 1f - dist * dist;
+                int sa = (int) (alpha * 0.35f * fade);
+                S.drawRounded(ctx, ribbonX + i * rsw, ribbonY, rsw + 1, ribbonH,
+                        (i == 0 || i == segs - 1) ? 1 : 0,
+                        TopographySurfaceRenderer.withAlpha(ACCENT_DIM, sa));
+            }
+        }
+
+        // ── Render widgets ───────────────────────────────────────
         root.updateHover(mouseX, mouseY);
         root.render(ctx, mouseX, mouseY, alpha);
+    }
+
+    private void renderSectionHeader(DrawContext ctx, String text, float hx, float hy,
+                                     float maxW, int alpha) {
+        SECTION_FONT.draw(ctx, text, hx, hy, applyAlpha(TEXT_DIM, alpha));
+
+        // Full-width line from text end to right edge
+        float textEnd = hx + SECTION_FONT.width(text) + 12;
+        float fadeLineY = hy + SECTION_FONT.lineHeight() / 2f;
+        float lineLen = hx + maxW - textEnd;
+        if (lineLen <= 0) return;
+
+        // Solid line that fades out
+        int segments = 8;
+        float segW = lineLen / segments;
+        for (int i = 0; i < segments; i++) {
+            float frac = 1f - (float) i / (segments - 1);
+            int segAlpha = (int) (alpha * frac * 0.12f);
+            S.drawRounded(ctx, textEnd + i * segW, fadeLineY, segW + 1, 1, 0,
+                    TopographySurfaceRenderer.withAlpha(0xFFFFFF, segAlpha));
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -259,7 +379,6 @@ public class TopographyScreen extends Screen {
         double mx = click.x();
         double my = click.y();
 
-        // Cancel keybind capture if clicking outside keybind widgets
         boolean clickedKeybind = false;
         for (ModeCardWidget card : modeCards) {
             if (card.getKeybindWidget().containsPoint(mx, my)) {

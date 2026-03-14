@@ -11,14 +11,23 @@ public class ToggleWidget extends Widget {
 
     private static final TopographySurfaceRenderer S = new TopographySurfaceRenderer();
 
+    private static final float TRACK_W = 26;
+    private static final float TRACK_H = 12;
+    private static final float TRACK_R = 6;
+    private static final float THUMB_SIZE = 8;
+    private static final float THUMB_PAD = 2;
+
     private final TopographySmoothTextRenderer font;
     private final String label;
     private final BooleanSupplier getter;
     private final Consumer<Boolean> setter;
 
-    private int onColor = 0xFF49D28B;
-    private int offColor = 0xFFFF4455;
+    private int onColor = 0xFF34D399;
+    private int offColor = 0xFF2A2A34;
     private int labelColor = 0xFF6B6F80;
+
+    private float toggleProgress = -1;
+    private long lastToggleTime = 0;
 
     public ToggleWidget(TopographySmoothTextRenderer font, String label,
                         BooleanSupplier getter, Consumer<Boolean> setter) {
@@ -41,31 +50,93 @@ public class ToggleWidget extends Widget {
         if (!visible) return;
         boolean on = getter.getAsBoolean();
 
+        // ── Animate toggle position ──────────────────────────────
+        long now = System.currentTimeMillis();
+        if (toggleProgress < 0) {
+            toggleProgress = on ? 1f : 0f;
+        } else if (lastToggleTime > 0) {
+            float dt = Math.min(50, now - lastToggleTime) / 1000f;
+            float target = on ? 1f : 0f;
+            toggleProgress += (target - toggleProgress) * Math.min(1f, 10f * dt);
+            if (Math.abs(toggleProgress - target) < 0.01f) toggleProgress = target;
+        }
+        lastToggleTime = now;
+
+        // ── Label text ───────────────────────────────────────────
         int lblCol = applyAlpha(labelColor, alpha);
         font.draw(ctx, label, x, y + 2, lblCol);
 
-        float valueX = x + font.width(label);
-        String valueText = on ? "[ON]" : "[OFF]";
-        int valueCol = applyAlpha(on ? onColor : offColor, alpha);
-        if (hovered) {
-            valueCol = applyAlpha(brighten(on ? onColor : offColor), alpha);
-        }
-        font.draw(ctx, valueText, valueX, y + 2, valueCol);
+        // ── Pill toggle ──────────────────────────────────────────
+        float pillX = x + font.width(label) + 4;
+        float pillY = y + (h - TRACK_H) / 2f;
 
-        // Update clickable width to cover full label + value
-        this.w = font.width(label) + font.width(valueText);
+        // ── Track fill ────────────────────────────────────────────
+        int trackColor = applyAlpha(
+                TopographySurfaceRenderer.lerpColor(offColor, onColor, toggleProgress), alpha);
+        if (hoverProgress > 0.01f) {
+            trackColor = TopographySurfaceRenderer.lerpColor(trackColor,
+                    TopographySurfaceRenderer.brighten(trackColor, 20), hoverProgress);
+        }
+        S.drawRounded(ctx, pillX, pillY, TRACK_W, TRACK_H, TRACK_R, trackColor);
+
+        // Track gradient shine (lighter top — convex volume)
+        int shineA = (int) (8 * alpha / 255f);
+        if (shineA > 0) {
+            S.drawGradientRounded(ctx, pillX + 1, pillY + 1, TRACK_W - 2, (TRACK_H - 2) * 0.5f,
+                    TRACK_R - 1,
+                    TopographySurfaceRenderer.withAlpha(0xFFFFFF, shineA),
+                    TopographySurfaceRenderer.withAlpha(0xFFFFFF, 0), 1f);
+        }
+
+        // OFF: inner shadow (sunken track)
+        float offFade = 1f - toggleProgress;
+        if (offFade > 0.1f) {
+            S.drawInsetShadow(ctx, pillX, pillY, TRACK_W, TRACK_H, TRACK_R,
+                    2, TopographySurfaceRenderer.withAlpha(0xFF000000, (int) (alpha * 0.15f * offFade)));
+        }
+
+        // Track glow when ON
+        if (toggleProgress > 0.5f) {
+            int glowAlpha = (int) (15 * toggleProgress * alpha / 255f);
+            S.drawGlow(ctx, pillX, pillY, TRACK_W, TRACK_H, TRACK_R, 4,
+                    TopographySurfaceRenderer.withAlpha(onColor, glowAlpha));
+        }
+
+        // ── Thumb ────────────────────────────────────────────────
+        float thumbTravel = TRACK_W - THUMB_SIZE - THUMB_PAD * 2;
+        float thumbX = pillX + THUMB_PAD + thumbTravel * toggleProgress;
+        float thumbY = pillY + THUMB_PAD;
+
+        // Thumb shadow
+        S.drawShadow(ctx, thumbX, thumbY, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE / 2f, 2,
+                TopographySurfaceRenderer.withAlpha(0xFF000000, (int) (alpha * 0.20f)));
+
+        // Thumb ON glow
+        if (toggleProgress > 0.5f) {
+            float glowT = (toggleProgress - 0.5f) * 2f;
+            int tGlowA = (int) (15 * glowT * alpha / 255f);
+            S.drawGlow(ctx, thumbX, thumbY, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE / 2f, 3,
+                    TopographySurfaceRenderer.withAlpha(onColor, tGlowA));
+        }
+
+        // Thumb body
+        S.drawRounded(ctx, thumbX, thumbY, THUMB_SIZE, THUMB_SIZE, THUMB_SIZE / 2f,
+                applyAlpha(0xFFFFFFFF, alpha));
+
+        // Thumb specular highlight
+        int hlA = (int) (alpha * 0.15f);
+        if (hlA > 0) {
+            S.drawRounded(ctx, thumbX + 1, thumbY + 1, THUMB_SIZE - 2, 2, (THUMB_SIZE - 2) / 2f,
+                    TopographySurfaceRenderer.withAlpha(0xFFFFFF, hlA));
+        }
+
+        // Clickable width
+        this.w = font.width(label) + 4 + TRACK_W;
     }
 
     @Override
     protected void onClicked() {
         setter.accept(!getter.getAsBoolean());
-    }
-
-    private static int brighten(int color) {
-        int r = Math.min(255, ((color >> 16) & 0xFF) + 30);
-        int g = Math.min(255, ((color >> 8) & 0xFF) + 30);
-        int b = Math.min(255, (color & 0xFF) + 30);
-        return (color & 0xFF000000) | (r << 16) | (g << 8) | b;
     }
 
     private static int applyAlpha(int color, int alpha) {

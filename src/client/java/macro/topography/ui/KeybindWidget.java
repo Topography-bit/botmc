@@ -11,8 +11,8 @@ import java.util.function.IntSupplier;
 
 public class KeybindWidget extends Widget {
 
-    private static final int ACCENT = 0xFF00C8FF;
-    private static final int TEXT_PRIMARY = 0xFFEAEAEF;
+    private static final int ACCENT = 0xFF818CF8;
+    private static final int TEXT_PRIMARY = 0xFFE8E8F0;
     private static final int TEXT_SECONDARY = 0xFF6B6F80;
 
     private final TopographySmoothTextRenderer font;

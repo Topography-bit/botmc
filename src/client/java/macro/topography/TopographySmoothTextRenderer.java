@@ -28,22 +28,26 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class TopographySmoothTextRenderer {
 
     private static final AtomicInteger TEXTURE_COUNTER = new AtomicInteger();
-    private static final int TEXT_PADDING = 3;
+    private static final int TEXT_PADDING = 4;
 
-    private final Font font;
-    private final FontMetrics metrics;
+    // HiDPI: render at 2x internally, display at correct size
+    private static final int RENDER_SCALE = 2;
+    private static final int SCALED_PADDING = TEXT_PADDING * RENDER_SCALE;
+
+    private final Font font;           // at RENDER_SCALE resolution
+    private final FontMetrics metrics;  // at RENDER_SCALE resolution
     private final Map<String, CachedText> cache = new HashMap<>();
-    private final int lineHeight;
-    private final int ascent;
+    private final int lineHeight;   // GUI coords (1x)
+    private final int ascent;       // GUI coords (1x)
 
     public TopographySmoothTextRenderer(String preferredFamily, int fontSize, int style) {
-        this.font = resolveFont(preferredFamily, fontSize, style);
+        this.font = resolveFont(preferredFamily, fontSize * RENDER_SCALE, style);
         BufferedImage probe = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
         Graphics2D graphics = configureGraphics(probe.createGraphics());
         graphics.setFont(font);
         this.metrics = graphics.getFontMetrics();
-        this.lineHeight = metrics.getHeight();
-        this.ascent = metrics.getAscent();
+        this.lineHeight = (metrics.getHeight() + RENDER_SCALE - 1) / RENDER_SCALE;
+        this.ascent = (metrics.getAscent() + RENDER_SCALE - 1) / RENDER_SCALE;
         graphics.dispose();
     }
 
@@ -56,25 +60,20 @@ public final class TopographySmoothTextRenderer {
     }
 
     public float width(String text) {
-        if (text == null || text.isEmpty()) {
-            return 0f;
-        }
-        return metrics.stringWidth(text);
+        if (text == null || text.isEmpty()) return 0f;
+        return metrics.stringWidth(text) / (float) RENDER_SCALE;
     }
 
     public String ellipsize(String text, int maxWidth) {
         if (text == null || text.isEmpty() || width(text) <= maxWidth) {
             return text == null ? "" : text;
         }
-
         String ellipsis = "...";
         int targetWidth = Math.max(0, maxWidth - (int) width(ellipsis));
         StringBuilder builder = new StringBuilder();
         for (int i = 0; i < text.length(); i++) {
             String candidate = builder + String.valueOf(text.charAt(i));
-            if (width(candidate) > targetWidth) {
-                break;
-            }
+            if (width(candidate) > targetWidth) break;
             builder.append(text.charAt(i));
         }
         return builder + ellipsis;
@@ -82,18 +81,10 @@ public final class TopographySmoothTextRenderer {
 
     public List<String> wrap(String text, int maxWidth, int maxLines) {
         List<String> lines = new ArrayList<>();
-        if (text == null || text.isBlank()) {
-            lines.add("");
-            return lines;
-        }
-
+        if (text == null || text.isBlank()) { lines.add(""); return lines; }
         String[] paragraphs = text.split("\\n", -1);
         for (String paragraph : paragraphs) {
-            if (paragraph.isEmpty()) {
-                lines.add("");
-                continue;
-            }
-
+            if (paragraph.isEmpty()) { lines.add(""); continue; }
             String[] words = paragraph.split(" ");
             StringBuilder current = new StringBuilder();
             for (String word : words) {
@@ -111,43 +102,65 @@ public final class TopographySmoothTextRenderer {
                     }
                 }
             }
-
-            if (!current.isEmpty()) {
-                lines.add(current.toString());
-            }
+            if (!current.isEmpty()) lines.add(current.toString());
         }
-
         if (maxLines > 0 && lines.size() > maxLines) {
             List<String> limited = new ArrayList<>(lines.subList(0, maxLines));
             limited.set(maxLines - 1, ellipsize(limited.get(maxLines - 1), maxWidth));
             return limited;
         }
-
         return lines;
     }
 
     public void draw(DrawContext context, String text, float x, float y, int color) {
-        if (text == null || text.isEmpty()) {
-            return;
-        }
-
+        if (text == null || text.isEmpty()) return;
         CachedText cached = getOrCreate(text, color);
+        // Use 12-param overload: display at GUI size, sample full texture
+        int displayW = cached.texW / RENDER_SCALE;
+        int displayH = cached.texH / RENDER_SCALE;
         context.drawTexture(
             RenderPipelines.GUI_TEXTURED,
             cached.textureId,
             Math.round(x) - TEXT_PADDING,
             Math.round(y) - TEXT_PADDING,
-            0f,
-            0f,
-            cached.textureWidth,
-            cached.textureHeight,
-            cached.textureWidth,
-            cached.textureHeight
+            displayW,           // display width on screen
+            displayH,           // display height on screen
+            0,                  // u offset
+            0,                  // v offset
+            cached.texW,        // region width (full texture)
+            cached.texH,        // region height (full texture)
+            cached.texW,        // texture total width
+            cached.texH         // texture total height
         );
     }
 
     public void drawCentered(DrawContext context, String text, float centerX, float y, int color) {
         draw(context, text, centerX - width(text) / 2f, y, color);
+    }
+
+    public void drawWithTracking(DrawContext context, String text, float x, float y, int color, float tracking) {
+        if (text == null || text.isEmpty()) return;
+        float cx = x;
+        for (int i = 0; i < text.length(); i++) {
+            String ch = String.valueOf(text.charAt(i));
+            draw(context, ch, cx, y, color);
+            cx += width(ch) + tracking;
+        }
+    }
+
+    public float widthWithTracking(String text, float tracking) {
+        if (text == null || text.isEmpty()) return 0f;
+        float total = 0;
+        for (int i = 0; i < text.length(); i++) {
+            total += width(String.valueOf(text.charAt(i)));
+            if (i < text.length() - 1) total += tracking;
+        }
+        return total;
+    }
+
+    public void drawCenteredWithTracking(DrawContext context, String text, float centerX, float y,
+                                          int color, float tracking) {
+        drawWithTracking(context, text, centerX - widthWithTracking(text, tracking) / 2f, y, color, tracking);
     }
 
     public void drawRight(DrawContext context, String text, float rightX, float y, int color) {
@@ -162,14 +175,14 @@ public final class TopographySmoothTextRenderer {
     private CachedText createTexture(String text, int color) {
         int rawWidth = Math.max(1, metrics.stringWidth(text));
         int rawHeight = Math.max(1, metrics.getHeight());
-        int textureWidth = rawWidth + TEXT_PADDING * 2;
-        int textureHeight = rawHeight + TEXT_PADDING * 2;
+        int texW = rawWidth + SCALED_PADDING * 2;
+        int texH = rawHeight + SCALED_PADDING * 2;
 
-        BufferedImage image = new BufferedImage(textureWidth, textureHeight, BufferedImage.TYPE_INT_ARGB);
+        BufferedImage image = new BufferedImage(texW, texH, BufferedImage.TYPE_INT_ARGB);
         Graphics2D graphics = configureGraphics(image.createGraphics());
         graphics.setFont(font);
         graphics.setColor(toAwtColor(color));
-        graphics.drawString(text, TEXT_PADDING, TEXT_PADDING + metrics.getAscent());
+        graphics.drawString(text, SCALED_PADDING, SCALED_PADDING + metrics.getAscent());
         graphics.dispose();
 
         try {
@@ -177,10 +190,11 @@ public final class TopographySmoothTextRenderer {
             ImageIO.write(image, "png", buffer);
             NativeImage nativeImage = NativeImage.read(new ByteArrayInputStream(buffer.toByteArray()));
             int textureIndex = TEXTURE_COUNTER.incrementAndGet();
-            NativeImageBackedTexture texture = new NativeImageBackedTexture(() -> "topography_text_" + textureIndex, nativeImage);
+            NativeImageBackedTexture texture = new NativeImageBackedTexture(
+                    () -> "topography_text_" + textureIndex, nativeImage);
             Identifier id = Identifier.of("topographhy", "ui/text/" + textureIndex);
             MinecraftClient.getInstance().getTextureManager().registerTexture(id, texture);
-            return new CachedText(id, rawWidth, rawHeight, textureWidth, textureHeight);
+            return new CachedText(id, texW, texH);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to build smooth text texture for '" + text + "'", e);
         }
@@ -199,8 +213,8 @@ public final class TopographySmoothTextRenderer {
 
     private static Font resolveFont(String preferredFamily, int fontSize, int style) {
         List<String> fallbacks = List.of(preferredFamily, "Inter", "Geist", "Segoe UI", "SF Pro Display", "SansSerif");
-        String[] availableFamilies = GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames(Locale.ROOT);
-
+        String[] availableFamilies = GraphicsEnvironment.getLocalGraphicsEnvironment()
+                .getAvailableFontFamilyNames(Locale.ROOT);
         for (String family : fallbacks) {
             for (String available : availableFamilies) {
                 if (available.equalsIgnoreCase(family)) {
@@ -208,7 +222,6 @@ public final class TopographySmoothTextRenderer {
                 }
             }
         }
-
         return new Font("SansSerif", style, fontSize);
     }
 
@@ -216,6 +229,5 @@ public final class TopographySmoothTextRenderer {
         return new Color((color >>> 16) & 0xFF, (color >>> 8) & 0xFF, color & 0xFF, (color >>> 24) & 0xFF);
     }
 
-    private record CachedText(Identifier textureId, int width, int height, int textureWidth, int textureHeight) {
-    }
+    private record CachedText(Identifier textureId, int texW, int texH) {}
 }

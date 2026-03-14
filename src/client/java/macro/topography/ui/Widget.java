@@ -10,6 +10,10 @@ public abstract class Widget {
     protected boolean visible = true;
     protected boolean enabled = true;
 
+    protected float hoverProgress = 0f;
+    protected float pressProgress = 0f;
+    private long lastAnimTime = 0;
+
     public void setBounds(float x, float y, float w, float h) {
         this.x = x;
         this.y = y;
@@ -39,6 +43,20 @@ public abstract class Widget {
 
     public void updateHover(int mouseX, int mouseY) {
         hovered = visible && enabled && containsPoint(mouseX, mouseY);
+
+        long now = System.currentTimeMillis();
+        if (lastAnimTime > 0) {
+            float dt = Math.min(50, now - lastAnimTime) / 1000f;
+
+            float hoverTarget = hovered ? 1f : 0f;
+            hoverProgress += (hoverTarget - hoverProgress) * Math.min(1f, 10f * dt);
+            if (Math.abs(hoverProgress - hoverTarget) < 0.005f) hoverProgress = hoverTarget;
+
+            float pressTarget = pressed ? 1f : 0f;
+            pressProgress += (pressTarget - pressProgress) * Math.min(1f, 16f * dt);
+            if (Math.abs(pressProgress - pressTarget) < 0.005f) pressProgress = pressTarget;
+        }
+        lastAnimTime = now;
     }
 
     public abstract void render(DrawContext ctx, int mouseX, int mouseY, int alpha);

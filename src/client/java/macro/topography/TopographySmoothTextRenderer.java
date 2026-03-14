@@ -135,12 +135,12 @@ public final class TopographySmoothTextRenderer {
         context.drawTexture(
             RenderPipelines.GUI_TEXTURED,
             cached.textureId,
-            Math.round(x),
-            Math.round(y),
+            Math.round(x) - TEXT_PADDING,
+            Math.round(y) - TEXT_PADDING,
             0f,
             0f,
-            cached.width,
-            cached.height,
+            cached.textureWidth,
+            cached.textureHeight,
             cached.textureWidth,
             cached.textureHeight
         );

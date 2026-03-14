@@ -5,21 +5,23 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.text.Text;
 
+import java.util.HashMap;
+import java.util.Map;
+
 public final class TopographyController {
 
     private static boolean screenOpenScheduled;
-    private static boolean zealotKeyWasPressed;
-    private static boolean bruiserKeyWasPressed;
+
+    // Per-mode keybind state: modeId -> wasPressed
+    private static final Map<Integer, Boolean> keyWasPressed = new HashMap<>();
 
     // Zone transition tracking
-    private static boolean wasInZealotZone = false;
-    private static boolean wasInBruiserZone = false;
+    private static final Map<Integer, Boolean> wasInZone = new HashMap<>();
 
     // Runtime stats
     private static long startTimeMs = 0;
     private static int killCount = 0;
     private static int deathCount = 0;
-    private static int activeMode = 0; // 0=none, 1=zealots, 2=bruisers
 
     private TopographyController() {}
 
@@ -33,21 +35,20 @@ public final class TopographyController {
 
     // ── Toggle ────────────────────────────────────────────────────
 
-    public static boolean toggleZealots() { return toggleAutopilot(1); }
-    public static boolean toggleBruisers() { return toggleAutopilot(2); }
-
-    private static boolean toggleAutopilot(int mode) {
+    public static boolean toggleMode(int modeId) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client == null || client.player == null || client.world == null) {
             notify("Join a world first.");
             return false;
         }
 
+        Mode mode = ModeRegistry.getById(modeId);
+        String name = mode != null ? mode.getName() : "Mode " + modeId;
+
         // Already running this mode → stop
-        if (Autopilot.isEnabled() && Autopilot.getTargetMode() == mode) {
+        if (Autopilot.isEnabled() && Autopilot.getTargetMode() == modeId) {
             Autopilot.stop();
-            activeMode = 0;
-            notify((mode == 1 ? "Zealots" : "Bruisers") + " stopped.");
+            notify(name + " stopped.");
             return true;
         }
 
@@ -56,19 +57,26 @@ public final class TopographyController {
             Autopilot.stop();
         }
 
-        Autopilot.start(mode);
-        activeMode = mode;
+        Autopilot.start(modeId);
         startTimeMs = System.currentTimeMillis();
         killCount = 0;
         deathCount = 0;
-        notify((mode == 1 ? "Zealots" : "Bruisers") + " started.");
+        notify(name + " started.");
         return true;
     }
 
+    // Backward-compat convenience
+    public static boolean toggleZealots() { return toggleMode(1); }
+    public static boolean toggleBruisers() { return toggleMode(2); }
+
     // ── Status queries ────────────────────────────────────────────
 
-    public static boolean isZealotsActive()  { return Autopilot.isEnabled() && Autopilot.getTargetMode() == 1; }
-    public static boolean isBruisersActive() { return Autopilot.isEnabled() && Autopilot.getTargetMode() == 2; }
+    public static boolean isModeActive(int modeId) {
+        return Autopilot.isEnabled() && Autopilot.getTargetMode() == modeId;
+    }
+
+    public static boolean isZealotsActive()  { return isModeActive(1); }
+    public static boolean isBruisersActive() { return isModeActive(2); }
     public static boolean isAnyActive()      { return Autopilot.isEnabled(); }
 
     public static String getUptime() {
@@ -102,20 +110,17 @@ public final class TopographyController {
 
         checkZoneTransitions(client);
 
-        // Keybind polling
+        // Keybind polling — iterate all registered modes
         long window = client.getWindow().getHandle();
-
-        int zealotKey = TopographyUiConfig.getZealotsKeyCode();
-        boolean zealotPressed = zealotKey != org.lwjgl.glfw.GLFW.GLFW_KEY_UNKNOWN
-            && org.lwjgl.glfw.GLFW.glfwGetKey(window, zealotKey) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
-        if (zealotPressed && !zealotKeyWasPressed) toggleZealots();
-        zealotKeyWasPressed = zealotPressed;
-
-        int bruiserKey = TopographyUiConfig.getBruisersKeyCode();
-        boolean bruiserPressed = bruiserKey != org.lwjgl.glfw.GLFW.GLFW_KEY_UNKNOWN
-            && org.lwjgl.glfw.GLFW.glfwGetKey(window, bruiserKey) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
-        if (bruiserPressed && !bruiserKeyWasPressed) toggleBruisers();
-        bruiserKeyWasPressed = bruiserPressed;
+        for (Mode mode : ModeRegistry.getModes()) {
+            int modeId = mode.getId();
+            int keyCode = TopographyUiConfig.getModeKeyCode(modeId);
+            boolean pressed = keyCode != org.lwjgl.glfw.GLFW.GLFW_KEY_UNKNOWN
+                && org.lwjgl.glfw.GLFW.glfwGetKey(window, keyCode) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            boolean was = keyWasPressed.getOrDefault(modeId, false);
+            if (pressed && !was) toggleMode(modeId);
+            keyWasPressed.put(modeId, pressed);
+        }
 
         // Sync render toggles
         PathRenderer.enabled = TopographyUiConfig.isPathRenderEnabled();
@@ -126,20 +131,20 @@ public final class TopographyController {
         net.minecraft.util.math.Vec3d pos = client.player.getEntityPos();
         int x = (int) pos.x, y = (int) pos.y, z = (int) pos.z;
 
-        boolean inZealot  = Pathfinder.isInFarmZone(pos, 1);
-        boolean inBruiser = Pathfinder.isInFarmZone(pos, 2);
+        for (Mode mode : ModeRegistry.getModes()) {
+            int id = mode.getId();
+            boolean inZone = Pathfinder.isInFarmZone(pos, id);
+            boolean was = wasInZone.getOrDefault(id, false);
 
-        if (inZealot && !wasInZealotZone)
-            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7a[IN] Zealot zone | " + x + " " + y + " " + z));
-        else if (!inZealot && wasInZealotZone)
-            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7c[OUT] Zealot zone | " + x + " " + y + " " + z));
-        wasInZealotZone = inZealot;
+            if (inZone && !was)
+                client.inGameHud.getChatHud().addMessage(
+                    Text.literal("\u00a7a[IN] " + mode.getName() + " zone | " + x + " " + y + " " + z));
+            else if (!inZone && was)
+                client.inGameHud.getChatHud().addMessage(
+                    Text.literal("\u00a7c[OUT] " + mode.getName() + " zone | " + x + " " + y + " " + z));
 
-        if (inBruiser && !wasInBruiserZone)
-            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7a[IN] Bruiser zone | " + x + " " + y + " " + z));
-        else if (!inBruiser && wasInBruiserZone)
-            client.inGameHud.getChatHud().addMessage(Text.literal("\u00a7c[OUT] Bruiser zone | " + x + " " + y + " " + z));
-        wasInBruiserZone = inBruiser;
+            wasInZone.put(id, inZone);
+        }
     }
 
     private static void notify(String message) {

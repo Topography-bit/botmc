@@ -65,7 +65,9 @@
       "Bash(ls:*)",
       "Bash(./gradlew clean:*)",
       "Bash(./gradlew classes:*)",
-      "Bash(set:*)"
+      "Bash(set:*)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/Users/Ghost/AppData/Local/Programs/**)"
     ]
   }
 }

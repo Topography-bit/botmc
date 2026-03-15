@@ -604,6 +604,8 @@ public final class Autopilot {
         boolean directPursuit = false;
         double  mobDist  = Double.MAX_VALUE;
         Vec3d   mobPos   = null;
+        double  combatPitchBlend = 0;
+        double  combatMobPitch   = 0;
 
         if (mob != null && mob.isAlive()) {
             mobPos  = mob.getEntityPos().add(0, mob.getHeight() * 0.5, 0);
@@ -611,17 +613,29 @@ public final class Autopilot {
 
             if (mobDist < PRE_AIM_RANGE) {
                 double mobYaw = yawTo(pos, mobPos) + aimScatterYaw;
+
+                // Pitch to mob center
+                double eyeY = pos.y + player.getStandingEyeHeight();
+                double dym = mobPos.y - eyeY;
+                double dhm = Math.sqrt(sq(mobPos.x - pos.x) + sq(mobPos.z - pos.z));
+                combatMobPitch = (dhm > 0.1)
+                    ? -Math.toDegrees(Math.atan2(dym, dhm)) + aimScatterPitch
+                    : 0;
+
                 if (mobDist < ATTACK_RANGE) {
-                    // In attack range: aim at mob but keep running (run-through)
                     inCombat = true;
                     newGoalYaw = mobYaw;
+                    combatPitchBlend = 1.0;
                 } else if (mobDist < DIRECT_PURSUIT_RANGE) {
-                    // Blend path direction with mob direction — don't abandon path
+                    directPursuit = true;
                     double pursuitBlend = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (DIRECT_PURSUIT_RANGE - ATTACK_RANGE));
-                    newGoalYaw = lerpAngle(newGoalYaw, mobYaw, 0.3 + 0.7 * pursuitBlend);
+                    double blend = 0.3 + 0.7 * pursuitBlend;
+                    newGoalYaw = lerpAngle(newGoalYaw, mobYaw, blend);
+                    combatPitchBlend = blend;
                 } else {
                     double t = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
                     newGoalYaw = lerpAngle(newGoalYaw, mobYaw, t * AIM_BLEND_FAR);
+                    combatPitchBlend = t * AIM_BLEND_FAR;
                 }
             }
         }
@@ -660,6 +674,11 @@ public final class Autopilot {
             if (dh > 0.5) {
                 newGoalPitch = -Math.toDegrees(Math.atan2(dy, dh)) * 0.3;
             }
+        }
+
+        // Combat: blend pitch toward mob body (before fall camera overrides)
+        if (combatPitchBlend > 0) {
+            newGoalPitch = newGoalPitch + (combatMobPitch - newGoalPitch) * combatPitchBlend;
         }
 
         /* ── Fall camera system ────────────────────────────────────
@@ -930,8 +949,8 @@ public final class Autopilot {
             if (turnAhead > SPRINT_ANGLE_THRESH) shouldSprint = false;
         }
         if (springError > SPRINT_DELTA_YAW_MAX) shouldSprint = false;
-        // Run-through: keep sprinting in combat for sprint-attack damage bonus
-        // Run-through: no braking near mob — sprint through for max damage
+        // Walk near mob — gives camera time to aim for attack
+        if (mob != null && mobDist < BRAKE_RANGE) shouldSprint = false;
 
         /* ── Sprint timing (human-like) ────────────────────────────
          *  1. Delay sprint 4-9 ticks after starting forward movement
@@ -1110,8 +1129,6 @@ public final class Autopilot {
         }
 
         /* ── Apply keys (rotation is applied in onFrame) ─────────── */
-        // Run-through: always keep running, even in combat.
-        // The path goes past the mob — bot sprints through and attacks on the fly.
         boolean forward = hasPath || (inCombat && mobDist < ATTACK_RANGE);
 
         /* ── Graduated turn behavior ──────────────────────────────
@@ -1122,10 +1139,20 @@ public final class Autopilot {
         if (forward && !inCombat) {
             navYawErr = Math.abs(MathHelper.wrapDegrees(
                 (float)(goalYaw - springYawPos)));
-            if (navYawErr > 90.0) {
-                forward = false;          // walking perpendicular/backwards — stop
+            // Near mob: tighter aim threshold — let camera lock on before entering combat
+            double maxAimErr = (mob != null && mobDist < BRAKE_RANGE) ? 30.0 : 90.0;
+            if (navYawErr > maxAimErr) {
+                forward = false;
             }
             // 30-90°: sprint already disabled via SPRINT_DELTA_YAW_MAX
+        }
+
+        // Combat: don't walk forward if camera points away from mob
+        // (prevents overshooting and walking away after passing through mob)
+        if (inCombat) {
+            double combatAimErr = Math.abs(MathHelper.wrapDegrees(
+                (float)(goalYaw - springYawPos)));
+            if (combatAimErr > 45) forward = false;
         }
 
         /* ── Turn slowdown ─────────────────────────────────────────
@@ -1152,7 +1179,12 @@ public final class Autopilot {
          *  For small yaw errors (3-15°), occasionally strafe instead of
          *  turning the camera. This is how humans make minor corrections. */
         boolean navLeft = false, navRight = false;
-        if (navStrafeTicks > 0) {
+        // Cancel nav strafe when entering combat — prevents circling
+        if (inCombat) {
+            navStrafeTicks = 0;
+            navStrafeDir = 0;
+        }
+        if (navStrafeTicks > 0 && !inCombat) {
             navStrafeTicks--;
             if (navStrafeDir < 0) navLeft = true;
             else if (navStrafeDir > 0) navRight = true;
@@ -1180,6 +1212,27 @@ public final class Autopilot {
 
         if (attack) {
             ((MinecraftClientInvoker) client).invokeDoAttack();
+        }
+
+        // ── Normalize yaw accumulators ──────────────────────────────
+        // goalYaw is near [-180,180]. Spring/smooth/tracked accumulate
+        // unbounded. Normalize them INDEPENDENTLY against goalYaw so
+        // that shifting one group doesn't break the other.
+        {
+            double base = goalYaw;
+            // Group 1: spring + tracked + saccade state
+            double c1 = Math.round((springYawPos - base) / 360.0) * 360.0;
+            if (c1 != 0) {
+                springYawPos -= c1;
+                trackedYaw   -= c1;
+                if (inSaccade) {
+                    saccadeStartYaw  -= c1;
+                    saccadeTargetYaw -= c1;
+                }
+            }
+            // Group 2: smoothGoalYaw (independently)
+            double c2 = Math.round((smoothGoalYaw - base) / 360.0) * 360.0;
+            if (c2 != 0) smoothGoalYaw -= c2;
         }
 
         // ── Fill debug fields for AutopilotDebugHud ──
@@ -1266,15 +1319,20 @@ public final class Autopilot {
         double fatigueLag = 1.0 + fatigue * (FATIGUE_LAG_MULT - 1.0);
         boolean isNavigating = !dbg_inCombat && !dbg_directPursuit;
         double baseTau = isNavigating ? 0.015 : GOAL_LAG_TAU; // 15ms nav vs 100ms combat
+        // Melee: snap to goal fast — no time for 100ms lag when mob is at arm's length
+        // and camera needs a 180° flip after overshooting
+        if (dbg_inCombat && dbg_mobDist < ATTACK_RANGE) baseTau = 0.02;
         double effectiveTau = baseTau * fatigueLag / (0.5 + 0.5 * attention);
         double alpha = 1.0 - Math.exp(-dt / effectiveTau);
         smoothGoalYaw   += MathHelper.wrapDegrees((float)(goalYaw   - smoothGoalYaw))   * alpha;
         smoothGoalPitch += (goalPitch - smoothGoalPitch) * alpha;
-        // Re-center smoothGoalYaw near goalYaw to prevent numeric drift
-        // (both values accumulate wraps; keep them within 180° of each other)
-        double yawDrift = smoothGoalYaw - goalYaw;
-        if (Math.abs(yawDrift) > 360.0) {
-            smoothGoalYaw -= Math.round(yawDrift / 360.0) * 360.0;
+        // Re-center smoothGoalYaw near springYawPos so the spring never
+        // sees a >180° ambiguity (which causes wrong-direction rotation).
+        // Old code centered near goalYaw with a 360° threshold — too loose,
+        // allowing smoothGoalYaw to drift 200°+ from springYawPos.
+        double smoothSpringDrift = smoothGoalYaw - springYawPos;
+        if (Math.abs(smoothSpringDrift) > 180.0) {
+            smoothGoalYaw -= Math.round(smoothSpringDrift / 360.0) * 360.0;
         }
 
         // ══ Layer 2: Movement execution ══════════════════════════
@@ -1358,7 +1416,7 @@ public final class Autopilot {
             // Also update start position to current spring pos to prevent jumps
             double shiftYaw   = MathHelper.wrapDegrees((float)(smoothGoalYaw - saccadeTargetYaw));
             double shiftPitch = smoothGoalPitch - saccadeTargetPitch;
-            if (Math.abs(shiftYaw) > 8 || Math.abs(shiftPitch) > 8) {
+            if (Math.abs(shiftYaw) > 25 || Math.abs(shiftPitch) > 25) {
                 saccadeStartYaw    = springYawPos;
                 saccadeStartPitch  = springPitchPos;
                 saccadeTargetYaw   = smoothGoalYaw;
@@ -1370,7 +1428,8 @@ public final class Autopilot {
                 double newTotalError = Math.sqrt(newDeltaYaw * newDeltaYaw
                     + newDeltaPitch * newDeltaPitch);
                 saccadeDuration = SACCADE_FITTS_A + SACCADE_FITTS_B * newTotalError;
-                saccadeElapsed = 0;
+                // Keep 15% progress so velocity isn't zeroed (prevents stall)
+                saccadeElapsed = saccadeDuration * 0.15;
             }
 
             tau = Math.min(1.0, saccadeElapsed / saccadeDuration);

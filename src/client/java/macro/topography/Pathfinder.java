@@ -1156,28 +1156,12 @@ public class Pathfinder {
                 // Use tag position for navigation (it's directly above the mob)
                 BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
 
-                // Run-through: path goes PAST the mob (3 blocks beyond).
-                // Bot sprints through, attacks on crosshair, keeps running.
-                Vec3d toMob = tagPos.subtract(pPos);
-                double hDist = Math.sqrt(toMob.x * toMob.x + toMob.z * toMob.z);
-
-                if (hDist > 0.1) {
-                    // Place goal 3 blocks past the mob along approach direction
-                    double passThrough = 3.0;
-                    for (double dist = passThrough; dist >= 0; dist -= 0.5) {
-                        Vec3d offset = new Vec3d(toMob.x / hDist * dist, 0,
-                                                 toMob.z / hDist * dist);
-                        Vec3d goal = tagPos.add(offset);
-                        BlockPos gb = BlockPos.ofFloored(goal.x, goal.y, goal.z);
-                        // Try current Y down to -15 (name tag can float well above mob/ground)
-                        for (int dy = 0; dy >= -15; dy--) {
-                            if (isStandableWorld(client.world, gb.getX(), gb.getY() + dy, gb.getZ())) {
-                                return new BlockPos(gb.getX(), gb.getY() + dy, gb.getZ());
-                            }
-                        }
+                // Path to mob position. Tag floats above mob — search down for ground.
+                for (int dy = 0; dy >= -15; dy--) {
+                    if (isStandableWorld(client.world, mobBlock.getX(), mobBlock.getY() + dy, mobBlock.getZ())) {
+                        return new BlockPos(mobBlock.getX(), mobBlock.getY() + dy, mobBlock.getZ());
                     }
                 }
-                // Fallback: find any standable position near the tag
                 return findNearestStandable(client.world, mobBlock);
             }
 

@@ -241,7 +241,7 @@ public class Pathfinder {
         );
     }
 
-    private static void requestImmediateRepath(String reason) {
+    public static void requestImmediateRepath(String reason) {
         if (reason == null || reason.isBlank()) return;
         if (forcedRepathReason == null || forcedRepathReason.isBlank()) {
             forcedRepathReason = reason;
@@ -598,6 +598,9 @@ public class Pathfinder {
                     goal.toShortString(),
                     pathGoal.toShortString()
                 );
+                // Feed debug HUD
+                Autopilot.dbg_lastRepathReason = repathReason;
+                Autopilot.dbg_lastRepathMs = System.currentTimeMillis();
                 forcedRepathReason = null;
             }
         }

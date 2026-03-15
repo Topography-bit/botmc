@@ -17,6 +17,7 @@ public final class TopographyController {
     private static boolean rshiftWasPressed;
     private static boolean f7WasPressed;
     private static boolean f8WasPressed;
+    private static boolean f9WasPressed;
 
     // Zone transition tracking
     private static final Map<Integer, Boolean> wasInZone = new HashMap<>();
@@ -142,6 +143,21 @@ public final class TopographyController {
                 notify("Human CSV " + (CameraDebugHud.isHumanCsvEnabled() ? "started" : "stopped"));
             }
             f8WasPressed = f8Down;
+        }
+
+        // F9 = autopilot debug HUD, Shift+F9 = autopilot CSV toggle
+        {
+            boolean f9Down = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_F9) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            boolean shiftDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_SHIFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            if (f9Down && !f9WasPressed) {
+                if (shiftDown) {
+                    AutopilotDebugHud.toggleCsv();
+                    notify("Autopilot CSV " + (AutopilotDebugHud.isCsvEnabled() ? "started" : "stopped"));
+                } else {
+                    AutopilotDebugHud.toggleHud();
+                }
+            }
+            f9WasPressed = f9Down;
         }
 
         // RSHIFT opens menu

@@ -14,6 +14,7 @@ public class topographhyClient implements ClientModInitializer {
 		PosCommand.register();
 		PathRenderer.register();
 		CameraDebugHud.register();
+		AutopilotDebugHud.register();
 		TopographyController.register();
 		ReconnectManager.register();
 		AutoJoinManager.register();

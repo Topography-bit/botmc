@@ -6,6 +6,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.GameOptions;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -47,7 +48,8 @@ public final class Autopilot {
     private static final double ATTACK_RANGE       = 3.8;
     private static final double PRE_AIM_RANGE      = 16.0;
     private static final double BRAKE_RANGE        = 6.0;
-    private static final double COMBAT_CHASE_RANGE = 2.5;
+    private static final double COMBAT_CHASE_RANGE = 2.0;  // walk forward until this close
+    private static final double DIRECT_PURSUIT_RANGE = 8.0; // within this: ignore path, walk straight at mob
     private static final double AIM_BLEND_FAR      = 0.3;
     private static final int    ATTACK_CD_MIN      = 0;
     private static final int    ATTACK_CD_MAX      = 1;
@@ -348,10 +350,17 @@ public final class Autopilot {
     private static int attackCooldown = 0;
     private static int combatStrafeDir = 1;
     private static int combatStrafeTicks = 0;
+    private static int consecutiveMisses = 0;         // attacks that didn't hit entity
+    private static final int MISS_SCATTER_REROLL = 4;  // re-roll aimScatter after this many misses
+    private static int combatStuckTicks = 0;           // ticks in combat without landing a hit
+    private static final int COMBAT_STUCK_THRESHOLD = 30; // 1.5 sec → reposition
+    private static final double COMBAT_REPOSITION_ANGLE = 45.0; // degrees to sidestep
 
     // Stuck
     private static Vec3d lastPos = null;
     private static int   stuckTicks = 0;
+    private static int   stuckKicks = 0;          // how many times stuck-kick fired at same area
+    private static final int STUCK_KICKS_REPATH = 2; // after 2 kicks → force repath
 
     // ── Human-like behavioral state ──────────────────────────────
     // Sprint timing
@@ -423,6 +432,35 @@ public final class Autopilot {
     static boolean dbg_preEdge;
     static double  dbg_preEdgeStrength;
     static double  dbg_preEdgeDist;
+
+    // ── Autopilot/Pathfinder debug (tick-rate) ──────────────────
+    static boolean dbg_inCombat;
+    static boolean dbg_directPursuit;
+    static double  dbg_mobDist;
+    static double  dbg_aimError;
+    static boolean dbg_crosshairOnEntity;
+    static boolean dbg_attackFired;
+    static int     dbg_consecutiveMisses;
+    static int     dbg_combatStuckTicks;
+    static boolean dbg_forward;
+    static boolean dbg_sprint;
+    static boolean dbg_jump;
+    static int     dbg_strafeDir;     // -1=left, 0=none, 1=right
+    static int     dbg_pathLen;
+    static int     dbg_wpIndex;
+    static double  dbg_distToWp;
+    static double  dbg_distToGoal;
+    static String  dbg_repathReason;
+    static int     dbg_stuckTicks;
+    static double  dbg_playerX, dbg_playerY, dbg_playerZ;
+    static double  dbg_mobX, dbg_mobY, dbg_mobZ;
+    static String  dbg_targetName;
+    static double  dbg_wpX, dbg_wpY, dbg_wpZ;          // current waypoint pos
+    static double  dbg_goalYaw, dbg_currentYaw;          // where bot wants to face vs where it faces
+    static double  dbg_goalPitchTick, dbg_currentPitch;   // same for pitch
+    static boolean dbg_pathBlocked;                       // pathfinder thinks path is blocked ahead
+    static String  dbg_lastRepathReason;                  // last reason pathfinder repathed
+    static long    dbg_lastRepathMs;                      // when last repath happened
 
     /** Called from ClientPlayNetworkHandlerMixin when a chat message arrives. */
     public static void onChatMessage(String message) {
@@ -560,6 +598,7 @@ public final class Autopilot {
 
         /* ── Combat aim blending ─────────────────────────────────── */
         inCombat = false;
+        boolean directPursuit = false; // within DIRECT_PURSUIT_RANGE: ignore path, walk at mob
         double  mobDist  = Double.MAX_VALUE;
         Vec3d   mobPos   = null;
 
@@ -572,6 +611,11 @@ public final class Autopilot {
                 if (mobDist < ATTACK_RANGE) {
                     inCombat = true;
                     newGoalYaw = mobYaw;
+                } else if (mobDist < DIRECT_PURSUIT_RANGE) {
+                    // Close enough to see the mob — walk straight at it,
+                    // don't follow pathfinder to a stale standoff point
+                    directPursuit = true;
+                    newGoalYaw = mobYaw;
                 } else {
                     double t = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
                     newGoalYaw = lerpAngle(newGoalYaw, mobYaw, t * AIM_BLEND_FAR);
@@ -580,7 +624,8 @@ public final class Autopilot {
         }
 
         goalYaw = newGoalYaw;
-        Pathfinder.setFreezeWaypoint(inCombat);
+        // Don't freeze waypoint in combat — let pathfinder update as mob moves
+        Pathfinder.setFreezeWaypoint(false);
 
         /* ── Idle head scanning ────────────────────────────────────
          *  When running straight for 1.5s+, add subtle head drift.
@@ -826,13 +871,19 @@ public final class Autopilot {
             preEdgePeekStrength = 0;
         }
 
-        // Combat pitch blend (overrides fall camera — if fighting mid-fall, look at mob)
+        // Combat/pursuit pitch blend — look at mob when close
         if (mob != null && mob.isAlive() && mobPos != null && mobDist < PRE_AIM_RANGE) {
             double dy = mobPos.y - (pos.y + player.getStandingEyeHeight());
             double dh = Math.sqrt(sq(mobPos.x - pos.x) + sq(mobPos.z - pos.z));
             if (dh > 0.1) {
                 double mobPitch = -Math.toDegrees(Math.atan2(dy, dh)) + aimScatterPitch;
-                double blend = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
+                double blend;
+                if (inCombat || directPursuit) {
+                    // Close to mob: full aim at mob
+                    blend = 1.0;
+                } else {
+                    blend = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
+                }
                 newGoalPitch = newGoalPitch * (1.0 - blend) + mobPitch * blend;
             }
         }
@@ -876,13 +927,14 @@ public final class Autopilot {
             if (turnAhead > SPRINT_ANGLE_THRESH) shouldSprint = false;
         }
         if (springError > SPRINT_DELTA_YAW_MAX) shouldSprint = false;
-        if (inCombat) shouldSprint = false;
+        if (inCombat || directPursuit) shouldSprint = false;
         if (mob != null && mob.isAlive() && mobDist < BRAKE_RANGE) shouldSprint = false;
 
         /* ── Sprint timing (human-like) ────────────────────────────
          *  1. Delay sprint 4-9 ticks after starting forward movement
          *  2. Occasional 2-4 tick gaps every 80-240 ticks of sprinting */
-        boolean forwardNow = hasPath && (!inCombat || (inCombat && mobDist > COMBAT_CHASE_RANGE));
+        boolean forwardNow = directPursuit
+            || (hasPath && (!inCombat || (inCombat && mobDist > COMBAT_CHASE_RANGE)));
         if (forwardNow && !wasMovingForward) {
             // Just started moving — delay sprint like a human pressing shift after W
             sprintDelayRemaining = SPRINT_DELAY_MIN
@@ -921,13 +973,39 @@ public final class Autopilot {
         boolean attack = false;
         if (attackCooldown > 0) attackCooldown--;
 
-        double aimErrorToMob = (inCombat && mobPos != null)
-            ? Math.abs(MathHelper.wrapDegrees((float)(yawTo(pos, mobPos) - springYawPos)))
-            : 999;
+        // Full 3D aim error: yaw + pitch, not just yaw.
+        // Without pitch check, bot "attacks" when crosshair is above/below hitbox.
+        double aimErrorToMob = 999;
+        if (inCombat && mobPos != null) {
+            double yawErr = Math.abs(MathHelper.wrapDegrees(
+                (float)(yawTo(pos, mobPos) - springYawPos)));
+            double eyeY = pos.y + player.getStandingEyeHeight();
+            double dy = mobPos.y - eyeY;
+            double dh = Math.sqrt(sq(mobPos.x - pos.x) + sq(mobPos.z - pos.z));
+            double targetPitch = (dh > 0.1)
+                ? -Math.toDegrees(Math.atan2(dy, dh))
+                : springPitchPos;
+            double pitchErr = Math.abs(targetPitch - springPitchPos);
+            aimErrorToMob = Math.sqrt(yawErr * yawErr + pitchErr * pitchErr);
+        }
 
-        if (inCombat && attackCooldown <= 0 && aimErrorToMob < ATTACK_AIM_TOLERANCE) {
+        // Only attack when vanilla crosshair raycast actually sees an entity.
+        // doAttack() hits whatever crosshairTarget is — if it's a block, we miss.
+        boolean crosshairOnEntity = client.crosshairTarget != null
+            && client.crosshairTarget.getType() == HitResult.Type.ENTITY;
+
+        // Crosshair is vanilla raycast — if it sees an entity, attack.
+        // This is more accurate than our aim_error math (accounts for hitbox).
+        if (inCombat && attackCooldown <= 0 && crosshairOnEntity) {
             attack = true;
             attackCooldown = ATTACK_CD_MIN + rng.nextInt(ATTACK_CD_MAX - ATTACK_CD_MIN + 1);
+            consecutiveMisses = 0;
+            combatStuckTicks = 0;
+        } else if (inCombat && attackCooldown <= 0 && aimErrorToMob < ATTACK_AIM_TOLERANCE
+                && !crosshairOnEntity) {
+            // Aim says close enough but crosshair misses → count as miss
+            attackCooldown = ATTACK_CD_MIN + rng.nextInt(ATTACK_CD_MAX - ATTACK_CD_MIN + 1);
+            consecutiveMisses++;
         }
 
         /* ── Combat reaction delay ─────────────────────────────────
@@ -942,13 +1020,24 @@ public final class Autopilot {
                 // Endpoint scatter: each new aim attempt has slightly different offset
                 aimScatterYaw   = rng.nextGaussian() * AIM_SCATTER_YAW_SD;
                 aimScatterPitch = rng.nextGaussian() * AIM_SCATTER_PITCH_SD;
+                consecutiveMisses = 0;
+                combatStuckTicks = 0;
             }
         } else {
             lastCombatTargetId = null;
+            consecutiveMisses = 0;
+            combatStuckTicks = 0;
         }
         if (combatReactionRemaining > 0) {
             combatReactionRemaining--;
             attack = false; // suppress attack during reaction window
+        }
+
+        // Re-roll aimScatter after consecutive misses — human adjusts aim
+        if (consecutiveMisses >= MISS_SCATTER_REROLL) {
+            aimScatterYaw   = rng.nextGaussian() * AIM_SCATTER_YAW_SD * 0.5; // tighter after miss
+            aimScatterPitch = rng.nextGaussian() * AIM_SCATTER_PITCH_SD * 0.5;
+            consecutiveMisses = 0;
         }
 
         /* ── Combat strafe ───────────────────────────────────────── */
@@ -966,15 +1055,16 @@ public final class Autopilot {
         }
 
         /* ── Path-following jump ────────────────────────────────────
-         *  If the next waypoint is above us, we need to jump.
-         *  Also jump if there's a 1-block step-up in the next 2 waypoints. */
+         *  Jump only for reachable step-ups (≤1.3 blocks above).
+         *  Waypoints far above (falls, cliffs) should NOT trigger jump. */
         boolean jump = false;
         if (hasPath && !inCombat && player.isOnGround()) {
             for (int look = 0; look < 3 && wpIdx + look < path.size(); look++) {
                 BlockPos wp = path.get(wpIdx + look);
                 double wpY = wp.getY();
                 double playerY = player.getBlockPos().getY();
-                if (wpY > playerY + 0.4) {
+                double dy = wpY - playerY;
+                if (dy > 0.4 && dy <= 1.3) {
                     jump = true;
                     break;
                 }
@@ -982,22 +1072,70 @@ public final class Autopilot {
         }
 
         /* ── Stuck detection ─────────────────────────────────────── */
-        if (lastPos != null && pos.squaredDistanceTo(lastPos) < STUCK_MOVE_SQ && !inCombat) {
+        // Use horizontal distance only — jumping in place shouldn't reset stuck
+        double hdxSq = lastPos != null ? (sq(pos.x - lastPos.x) + sq(pos.z - lastPos.z)) : 999;
+        if (lastPos != null && hdxSq < STUCK_MOVE_SQ && !inCombat) {
             stuckTicks++;
-            if (stuckTicks > STUCK_THRESHOLD) {
-                double kickDeg = (rng.nextBoolean() ? 1 : -1) * (30 + rng.nextDouble() * 30);
-                goalYaw = springYawPos + kickDeg;
-                jump = true;
+            // Fast repath: should be walking but not moving = hitting a wall
+            // Don't waste time with yaw kicks, just repath immediately
+            boolean shouldBeWalking = directPursuit || (hasPath && !inCombat);
+            if (stuckTicks > 12 && shouldBeWalking) {
+                Pathfinder.requestImmediateRepath("wall_stuck");
+                stuckTicks = 0;
+                stuckKicks = 0;
+            } else if (stuckTicks > STUCK_THRESHOLD) {
+                stuckKicks++;
+                if (stuckKicks >= STUCK_KICKS_REPATH) {
+                    Pathfinder.requestImmediateRepath("stuck_repeated");
+                    stuckKicks = 0;
+                } else {
+                    double kickDeg = (rng.nextBoolean() ? 1 : -1) * (30 + rng.nextDouble() * 30);
+                    goalYaw = springYawPos + kickDeg;
+                    jump = true;
+                }
                 stuckTicks = 0;
             }
         } else {
+            if (hdxSq > 4.0) stuckKicks = 0;
             stuckTicks = 0;
         }
         lastPos = pos;
 
+        /* ── Combat stuck: circling mob without hitting ────────── */
+        if (inCombat) {
+            combatStuckTicks++;
+            if (combatStuckTicks > COMBAT_STUCK_THRESHOLD) {
+                // Reposition: step back + sidestep, re-approach from different angle
+                double kickDeg = (rng.nextBoolean() ? 1 : -1) * COMBAT_REPOSITION_ANGLE;
+                goalYaw = springYawPos + kickDeg;
+                aimScatterYaw   = rng.nextGaussian() * AIM_SCATTER_YAW_SD * 0.3;
+                aimScatterPitch = rng.nextGaussian() * AIM_SCATTER_PITCH_SD * 0.3;
+                combatStuckTicks = 0;
+                consecutiveMisses = 0;
+            }
+        } else {
+            combatStuckTicks = 0;
+        }
+
         /* ── Apply keys (rotation is applied in onFrame) ─────────── */
         boolean combatChase = inCombat && mobDist > COMBAT_CHASE_RANGE;
-        boolean forward = hasPath && (!inCombat || combatChase);
+        // directPursuit: close to mob, walk straight at it (ignore path)
+        boolean forward = directPursuit
+            || (hasPath && (!inCombat || combatChase));
+
+        /* ── Graduated turn behavior ──────────────────────────────
+         *  Humans turn and walk simultaneously for moderate angles.
+         *  Only stop for very sharp turns (>90°, walking backwards).
+         *  cos(70°)=0.34 → still forward progress. cos(90°)=0 → none. */
+        double navYawErr = 0;
+        if (forward && !inCombat && !directPursuit) {
+            navYawErr = Math.abs(MathHelper.wrapDegrees(
+                (float)(goalYaw - springYawPos)));
+            if (navYawErr > 90.0) {
+                forward = false;          // walking perpendicular/backwards — stop
+            }
+            // 30-90°: sprint already disabled via SPRINT_DELTA_YAW_MAX
+        }
 
         /* ── Turn slowdown ─────────────────────────────────────────
          *  Humans slow down at sharp corners. Brief W release. */
@@ -1052,6 +1190,50 @@ public final class Autopilot {
         if (attack) {
             ((MinecraftClientInvoker) client).invokeDoAttack();
         }
+
+        // ── Fill debug fields for AutopilotDebugHud ──
+        dbg_inCombat        = inCombat;
+        dbg_directPursuit   = directPursuit;
+        dbg_mobDist         = mobDist;
+        dbg_aimError        = aimErrorToMob;
+        dbg_crosshairOnEntity = crosshairOnEntity;
+        dbg_attackFired     = attack;
+        dbg_consecutiveMisses = consecutiveMisses;
+        dbg_combatStuckTicks = combatStuckTicks;
+        dbg_forward         = forward;
+        dbg_sprint          = shouldSprint && forward;
+        dbg_jump            = jump;
+        dbg_strafeDir       = (strafeLeft || navLeft) ? -1 : (strafeRight || navRight) ? 1 : 0;
+        dbg_pathLen         = hasPath ? path.size() : 0;
+        dbg_wpIndex         = wpIdx;
+        dbg_distToWp        = (hasPath && wpIdx < path.size())
+            ? pos.distanceTo(Vec3d.ofCenter(path.get(wpIdx))) : -1;
+        dbg_distToGoal      = (hasPath)
+            ? pos.distanceTo(Vec3d.ofCenter(path.get(path.size() - 1))) : -1;
+        dbg_stuckTicks      = stuckTicks;
+        dbg_playerX = pos.x; dbg_playerY = pos.y; dbg_playerZ = pos.z;
+        if (hasPath && wpIdx < path.size()) {
+            BlockPos wp = path.get(wpIdx);
+            dbg_wpX = wp.getX() + 0.5; dbg_wpY = wp.getY(); dbg_wpZ = wp.getZ() + 0.5;
+        } else {
+            dbg_wpX = 0; dbg_wpY = 0; dbg_wpZ = 0;
+        }
+        dbg_goalYaw     = goalYaw;
+        dbg_currentYaw  = springYawPos;
+        dbg_goalPitchTick = goalPitch;
+        dbg_currentPitch  = springPitchPos;
+        dbg_pathBlocked = hasPath && client.world != null
+            && isPathBlockedForDebug(client.world, path, wpIdx);
+        if (mob != null && mob.isAlive()) {
+            Vec3d mp = mob.getEntityPos();
+            dbg_mobX = mp.x; dbg_mobY = mp.y; dbg_mobZ = mp.z;
+            dbg_targetName = mob.getType().getTranslationKey();
+        } else {
+            dbg_mobX = 0; dbg_mobY = 0; dbg_mobZ = 0;
+            dbg_targetName = "none";
+        }
+        dbg_repathReason = null;
+        AutopilotDebugHud.tickLog();
     }
 
     /* ══════════════════════════════════════════════════════════════
@@ -1141,8 +1323,10 @@ public final class Autopilot {
             saccadeTargetPitch = springPitchPos + rawDeltaPitch * overshoot;
 
             // Fitts' Law: T = a + b × D, with ±20% variability
-            // Attention: high focus → faster; Fatigue: slower over time
-            double baseTime = SACCADE_FITTS_A + SACCADE_FITTS_B * totalError;
+            // Navigation turns are faster (running player whips camera)
+            // Combat aims are more deliberate
+            double navSpeedup = (!dbg_inCombat && !dbg_directPursuit) ? 0.65 : 1.0;
+            double baseTime = (SACCADE_FITTS_A + SACCADE_FITTS_B * totalError) * navSpeedup;
             double timeVar = 1.0 - SACCADE_TIME_VAR
                 + rng.nextDouble() * 2.0 * SACCADE_TIME_VAR;
             double fatigueMul = 1.0 + fatigue * (1.0 / FATIGUE_OMEGA_MULT - 1.0);
@@ -1266,6 +1450,12 @@ public final class Autopilot {
                 double yawOmega = baseYawOmega;
                 if (absYawError > FLICK_THRESHOLD) {
                     yawOmega *= FLICK_OMEGA_MULT;
+                    if (!dbg_inCombat && absYawError > 45.0) {
+                        yawOmega *= 1.3; // nav: total ~2.08× for large turns
+                    }
+                    if (dbg_inCombat && absYawError > 30.0) {
+                        yawOmega *= 1.4; // combat: snap to mob faster when aim is way off
+                    }
                 } else if (absYawError < HOLD_THRESHOLD) {
                     yawOmega *= HOLD_OMEGA_MULT;
                 }
@@ -1290,6 +1480,11 @@ public final class Autopilot {
                     + SPEED_NOISE_AMP2 * valueNoise(timeS * SPEED_NOISE_FREQ2 + 137.0);
                 yawOmega *= speedMod;
                 double pitchOmega = basePitchOmega * speedMod;
+                // Combat pitch boost — aim was freezing because pitch omega too slow
+                if (dbg_inCombat) {
+                    double pitchError = Math.abs(smoothGoalPitch - springPitchPos);
+                    if (pitchError > 15.0) pitchOmega *= 1.5;
+                }
 
                 // Damping ratios
                 double yawZeta   = (absYawError > UNDERDAMP_THRESHOLD) ? UNDERDAMP_ZETA : 1.0;
@@ -1694,6 +1889,21 @@ public final class Autopilot {
         return landing;
     }
 
+    /** Quick check if any of the next 3 waypoints are inside a solid block (for debug HUD). */
+    private static boolean isPathBlockedForDebug(net.minecraft.client.world.ClientWorld world,
+                                                  List<BlockPos> path, int wpIdx) {
+        for (int i = wpIdx; i < Math.min(path.size(), wpIdx + 3); i++) {
+            BlockPos node = path.get(i);
+            try {
+                BlockPos feet = new BlockPos(node.getX(), node.getY(), node.getZ());
+                if (!world.getBlockState(feet).getCollisionShape(world, feet).isEmpty()) {
+                    return true;
+                }
+            } catch (Exception e) { /* ignore */ }
+        }
+        return false;
+    }
+
     private static double horizontalDist(BlockPos a, BlockPos b) {
         double dx = b.getX() - a.getX();
         double dz = b.getZ() - a.getZ();
@@ -1720,7 +1930,10 @@ public final class Autopilot {
         attackCooldown     = 0;
         combatStrafeDir    = rng.nextBoolean() ? 1 : -1;
         combatStrafeTicks  = COMBAT_STRAFE_MIN + rng.nextInt(COMBAT_STRAFE_MAX - COMBAT_STRAFE_MIN + 1);
+        consecutiveMisses  = 0;
+        combatStuckTicks   = 0;
         stuckTicks         = 0;
+        stuckKicks         = 0;
         lastPos            = null;
         inCombat           = false;
         // Human-like behavioral state

@@ -1147,12 +1147,15 @@ public final class Autopilot {
             // 30-90°: sprint already disabled via SPRINT_DELTA_YAW_MAX
         }
 
-        // Combat: don't walk forward if camera points away from mob
-        // (prevents overshooting and walking away after passing through mob)
-        if (inCombat) {
+        // Combat/pursuit: distance-aware forward control.
+        // Close range (< 2 blocks): strict aim required — prevents sprinting
+        //   through mob then standing behind it for 1-2 seconds rotating 180°.
+        // Far range (> 2 blocks): looser — can approach while camera adjusts.
+        if (inCombat || directPursuit) {
             double combatAimErr = Math.abs(MathHelper.wrapDegrees(
                 (float)(goalYaw - springYawPos)));
-            if (combatAimErr > 45) forward = false;
+            double maxCombatAim = (mobDist < 2.0) ? 25.0 : 60.0;
+            if (combatAimErr > maxCombatAim) forward = false;
         }
 
         /* ── Turn slowdown ─────────────────────────────────────────
@@ -1428,12 +1431,17 @@ public final class Autopilot {
             // to spring. Saccades are ballistic (fixed trajectory) — they can't
             // track moving targets. The spring is adaptive and actually faster
             // (84°/s avg vs 54°/s for restart-plagued saccades).
-            double shiftYaw   = MathHelper.wrapDegrees((float)(smoothGoalYaw - saccadeTargetYaw));
-            double shiftPitch = smoothGoalPitch - saccadeTargetPitch;
-            if (Math.abs(shiftYaw) > 30 || Math.abs(shiftPitch) > 30) {
-                inSaccade = false;
-                // Keep current velocity for smooth hand-off to spring
-                // (spring picks up from springYawVel/springPitchVel)
+            // Grace period: smoothGoalYaw takes ~100ms to converge after a goal
+            // change (tau=20ms melee). Cancelling during convergence kills velocity
+            // because the saccade barely started (vel≈0 at tau<0.1).
+            // Wait 200ms so the saccade builds speed before checking for shifts.
+            if (saccadeElapsed > 0.2) {
+                double shiftYaw   = MathHelper.wrapDegrees((float)(smoothGoalYaw - saccadeTargetYaw));
+                double shiftPitch = smoothGoalPitch - saccadeTargetPitch;
+                if (Math.abs(shiftYaw) > 30 || Math.abs(shiftPitch) > 30) {
+                    inSaccade = false;
+                    // Keep current velocity for smooth hand-off to spring
+                }
             }
 
             if (inSaccade) {
@@ -1526,6 +1534,13 @@ public final class Autopilot {
                     }
                     if (dbg_inCombat && absYawError > 30.0) {
                         yawOmega *= 1.4; // combat: snap to mob faster when aim is way off
+                    }
+                    // Combat with massive error: floor omega at 14 so camera
+                    // never stalls at 16°/s — ensures ~200°/s peak for 150° turns.
+                    // This catches edge cases where attention/fatigue/scale
+                    // stack unfavorably and drag omega below useful levels.
+                    if ((dbg_inCombat || dbg_directPursuit) && absYawError > 60.0) {
+                        yawOmega = Math.max(yawOmega, 14.0);
                     }
                 } else if (absYawError < HOLD_THRESHOLD) {
                     // Hold zone: slow down for precise aiming (combat only).

@@ -63,7 +63,7 @@ public final class Autopilot {
     //    Slight under-damping on big moves → natural overshoot.
     //    Slow-varying speed modulation → not always same pace.
     //    Rare micro-impulses → occasional tiny hand-tremor jerks.
-    private static final double NAV_YAW_OMEGA      = 5.0;       // base ω for navigation
+    private static final double NAV_YAW_OMEGA      = 7.0;       // base ω for navigation
     private static final double COMBAT_YAW_OMEGA   = 8.0;       // base ω for combat
     private static final double NAV_PITCH_OMEGA     = 4.0;
     private static final double COMBAT_PITCH_OMEGA  = 8.0;
@@ -596,9 +596,12 @@ public final class Autopilot {
             newGoalYaw = yawTo(pos, pursuitTarget);
         }
 
-        /* ── Combat aim blending ─────────────────────────────────── */
+        /* ── Combat aim blending ───────────────────────────────────
+         *  Run-through mode: bot sprints through mob, attacks on crosshair.
+         *  No stopping, no strafing — path goes past the mob.
+         *  Camera follows path (Pure Pursuit), with increasing mob aim blend. */
         inCombat = false;
-        boolean directPursuit = false; // within DIRECT_PURSUIT_RANGE: ignore path, walk at mob
+        boolean directPursuit = false;
         double  mobDist  = Double.MAX_VALUE;
         Vec3d   mobPos   = null;
 
@@ -609,13 +612,13 @@ public final class Autopilot {
             if (mobDist < PRE_AIM_RANGE) {
                 double mobYaw = yawTo(pos, mobPos) + aimScatterYaw;
                 if (mobDist < ATTACK_RANGE) {
+                    // In attack range: aim at mob but keep running (run-through)
                     inCombat = true;
                     newGoalYaw = mobYaw;
                 } else if (mobDist < DIRECT_PURSUIT_RANGE) {
-                    // Close enough to see the mob — walk straight at it,
-                    // don't follow pathfinder to a stale standoff point
-                    directPursuit = true;
-                    newGoalYaw = mobYaw;
+                    // Blend path direction with mob direction — don't abandon path
+                    double pursuitBlend = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (DIRECT_PURSUIT_RANGE - ATTACK_RANGE));
+                    newGoalYaw = lerpAngle(newGoalYaw, mobYaw, 0.3 + 0.7 * pursuitBlend);
                 } else {
                     double t = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
                     newGoalYaw = lerpAngle(newGoalYaw, mobYaw, t * AIM_BLEND_FAR);
@@ -927,14 +930,13 @@ public final class Autopilot {
             if (turnAhead > SPRINT_ANGLE_THRESH) shouldSprint = false;
         }
         if (springError > SPRINT_DELTA_YAW_MAX) shouldSprint = false;
-        if (inCombat || directPursuit) shouldSprint = false;
-        if (mob != null && mob.isAlive() && mobDist < BRAKE_RANGE) shouldSprint = false;
+        // Run-through: keep sprinting in combat for sprint-attack damage bonus
+        // Run-through: no braking near mob — sprint through for max damage
 
         /* ── Sprint timing (human-like) ────────────────────────────
          *  1. Delay sprint 4-9 ticks after starting forward movement
          *  2. Occasional 2-4 tick gaps every 80-240 ticks of sprinting */
-        boolean forwardNow = directPursuit
-            || (hasPath && (!inCombat || (inCombat && mobDist > COMBAT_CHASE_RANGE)));
+        boolean forwardNow = hasPath || inCombat;
         if (forwardNow && !wasMovingForward) {
             // Just started moving — delay sprint like a human pressing shift after W
             sprintDelayRemaining = SPRINT_DELAY_MIN
@@ -1040,19 +1042,9 @@ public final class Autopilot {
             consecutiveMisses = 0;
         }
 
-        /* ── Combat strafe ───────────────────────────────────────── */
+        /* ── Combat strafe ─────────────────────────────────────────
+         *  Run-through mode: no strafing. Bot sprints through mob.  */
         boolean strafeLeft = false, strafeRight = false;
-
-        if (inCombat && mobDist < COMBAT_CHASE_RANGE) {
-            combatStrafeTicks--;
-            if (combatStrafeTicks <= 0) {
-                combatStrafeDir = -combatStrafeDir;
-                combatStrafeTicks = COMBAT_STRAFE_MIN
-                    + rng.nextInt(COMBAT_STRAFE_MAX - COMBAT_STRAFE_MIN + 1);
-            }
-            if (combatStrafeDir > 0) strafeRight = true;
-            else                     strafeLeft  = true;
-        }
 
         /* ── Path-following jump ────────────────────────────────────
          *  Jump only for reachable step-ups (≤1.3 blocks above).
@@ -1064,7 +1056,7 @@ public final class Autopilot {
                 double wpY = wp.getY();
                 double playerY = player.getBlockPos().getY();
                 double dy = wpY - playerY;
-                if (dy > 0.4 && dy <= 1.3) {
+                if (dy > 0.6 && dy <= 1.3) {
                     jump = true;
                     break;
                 }
@@ -1118,17 +1110,16 @@ public final class Autopilot {
         }
 
         /* ── Apply keys (rotation is applied in onFrame) ─────────── */
-        boolean combatChase = inCombat && mobDist > COMBAT_CHASE_RANGE;
-        // directPursuit: close to mob, walk straight at it (ignore path)
-        boolean forward = directPursuit
-            || (hasPath && (!inCombat || combatChase));
+        // Run-through: always keep running, even in combat.
+        // The path goes past the mob — bot sprints through and attacks on the fly.
+        boolean forward = hasPath || (inCombat && mobDist < ATTACK_RANGE);
 
         /* ── Graduated turn behavior ──────────────────────────────
          *  Humans turn and walk simultaneously for moderate angles.
          *  Only stop for very sharp turns (>90°, walking backwards).
          *  cos(70°)=0.34 → still forward progress. cos(90°)=0 → none. */
         double navYawErr = 0;
-        if (forward && !inCombat && !directPursuit) {
+        if (forward && !inCombat) {
             navYawErr = Math.abs(MathHelper.wrapDegrees(
                 (float)(goalYaw - springYawPos)));
             if (navYawErr > 90.0) {
@@ -1268,12 +1259,14 @@ public final class Autopilot {
 
         // ══ Layer 1: Goal smoothing ══════════════════════════════
         //    Low-pass filter: goalYaw changes at 20Hz tick rate.
-        //    Real humans have ~100ms visual processing delay before
-        //    their hand begins to respond to a target shift.
-        //    Attention modulates: high focus → faster response.
+        //    Combat: 100ms delay simulates visual processing before aiming.
+        //    Navigation: near-instant tracking — player anticipates the path,
+        //    no reaction delay needed. The spring itself provides all smoothing.
         // Fatigue increases visual processing delay over long sessions
         double fatigueLag = 1.0 + fatigue * (FATIGUE_LAG_MULT - 1.0);
-        double effectiveTau = GOAL_LAG_TAU * fatigueLag / (0.5 + 0.5 * attention);
+        boolean isNavigating = !dbg_inCombat && !dbg_directPursuit;
+        double baseTau = isNavigating ? 0.015 : GOAL_LAG_TAU; // 15ms nav vs 100ms combat
+        double effectiveTau = baseTau * fatigueLag / (0.5 + 0.5 * attention);
         double alpha = 1.0 - Math.exp(-dt / effectiveTau);
         smoothGoalYaw   += MathHelper.wrapDegrees((float)(goalYaw   - smoothGoalYaw))   * alpha;
         smoothGoalPitch += (goalPitch - smoothGoalPitch) * alpha;
@@ -1399,11 +1392,18 @@ public final class Autopilot {
             if (tau >= 1.0) {
                 // Saccade complete — velocity is zero (minJerk deriv = 0 at τ=1)
 
-                // Post-saccade corrections: 1-3 discrete pauses before smooth tracking
-                // Humans evaluate aim error visually, then make small adjustments
-                postSaccadeDwell = CORRECTION_PAUSE_MIN
-                    + rng.nextDouble() * (CORRECTION_PAUSE_MAX - CORRECTION_PAUSE_MIN);
-                postSaccadeCorrections = 1 + rng.nextInt(2); // 1-2 more pauses
+                // Post-saccade corrections: discrete pauses before smooth tracking.
+                // Only in combat/pursuit — humans evaluate aim visually.
+                // During navigation, mouse moves continuously (no "evaluate aim" pause).
+                boolean needsAimEval = dbg_inCombat || dbg_directPursuit;
+                if (needsAimEval) {
+                    postSaccadeDwell = CORRECTION_PAUSE_MIN
+                        + rng.nextDouble() * (CORRECTION_PAUSE_MAX - CORRECTION_PAUSE_MIN);
+                    postSaccadeCorrections = 1 + rng.nextInt(2); // 1-2 more pauses
+                } else {
+                    postSaccadeDwell = 0;
+                    postSaccadeCorrections = 0;
+                }
 
                 // Post-saccadic oscillation: wrist resonance after fast flick
                 // Amplitude proportional to how fast the saccade peaked
@@ -1457,7 +1457,11 @@ public final class Autopilot {
                         yawOmega *= 1.4; // combat: snap to mob faster when aim is way off
                     }
                 } else if (absYawError < HOLD_THRESHOLD) {
-                    yawOmega *= HOLD_OMEGA_MULT;
+                    // Hold zone: slow down for precise aiming (combat only).
+                    // Navigation needs continuous smooth tracking, not careful aim.
+                    if (dbg_inCombat || dbg_directPursuit) {
+                        yawOmega *= HOLD_OMEGA_MULT;
+                    }
                 }
 
                 // Re-roll omega scale when starting a new correction
@@ -1468,7 +1472,8 @@ public final class Autopilot {
                 wasInHoldZone = nowInHoldZone;
 
                 // Trigger next post-saccade pause when error drops below threshold
-                if (postSaccadeCorrections > 0 && absYawError < CORRECTION_THRESH) {
+                if (postSaccadeCorrections > 0 && absYawError < CORRECTION_THRESH
+                        && (dbg_inCombat || dbg_directPursuit)) {
                     postSaccadeCorrections--;
                     postSaccadeDwell = CORRECTION_INTER_MIN
                         + rng.nextDouble() * (CORRECTION_INTER_MAX - CORRECTION_INTER_MIN);
@@ -1494,7 +1499,8 @@ public final class Autopilot {
                 double yawAccel = yawOmega * yawOmega * yawError
                                 - 2.0 * yawZeta * yawOmega * springYawVel;
                 // Soft-limit acceleration: human arms have max force
-                double maxAccel = 2500.0; // deg/s² — reasonable for wrist flick
+                // Navigation: higher limit — player whips mouse for big turns
+                double maxAccel = isNavigating ? 5000.0 : 2500.0;
                 if (Math.abs(yawAccel) > maxAccel) {
                     yawAccel = Math.signum(yawAccel) * maxAccel
                         * Math.tanh(Math.abs(yawAccel) / maxAccel);

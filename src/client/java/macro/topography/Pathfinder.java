@@ -262,6 +262,7 @@ public class Pathfinder {
         private final int sizeY;
         private final int sizeZ;
         private final BitSet solidBits;
+        private final byte[] collisionMaxY; // collision shape maxY × 16 (0=passable, 8=slab, 16=full)
         private final boolean empty;
 
         private BlockCache(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
@@ -280,11 +281,14 @@ public class Pathfinder {
                 this.sizeY = 0;
                 this.sizeZ = 0;
                 this.solidBits = new BitSet();
+                this.collisionMaxY = new byte[0];
             } else {
                 this.empty = false;
                 this.sizeY = sy;
                 this.sizeZ = sz;
-                this.solidBits = new BitSet(sx * sy * sz);
+                int total = sx * sy * sz;
+                this.solidBits = new BitSet(total);
+                this.collisionMaxY = new byte[total];
             }
         }
 
@@ -340,8 +344,12 @@ public class Pathfinder {
                                 mutable.set(x, y, z);
                                 try {
                                     BlockState state = chunk.getBlockState(mutable);
-                                    boolean solid = !state.getCollisionShape(world, mutable).isEmpty();
+                                    net.minecraft.util.shape.VoxelShape shape = state.getCollisionShape(world, mutable);
+                                    boolean solid = !shape.isEmpty();
                                     cache.setSolid(x, y, z, solid);
+                                    if (solid) {
+                                        cache.setBlockCollisionMaxY(x, y, z, shape.getMax(net.minecraft.util.math.Direction.Axis.Y));
+                                    }
                                 } catch (Exception e) {
                                     // Unknown states are treated as passable.
                                 }
@@ -400,6 +408,17 @@ public class Pathfinder {
         private void setSolid(int x, int y, int z, boolean solid) {
             if (!solid || !inBounds(x, y, z)) return;
             solidBits.set(index(x, y, z));
+        }
+
+        private void setBlockCollisionMaxY(int x, int y, int z, double maxYInBlock) {
+            if (!inBounds(x, y, z)) return;
+            collisionMaxY[index(x, y, z)] = (byte) Math.min(16, Math.max(0, (int)(maxYInBlock * 16)));
+        }
+
+        /** Get collision shape max Y (0.0-1.0) for block at given coords. 0 = passable. */
+        double getCollisionMaxY(int x, int y, int z) {
+            if (!inBounds(x, y, z)) return 0.0;
+            return (collisionMaxY[index(x, y, z)] & 0xFF) / 16.0;
         }
     }
 
@@ -1137,14 +1156,17 @@ public class Pathfinder {
                 // Use tag position for navigation (it's directly above the mob)
                 BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
 
-                // Find standable goal near the mob, offset toward player
-                Vec3d toPlayer = pPos.subtract(tagPos);
-                double hDist = Math.sqrt(toPlayer.x * toPlayer.x + toPlayer.z * toPlayer.z);
+                // Run-through: path goes PAST the mob (3 blocks beyond).
+                // Bot sprints through, attacks on crosshair, keeps running.
+                Vec3d toMob = tagPos.subtract(pPos);
+                double hDist = Math.sqrt(toMob.x * toMob.x + toMob.z * toMob.z);
 
                 if (hDist > 0.1) {
-                    for (double dist = ATTACK_STANDOFF; dist >= 0; dist -= 0.5) {
-                        Vec3d offset = new Vec3d(toPlayer.x / hDist * dist, 0,
-                                                 toPlayer.z / hDist * dist);
+                    // Place goal 3 blocks past the mob along approach direction
+                    double passThrough = 3.0;
+                    for (double dist = passThrough; dist >= 0; dist -= 0.5) {
+                        Vec3d offset = new Vec3d(toMob.x / hDist * dist, 0,
+                                                 toMob.z / hDist * dist);
                         Vec3d goal = tagPos.add(offset);
                         BlockPos gb = BlockPos.ofFloored(goal.x, goal.y, goal.z);
                         // Try current Y down to -15 (name tag can float well above mob/ground)
@@ -1879,6 +1901,11 @@ public class Pathfinder {
             if (!cache.isPassable(x, y + 2, z)) continue;        // clearance above head for jump
             if (!cache.isStandable(nx, ny, nz)) continue;
             if (!cache.isPassable(nx, ny + 2, nz)) continue;     // head clearance at destination+1
+            // Check actual step height using collision shapes — reject unjumpable steps (>1.25 blocks)
+            double srcFloorH = cache.getCollisionMaxY(x, y - 1, z);   // source floor surface
+            double dstFloorH = cache.getCollisionMaxY(nx, ny - 1, nz); // dest floor surface
+            double actualStep = 1.0 + dstFloorH - srcFloorH; // base 1 block + height difference
+            if (actualStep > 1.25) continue;
             // Diagonal corner check
             if (d[0] != 0 && d[1] != 0) {
                 if (!cache.isPassable(x + d[0], ny, z) || !cache.isPassable(x + d[0], ny + 1, z)

@@ -15,6 +15,7 @@ public final class TopographyController {
     // Per-mode keybind state: modeId -> wasPressed
     private static final Map<Integer, Boolean> keyWasPressed = new HashMap<>();
     private static boolean rshiftWasPressed;
+    private static boolean f7WasPressed;
 
     // Zone transition tracking
     private static final Map<Integer, Boolean> wasInZone = new HashMap<>();
@@ -111,8 +112,23 @@ public final class TopographyController {
 
         checkZoneTransitions(client);
 
-        // RSHIFT opens menu
+        // F7 = camera debug HUD, Shift+F7 = CSV toggle
         long window = client.getWindow().getHandle();
+        {
+            boolean f7Down = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_F7) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            boolean shiftDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_SHIFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            if (f7Down && !f7WasPressed) {
+                if (shiftDown) {
+                    CameraDebugHud.toggleCsv();
+                    notify("Camera CSV " + (CameraDebugHud.isCsvEnabled() ? "started" : "stopped"));
+                } else {
+                    CameraDebugHud.toggleHud();
+                }
+            }
+            f7WasPressed = f7Down;
+        }
+
+        // RSHIFT opens menu
         {
             boolean rshiftDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT_SHIFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
             if (rshiftDown && !rshiftWasPressed && client.currentScreen == null) {

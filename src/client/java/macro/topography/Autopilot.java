@@ -77,16 +77,106 @@ public final class Autopilot {
     private static final double UNDERDAMP_THRESHOLD = 15.0;  // deg — above this = under-damp
     private static final double UNDERDAMP_ZETA      = 0.82;  // damping ratio (1.0=critical, 0.82→~5% overshoot)
 
-    // Slow-varying speed modulation (aperiodic via two incommensurate sines)
-    private static final double SPEED_MOD_AMP1 = 0.12;     // ±12% variation
-    private static final double SPEED_MOD_FREQ1 = 1.7;     // rad/s (period ~3.7s)
-    private static final double SPEED_MOD_AMP2 = 0.08;     // ±8% variation
-    private static final double SPEED_MOD_FREQ2 = 0.6;     // rad/s (period ~10.5s)
+    // ── Saccade: minimum-jerk trajectory for large moves ──────
+    //    Replaces spring for >18° moves. Bell-shaped velocity profile
+    //    matching real human motor control (Flash & Hogan 1985).
+    //    Spring is fundamentally wrong for large moves — exponential
+    //    approach vs. the real S-curve with peak velocity at ~40%.
+    private static final double SACCADE_THRESHOLD = 18.0;   // deg — above this, use min-jerk
+    private static final double SACCADE_FITTS_A   = 0.12;   // base movement time (s)
+    private static final double SACCADE_FITTS_B   = 0.008;  // seconds per degree of rotation
+    private static final double SACCADE_TIME_VAR  = 0.20;   // ±20% movement time variability
 
-    // Micro-impulses (hand tremor)
-    private static final double IMPULSE_CHANCE_PER_SEC = 0.5;  // ~once every 2 seconds
-    private static final double IMPULSE_YAW_STRENGTH   = 12.0; // deg/s velocity kick
-    private static final double IMPULSE_PITCH_STRENGTH = 5.0;  // deg/s (pitch tremor is smaller)
+    // ── Physiological tremor (narrow-band ~10Hz) ──────────────
+    //    Continuous oscillation matching real hand tremor spectrum.
+    //    NOT random impulses — real tremor is autocorrelated 8-12Hz
+    //    with slowly drifting amplitude and frequency.
+    private static final double TREMOR_YAW_AMP    = 0.08;   // degrees base amplitude
+    private static final double TREMOR_PITCH_AMP  = 0.05;   // degrees (pitch tremor smaller)
+    private static final double TREMOR_YAW_FREQ   = 10.0;   // Hz center frequency
+    private static final double TREMOR_PITCH_FREQ = 9.3;    // Hz (slightly different — decorrelated)
+
+    // ── Goal smoothing (visual processing delay ~100ms) ───────
+    //    Simulates the ~100ms visual-cortex latency before the hand
+    //    reacts to a change in the target position.
+    private static final double GOAL_LAG_TAU      = 0.10;   // seconds (100ms time constant)
+
+    // ── Speed modulation (1/f noise, not periodic sines) ──────
+    //    Value noise at two octaves → aperiodic biological variation.
+    //    No detectable frequency peaks under Fourier analysis.
+    private static final double SPEED_NOISE_AMP1  = 0.12;   // ±12% slow drift
+    private static final double SPEED_NOISE_FREQ1 = 0.4;    // Hz
+    private static final double SPEED_NOISE_AMP2  = 0.06;   // ±6% faster variation
+    private static final double SPEED_NOISE_FREQ2 = 0.9;    // Hz
+
+    // ── Post-saccade corrections (discrete sub-movements) ───────
+    //    Humans don't smoothly converge after a saccade. They pause
+    //    50-150ms (visual evaluation), then make 1-2 small discrete
+    //    corrections — each followed by another brief pause.
+    private static final double CORRECTION_PAUSE_MIN  = 0.06;  // first pause after saccade (s)
+    private static final double CORRECTION_PAUSE_MAX  = 0.16;
+    private static final double CORRECTION_INTER_MIN  = 0.04;  // inter-correction pauses (s)
+    private static final double CORRECTION_INTER_MAX  = 0.10;
+    private static final double CORRECTION_THRESH     = 3.0;   // deg — error below this → pause
+    private static final double CORRECTION_DAMP_RATE  = 25.0;  // velocity decay during pause (1/s)
+
+    // ── Post-saccadic oscillation (mechanical wrist resonance) ─
+    //    After a fast flick, hand/wrist oscillates ~3Hz for ~250ms.
+    //    Distinct from tremor — transient response to deceleration.
+    private static final double POST_SACC_OSC_FREQ    = 3.2;   // Hz
+    private static final double POST_SACC_OSC_DECAY   = 12.0;  // decay rate (1/s)
+    private static final double POST_SACC_OSC_GAIN    = 0.0008; // amplitude = peak_vel × gain (max ~0.4°)
+
+    // ── Attention model (slow-varying focus/alertness) ────────
+    //    Modulates reaction time, omega, tremor, accuracy.
+    //    Simulates natural focus fluctuations over 3-13s cycles.
+    private static final double ATTENTION_MIN          = 0.78;
+    private static final double ATTENTION_MAX          = 1.22;
+    private static final double ATTENTION_DRIFT_RATE   = 0.02;  // convergence per tick
+    private static final int    ATTENTION_CHANGE_MIN   = 60;    // ticks between re-rolls (3s)
+    private static final int    ATTENTION_CHANGE_MAX   = 260;   // (13s)
+
+    // ── Endpoint scatter (per-aim-attempt imprecision) ────────
+    //    Even aiming at the same point, humans hit different angles.
+    //    Re-rolled each time a new mob target is acquired.
+    private static final double AIM_SCATTER_YAW_SD     = 1.2;   // degrees σ
+    private static final double AIM_SCATTER_PITCH_SD   = 0.8;   // degrees σ
+
+    // ── Mouse lift (physical mouse repositioning) ──────────────
+    //    For very large rotations (>100°), humans physically lift the
+    //    mouse and reposition it. Brief ~80-120ms pause mid-saccade.
+    private static final double MOUSE_LIFT_THRESHOLD  = 100.0;  // deg — saccade size to trigger
+    private static final double MOUSE_LIFT_TAU_START  = 0.35;   // pause starts at ~35% through saccade
+    private static final double MOUSE_LIFT_TAU_END    = 0.42;   // pause ends at ~42%
+    private static final double MOUSE_LIFT_PAUSE_MIN  = 0.07;   // seconds
+    private static final double MOUSE_LIFT_PAUSE_MAX  = 0.12;
+
+    // ── Correlated tremor (diagonal hand tendency) ────────────
+    //    Real hand movement has off-axis coupling: when yaw trembles,
+    //    pitch moves too (and vice versa). Correlation ~0.3-0.5.
+    private static final double TREMOR_CORRELATION    = 0.35;   // cross-axis coupling factor
+
+    // ── Breathing rhythm (chest movement → pitch) ─────────────
+    //    Ultra-subtle ~0.25Hz pitch oscillation. Always present.
+    //    Amplitude varies with breathing depth (slow noise modulation).
+    private static final double BREATH_FREQ           = 0.25;   // Hz (~15 breaths/min)
+    private static final double BREATH_AMP            = 0.6;    // degrees base amplitude (needs >1 pixel at most sensitivities)
+    private static final double BREATH_FREQ_DRIFT     = 0.04;   // Hz drift range
+
+    // ── Fatigue model (session degradation) ───────────────────
+    //    Over 10+ minutes: tremor increases, reaction slows,
+    //    attention range narrows. Resets on start().
+    private static final double FATIGUE_ONSET_SEC     = 600.0;  // 10 min before noticeable
+    private static final double FATIGUE_MAX           = 0.35;   // max fatigue factor (0-1)
+    private static final double FATIGUE_TREMOR_MULT   = 1.6;    // tremor × at max fatigue
+    private static final double FATIGUE_LAG_MULT      = 1.3;    // goal lag × at max fatigue
+    private static final double FATIGUE_OMEGA_MULT    = 0.85;   // omega × at max fatigue
+
+    // ── Asymmetric overshoot (humans overshoot > undershoot) ──
+    //    After saccade, add a small overshoot bias. Saccade target
+    //    is nudged slightly past the real goal.
+    private static final double OVERSHOOT_BIAS        = 0.04;   // 4% overshoot bias
+    private static final double OVERSHOOT_VARIANCE    = 0.03;   // ±3% random variation
 
     // ── Stuck detection ─────────────────────────────────────────
     private static final int    STUCK_THRESHOLD = 25;
@@ -115,8 +205,17 @@ public final class Autopilot {
     private static final int    NAV_STRAFE_MAX_TICKS = 8;
 
     // Idle head scanning: humans look around when running straight
-    private static final int    IDLE_SCAN_AFTER      = 30;    // ticks of straight running
+    private static final int    IDLE_SCAN_AFTER      = 15;    // ticks of straight running (0.75s)
     private static final double IDLE_SCAN_AMP        = 3.5;   // degrees max drift
+
+    // Walking head-bob: subtle pitch oscillation from walking cadence.
+    // Real humans have slight vertical camera movement when running.
+    // Low frequencies prevent ±1px alternation (dithering jitter) —
+    // each half-cycle spans many frames, producing smooth multi-pixel sweeps.
+    private static final double HEAD_BOB_FREQ        = 1.7;   // Hz (relaxed stride rhythm)
+    private static final double HEAD_BOB_AMP         = 0.55;  // degrees (~6.5 pixels per half-cycle)
+    private static final double HEAD_BOB_FREQ2       = 0.6;   // Hz (slow body sway)
+    private static final double HEAD_BOB_AMP2        = 0.4;   // degrees
 
     // Combat reaction: humans don't attack the frame a mob enters range
     private static final int    REACTION_MIN_TICKS   = 3;     // 150ms
@@ -124,6 +223,31 @@ public final class Autopilot {
 
     // W micro-releases: humans' fingers aren't perfectly still
     private static final double W_MICRORELEASE_CHANCE = 0.004; // per-tick (~once per 12.5 sec)
+
+    // ── Fall camera: human-like look-down during falls ────────────
+    //    Humans instinctively look toward landing zone when falling.
+    //    5 phases: pre-edge peek → reaction delay → active tracking →
+    //    pre-landing brace → post-landing bounce.
+    private static final double FALL_VELOCITY_THRESH  = -0.18;  // y vel to detect falling (bl/tick) — ignore stairs/slopes (~0.08)
+    private static final int    FALL_REACTION_MIN     = 3;      // ticks before camera reacts (150ms)
+    private static final int    FALL_REACTION_MAX     = 7;      // max reaction delay (350ms)
+    private static final double FALL_MAX_PITCH        = 62.0;   // max downward pitch (humans don't look 90° down)
+    private static final double FALL_RAMP_TICKS       = 8.0;    // ticks to smoothly ramp in fall-look
+    private static final double FALL_BRACE_SECONDS    = 0.35;   // seconds before landing to start recovering
+    private static final double FALL_BRACE_RECOVERY   = 0.55;   // how much pitch recovers before landing (0-1)
+    private static final double FALL_PITCH_OMEGA      = 5.5;    // pitch spring ω during fall (faster than nav)
+    private static final double FALL_PITCH_ZETA       = 0.92;   // slight underdamp for natural fall tracking
+    private static final double FALL_TREMOR_MULT      = 2.2;    // hand tremor multiplier during falls (anxiety)
+    private static final double FALL_BOUNCE_STRENGTH  = 8.0;    // pitch velocity kick on landing (impact feel)
+    private static final double FALL_LOOKAHEAD_MULT   = 1.5;    // yaw lookahead boost during long falls
+    // ── Pre-edge peek: look at the EDGE, not through the floor ──
+    private static final int    PRE_PEEK_SCAN_WPS     = 20;     // waypoints ahead to scan for edges
+    private static final double PRE_PEEK_MIN_DROP     = 3.0;    // minimum Y drop to consider it an edge (ignore stairs)
+    private static final double PRE_PEEK_START_DIST   = 12.0;   // blocks — start subtle glance-down
+    private static final double PRE_PEEK_FULL_DIST    = 3.0;    // blocks — full peek at edge point
+    private static final double PRE_PEEK_EARLY_PITCH  = 5.0;    // degrees — subtle initial glance (far from edge)
+    private static final double PRE_PEEK_SKIP_CHANCE  = 0.15;   // 15% chance to not pre-peek (distracted)
+    private static final double PRE_PEEK_DIST_VAR     = 0.20;   // ±20% variation in start distance
 
     /* ══════════════════════════════════════════════════════════════
      *  STATE
@@ -142,6 +266,73 @@ public final class Autopilot {
     private static double springYawPos = 0, springYawVel = 0;
     private static double springPitchPos = 0, springPitchVel = 0;
     private static long   lastFrameNano = 0;
+
+    // Smoothed goals (visual processing delay)
+    private static double smoothGoalYaw = 0, smoothGoalPitch = 0;
+
+    // Saccade (minimum-jerk trajectory for large moves)
+    private static boolean inSaccade = false;
+    private static double saccadeStartYaw, saccadeStartPitch;
+    private static double saccadeTargetYaw, saccadeTargetPitch;
+    private static double saccadeDuration, saccadeElapsed;
+
+    // Physiological tremor phase accumulators
+    private static double tremorYawPhase = 0, tremorPitchPhase = 0;
+
+    // Movement-to-movement variability (re-rolled per saccade/movement)
+    private static double moveOmegaScale = 1.0;
+    private static boolean wasInHoldZone = false;
+
+    // Post-saccade corrections (discrete sub-movements with pauses)
+    private static double postSaccadeDwell = 0;       // seconds of pause remaining
+    private static int    postSaccadeCorrections = 0;  // pauses left to inject
+
+    // Post-saccadic oscillation (transient wrist resonance after flick)
+    private static double postSaccOscPhase = 0;
+    private static double postSaccOscAmp = 0;
+    private static double postSaccOscStartTime = 0;
+
+    // Attention model (slow-varying focus)
+    private static double attention = 1.0;
+    private static double attentionTarget = 1.0;
+    private static int    nextAttentionChangeTick = 0;
+    private static int    tickCounter = 0;
+
+    // Endpoint scatter (per aim attempt)
+    private static double aimScatterYaw = 0;
+    private static double aimScatterPitch = 0;
+
+    // Mouse lift state (mid-saccade pause for large rotations)
+    private static double mouseLiftPause = 0;
+    private static boolean mouseLiftDone = false;
+
+    // Breathing phase
+    private static double breathPhase = 0;
+
+    // Head-bob phase (walking cadence)
+    private static double headBobPhase = 0;
+
+    // Fatigue
+    private static long sessionStartNano = 0;
+    private static double fatigue = 0; // 0..FATIGUE_MAX
+
+    // Mouse quantization: error diffusion carries sub-pixel remainder
+    // between frames so micro-movements (tremor, breathing) accumulate
+    // and eventually produce a real pixel step — like a DAC with dithering.
+    private static double quantErrorYaw   = 0;
+    private static double quantErrorPitch = 0;
+
+    // Double-precision angle tracking — avoids float precision loss from
+    // player.getYaw() (float). Without this, ~20% of deltas land off the
+    // mouse sensitivity grid because float→double roundtrip corrupts values.
+    private static double trackedYaw   = 0;
+    private static double trackedPitch = 0;
+
+    // Pitch hysteresis: suppress ±1px alternation (dithering jitter).
+    // When tremor/bob oscillates near a pixel boundary, error diffusion
+    // creates rapid +1/-1 alternation that looks robotic. This tracks the
+    // last non-zero pitch direction to add a small hysteresis band.
+    private static long lastPitchDir = 0; // +1 or -1, direction of last pitch step
 
     // Combat
     private static int attackCooldown = 0;
@@ -174,12 +365,46 @@ public final class Autopilot {
     private static UUID lastCombatTargetId = null;
     private static int combatReactionRemaining = 0;
 
+    // Fall camera
+    private static boolean isFallingCamera = false;
+    private static int fallingCameraTicks = 0;
+    private static int fallReactionDelay = 0;
+    private static Vec3d fallLandingPos = null;
+
+    // Pre-edge peek state
+    private static boolean preEdgeActive = false;   // currently peeking toward edge
+    private static Vec3d   preEdgePos = null;        // position of the edge waypoint
+    private static double  preEdgeStartDist = 0;     // personalized start distance (with variance)
+    private static boolean preEdgeSkip = false;       // this approach: skip pre-peek (distracted)
+    private static double  preEdgePeekStrength = 0;   // current blend 0..1
+
     /* ══════════════════════════════════════════════════════════════
      *  PUBLIC API
      * ══════════════════════════════════════════════════════════════ */
 
     public static boolean isEnabled()      { return enabled; }
     public static int     getTargetMode()  { return targetMode; }
+
+    // ── Debug data (read by CameraDebugHud) ───────────────────
+    static boolean dbg_saccadeActive;
+    static double  dbg_saccadeTau;
+    static double  dbg_yawVel, dbg_pitchVel;
+    static double  dbg_goalYawRaw, dbg_goalPitchRaw;
+    static double  dbg_goalYawSmooth, dbg_goalPitchSmooth;
+    static double  dbg_springYaw, dbg_springPitch;
+    static double  dbg_tremorYaw, dbg_tremorPitch;
+    static double  dbg_omegaScale;
+    static boolean dbg_falling;
+    static double  dbg_totalError;
+    static double  dbg_attention;
+    static boolean dbg_inDwell;
+    static int     dbg_correctionsLeft;
+    static double  dbg_fatigue;
+    static double  dbg_breathOffset;
+    static boolean dbg_mouseLift;
+    static boolean dbg_preEdge;
+    static double  dbg_preEdgeStrength;
+    static double  dbg_preEdgeDist;
 
     /** Called from ClientPlayNetworkHandlerMixin when a chat message arrives. */
     public static void onChatMessage(String message) {
@@ -200,10 +425,16 @@ public final class Autopilot {
             springPitchPos = mc.player.getPitch();
             goalYaw   = springYawPos;
             goalPitch = springPitchPos;
+            smoothGoalYaw   = springYawPos;
+            smoothGoalPitch = springPitchPos;
+            trackedYaw   = mc.player.getYaw();
+            trackedPitch = mc.player.getPitch();
         }
         springYawVel   = 0;
         springPitchVel = 0;
+        inSaccade = false;
         lastFrameNano  = System.nanoTime();
+        sessionStartNano = lastFrameNano;
         Pathfinder.reset();
         enabled = true;
         System.out.println("[Autopilot] Started (mode " + mode + ")");
@@ -253,6 +484,24 @@ public final class Autopilot {
         Vec3d  pos    = player.getEntityPos();
         double hSpeed = player.getVelocity().horizontalLength();
 
+        // ── Attention model update ────────────────────────────────
+        //    Slow-varying focus level that modulates all motor control.
+        tickCounter++;
+        if (tickCounter >= nextAttentionChangeTick) {
+            attentionTarget = ATTENTION_MIN
+                + rng.nextDouble() * (ATTENTION_MAX - ATTENTION_MIN);
+            nextAttentionChangeTick = tickCounter + ATTENTION_CHANGE_MIN
+                + rng.nextInt(ATTENTION_CHANGE_MAX - ATTENTION_CHANGE_MIN + 1);
+        }
+        attention += (attentionTarget - attention) * ATTENTION_DRIFT_RATE;
+
+        // ── Fatigue model ─────────────────────────────────────────
+        //    Gradual degradation over long sessions. Sigmoid curve:
+        //    negligible for first 10 min, then ramps toward max.
+        double sessionSec = (System.nanoTime() - sessionStartNano) / 1_000_000_000.0;
+        double fatigueRaw = sessionSec / FATIGUE_ONSET_SEC - 1.0; // negative before onset
+        fatigue = FATIGUE_MAX / (1.0 + Math.exp(-2.0 * fatigueRaw)); // sigmoid 0→MAX
+
         // Update pathfinder
         Pathfinder.update(client, player, targetMode, targetMode,
             1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
@@ -267,6 +516,8 @@ public final class Autopilot {
 
         if (hasPath) {
             double L = Math.min(LOOKAHEAD_MAX, LOOKAHEAD_MIN + hSpeed * LOOKAHEAD_SPEED_K);
+            // During long falls, look further ahead (where to go after landing)
+            if (isFallingCamera && fallingCameraTicks > 10) L *= FALL_LOOKAHEAD_MULT;
             Vec3d pursuitTarget = findPursuitPoint(path, wpIdx, pos, L);
             newGoalYaw = yawTo(pos, pursuitTarget);
         }
@@ -281,7 +532,7 @@ public final class Autopilot {
             mobDist = pos.distanceTo(mob.getEntityPos());
 
             if (mobDist < PRE_AIM_RANGE) {
-                double mobYaw = yawTo(pos, mobPos);
+                double mobYaw = yawTo(pos, mobPos) + aimScatterYaw;
                 if (mobDist < ATTACK_RANGE) {
                     inCombat = true;
                     newGoalYaw = mobYaw;
@@ -316,6 +567,7 @@ public final class Autopilot {
         /* ── Pitch goal ──────────────────────────────────────────── */
         double newGoalPitch = 0;
 
+        // Base pitch from path elevation (same as before)
         if (hasPath && wpIdx + 1 < path.size()) {
             BlockPos wpCur   = path.get(wpIdx);
             BlockPos wpAhead = path.get(Math.min(wpIdx + 2, path.size() - 1));
@@ -326,17 +578,221 @@ public final class Autopilot {
             }
         }
 
+        /* ── Fall camera system ────────────────────────────────────
+         *  5-phase human-like camera during vertical drops:
+         *  1. Pre-edge peek: subtle downward glance approaching an edge
+         *  2. Reaction delay: 150-350ms before camera starts moving
+         *  3. Active tracking: smooth pitch toward landing zone
+         *  4. Pre-landing brace: pitch recovers toward horizontal
+         *  5. Post-landing bounce: impact feel via spring velocity kick */
+        Vec3d velocity = player.getVelocity();
+        boolean playerFalling = !player.isOnGround() && velocity.y < FALL_VELOCITY_THRESH;
+
+        if (playerFalling && !isFallingCamera) {
+            // Phase 2 start: just went airborne — roll reaction delay
+            isFallingCamera = true;
+            fallingCameraTicks = 0;
+            // If pre-edge was active, player expected this drop → normal reaction
+            // If no pre-edge, it's a surprise → shorter startle reaction (1-3 ticks)
+            if (preEdgeActive && preEdgePeekStrength > 0.3) {
+                fallReactionDelay = FALL_REACTION_MIN
+                    + rng.nextInt(FALL_REACTION_MAX - FALL_REACTION_MIN + 1);
+            } else {
+                // Surprise fall — startle reflex is faster
+                fallReactionDelay = 1 + rng.nextInt(3); // 1-3 ticks (50-150ms)
+            }
+            fallLandingPos = findLandingFromPath(path, wpIdx, pos);
+        }
+
+        if (playerFalling && isFallingCamera) {
+            fallingCameraTicks++;
+
+            // Update landing estimate periodically (path may change)
+            if (fallingCameraTicks % 10 == 0) {
+                Vec3d updated = findLandingFromPath(path, wpIdx, pos);
+                if (updated != null) fallLandingPos = updated;
+            }
+
+            if (fallingCameraTicks > fallReactionDelay) {
+                // Phase 3: active fall tracking
+                double fallPitch;
+
+                if (fallLandingPos != null) {
+                    // Known landing — look at it
+                    Vec3d eyePos = pos.add(0, player.getStandingEyeHeight(), 0);
+                    double dyToLand = fallLandingPos.y - eyePos.y;
+                    double dhToLand = Math.sqrt(
+                        sq(fallLandingPos.x - eyePos.x) + sq(fallLandingPos.z - eyePos.z));
+
+                    if (dhToLand > 0.5) {
+                        fallPitch = -Math.toDegrees(Math.atan2(dyToLand, dhToLand));
+                    } else {
+                        fallPitch = -Math.toDegrees(Math.atan2(dyToLand, Math.max(dhToLand, 1.5)));
+                    }
+                } else {
+                    // Unknown landing (accidental fall) — look down based on
+                    // velocity direction. Humans instinctively look toward
+                    // where they're going. More downward velocity = more pitch.
+                    double vy = velocity.y * 20.0; // blocks per second (negative = down)
+                    double vhSq = sq(velocity.x) + sq(velocity.z);
+                    double vh = Math.sqrt(vhSq) * 20.0;
+                    fallPitch = -Math.toDegrees(Math.atan2(vy, Math.max(vh, 2.0)));
+                }
+                fallPitch = Math.min(fallPitch, FALL_MAX_PITCH);
+
+                // Smooth ramp-in (smoothstep curve, not linear)
+                int activeTicks = fallingCameraTicks - fallReactionDelay;
+                double rampIn = Math.min(1.0, activeTicks / FALL_RAMP_TICKS);
+                rampIn = rampIn * rampIn * (3.0 - 2.0 * rampIn); // smoothstep
+
+                // Phase 4: pre-landing brace — recover pitch toward horizontal
+                double recovery = 0;
+                if (fallLandingPos != null) {
+                    double fallSpeed = -velocity.y * 20.0; // blocks per second
+                    double remainingDy = Math.abs(fallLandingPos.y - pos.y);
+                    double estSecsToLand = (fallSpeed > 1.0) ? remainingDy / fallSpeed : 999;
+
+                    if (estSecsToLand < FALL_BRACE_SECONDS) {
+                        recovery = 1.0 - (estSecsToLand / FALL_BRACE_SECONDS);
+                        recovery = recovery * recovery; // ease-in: gentle at first, faster near end
+                    }
+                }
+
+                double effectiveFallPitch = fallPitch * (1.0 - recovery * FALL_BRACE_RECOVERY);
+
+                // Blend fall pitch over base path pitch
+                newGoalPitch = newGoalPitch * (1.0 - rampIn) + effectiveFallPitch * rampIn;
+            }
+        } else {
+            if (isFallingCamera) {
+                // Phase 5: just landed — pitch bounce (impact feel)
+                springPitchVel += FALL_BOUNCE_STRENGTH;
+            }
+            isFallingCamera = false;
+            fallingCameraTicks = 0;
+            fallLandingPos = null;
+        }
+
+        // Phase 1: pre-edge peek — look toward the EDGE point, not through floor
+        //   Scan path ahead for a significant Y drop. If found, identify the
+        //   last ground-level waypoint (the "edge"). Target gaze at that edge
+        //   point — since it's at roughly player Y, pitch stays moderate (5-20°)
+        //   and we never look through blocks. Fall camera takes over once airborne.
+        if (!isFallingCamera && player.isOnGround() && hasPath && !inCombat) {
+            // Scan path forward to find edge: last WP before Y drops ≥ PRE_PEEK_MIN_DROP
+            Vec3d foundEdge = null;
+            int scanEnd = Math.min(wpIdx + PRE_PEEK_SCAN_WPS, path.size());
+            int edgeIdx = -1;
+            for (int i = wpIdx; i < scanEnd - 1; i++) {
+                int curY = path.get(i).getY();
+                // Look ahead from this point for a significant drop
+                for (int j = i + 1; j < scanEnd; j++) {
+                    int drop = curY - path.get(j).getY();
+                    if (drop >= PRE_PEEK_MIN_DROP) {
+                        // Edge = waypoint i (last ground before drop)
+                        // But only if path doesn't go UP between player and edge
+                        boolean pathRises = false;
+                        int playerY = path.get(wpIdx).getY();
+                        for (int k = wpIdx + 1; k <= i; k++) {
+                            if (path.get(k).getY() > playerY + 1) {
+                                pathRises = true;
+                                break;
+                            }
+                        }
+                        if (!pathRises) {
+                            edgeIdx = i;
+                            foundEdge = Vec3d.ofCenter(path.get(i));
+                        }
+                        break; // found first significant drop from point i
+                    }
+                }
+                if (foundEdge != null) break;
+            }
+
+            if (foundEdge != null) {
+                double distToEdge = Math.sqrt(
+                    sq(foundEdge.x - pos.x) + sq(foundEdge.z - pos.z));
+
+                // New edge detected — initialize per-approach state
+                if (!preEdgeActive || preEdgePos == null
+                    || foundEdge.squaredDistanceTo(preEdgePos) > 25.0) {
+                    preEdgeActive = true;
+                    preEdgePos = foundEdge;
+                    // Human variability: randomize start distance ±20%
+                    preEdgeStartDist = PRE_PEEK_START_DIST
+                        * (1.0 + (rng.nextDouble() * 2.0 - 1.0) * PRE_PEEK_DIST_VAR);
+                    // Attention modulates: focused → earlier notice
+                    preEdgeStartDist *= (0.5 + 0.5 * attention);
+                    // 15% chance player is "distracted" and doesn't pre-peek
+                    preEdgeSkip = rng.nextDouble() < PRE_PEEK_SKIP_CHANCE;
+                }
+
+                if (!preEdgeSkip && distToEdge < preEdgeStartDist) {
+                    // Compute pitch angle to the edge point
+                    double eyeY = pos.y + player.getStandingEyeHeight();
+                    double edgeDy = foundEdge.y - eyeY;
+                    double edgeDh = Math.max(distToEdge, 0.5);
+                    double pitchToEdge = -Math.toDegrees(Math.atan2(edgeDy, edgeDh));
+                    // Clamp — don't look more than 25° down for pre-peek
+                    pitchToEdge = Math.max(0, Math.min(pitchToEdge, 25.0));
+
+                    // Strength ramp: smoothstep from start distance to full distance
+                    double t;
+                    if (distToEdge > preEdgeStartDist) {
+                        t = 0;
+                    } else if (distToEdge < PRE_PEEK_FULL_DIST) {
+                        t = 1.0;
+                    } else {
+                        t = 1.0 - (distToEdge - PRE_PEEK_FULL_DIST)
+                            / (preEdgeStartDist - PRE_PEEK_FULL_DIST);
+                    }
+                    t = t * t * (3.0 - 2.0 * t); // smoothstep
+
+                    // Early phase (far): just a subtle +5° glance
+                    // Late phase (close): full pitch toward edge point
+                    double peekPitch = PRE_PEEK_EARLY_PITCH * (1.0 - t)
+                                     + pitchToEdge * t;
+
+                    preEdgePeekStrength = t;
+                    newGoalPitch += peekPitch * t + PRE_PEEK_EARLY_PITCH * (1.0 - t) * Math.min(t * 3.0, 1.0);
+                } else {
+                    preEdgePeekStrength = 0;
+                }
+            } else {
+                // No edge ahead — reset
+                if (preEdgeActive) {
+                    preEdgeActive = false;
+                    preEdgePos = null;
+                    preEdgePeekStrength = 0;
+                }
+            }
+        } else if (isFallingCamera) {
+            // Hand off to fall camera — clear pre-edge state
+            preEdgeActive = false;
+            preEdgePos = null;
+            preEdgePeekStrength = 0;
+        }
+
+        // Combat pitch blend (overrides fall camera — if fighting mid-fall, look at mob)
         if (mob != null && mob.isAlive() && mobPos != null && mobDist < PRE_AIM_RANGE) {
             double dy = mobPos.y - (pos.y + player.getStandingEyeHeight());
             double dh = Math.sqrt(sq(mobPos.x - pos.x) + sq(mobPos.z - pos.z));
             if (dh > 0.1) {
-                double mobPitch = -Math.toDegrees(Math.atan2(dy, dh));
+                double mobPitch = -Math.toDegrees(Math.atan2(dy, dh)) + aimScatterPitch;
                 double blend = 1.0 - clamp01((mobDist - ATTACK_RANGE) / (PRE_AIM_RANGE - ATTACK_RANGE));
                 newGoalPitch = newGoalPitch * (1.0 - blend) + mobPitch * blend;
             }
         }
 
         goalPitch = newGoalPitch;
+
+        // Subtle pitch wander while running straight (humans glance up/down)
+        if (lowErrorTicks > IDLE_SCAN_AFTER && !inCombat) {
+            double t = lowErrorTicks / 20.0;
+            double pitchDrift = IDLE_SCAN_AMP * 0.35 * Math.sin(t * 0.8 + 1.3)
+                              + IDLE_SCAN_AMP * 0.2  * Math.sin(t * 2.1 + 0.7);
+            goalPitch += pitchDrift;
+        }
 
         /* ── Sprint control (uses spring state, not frame interpolation) ── */
         // How far the spring still needs to turn
@@ -411,6 +867,9 @@ public final class Autopilot {
                 lastCombatTargetId = mobId;
                 combatReactionRemaining = REACTION_MIN_TICKS
                     + rng.nextInt(REACTION_MAX_TICKS - REACTION_MIN_TICKS + 1);
+                // Endpoint scatter: each new aim attempt has slightly different offset
+                aimScatterYaw   = rng.nextGaussian() * AIM_SCATTER_YAW_SD;
+                aimScatterPitch = rng.nextGaussian() * AIM_SCATTER_PITCH_SD;
             }
         } else {
             lastCombatTargetId = null;
@@ -524,13 +983,24 @@ public final class Autopilot {
     }
 
     /* ══════════════════════════════════════════════════════════════
-     *  FRAME  (60-144 Hz) — human-like spring dynamics
+     *  FRAME  (60-144 Hz) — motor-control-accurate human dynamics
      *
-     *  Instead of constant critically-damped spring (robotic):
-     *  - Large error → high ω, slight under-damping (quick flick + overshoot)
-     *  - Small error → low ω (gentle hold, no rush)
-     *  - Slow speed modulation (variable pace, not always same speed)
-     *  - Rare micro-impulses (hand tremor moments)
+     *  Three-layer architecture matching real neuromuscular control:
+     *
+     *  Layer 1: Goal smoothing (visual processing delay ~100ms)
+     *    Raw goal from tick → low-pass → smoothed goal.
+     *    Simulates the visual cortex latency before motor response.
+     *
+     *  Layer 2: Movement execution (dual-mode)
+     *    SACCADE MODE (>18° error): Minimum-jerk trajectory
+     *      (Flash & Hogan 1985). Bell-shaped velocity profile with
+     *      Fitts' Law timing + per-movement variability.
+     *    SPRING MODE (<18° error): Critically-damped spring for
+     *      continuous tracking with dynamic ω and damping.
+     *
+     *  Layer 3: Physiological tremor overlay
+     *    Continuous narrow-band ~10Hz oscillation (NOT white noise).
+     *    Added to output, not fed back into spring.
      * ══════════════════════════════════════════════════════════════ */
 
     private static void onFrame(ClientPlayerEntity player) {
@@ -542,74 +1012,398 @@ public final class Autopilot {
 
         double timeS = now / 1_000_000_000.0;
 
-        // ── Base omega from combat state ────────────────────────
-        double baseYawOmega   = inCombat ? COMBAT_YAW_OMEGA   : NAV_YAW_OMEGA;
-        double basePitchOmega = inCombat ? COMBAT_PITCH_OMEGA  : NAV_PITCH_OMEGA;
-
-        // ── YAW: dynamic omega based on error magnitude ─────────
-        double yawError = MathHelper.wrapDegrees((float)(goalYaw - springYawPos));
-        double absYawError = Math.abs(yawError);
-
-        double yawOmega = baseYawOmega;
-        if (absYawError > FLICK_THRESHOLD) {
-            // Large error: quick ballistic flick
-            yawOmega *= FLICK_OMEGA_MULT;
-        } else if (absYawError < HOLD_THRESHOLD) {
-            // Small error: gentle corrective hold
-            yawOmega *= HOLD_OMEGA_MULT;
+        // ══ Layer 1: Goal smoothing ══════════════════════════════
+        //    Low-pass filter: goalYaw changes at 20Hz tick rate.
+        //    Real humans have ~100ms visual processing delay before
+        //    their hand begins to respond to a target shift.
+        //    Attention modulates: high focus → faster response.
+        // Fatigue increases visual processing delay over long sessions
+        double fatigueLag = 1.0 + fatigue * (FATIGUE_LAG_MULT - 1.0);
+        double effectiveTau = GOAL_LAG_TAU * fatigueLag / (0.5 + 0.5 * attention);
+        double alpha = 1.0 - Math.exp(-dt / effectiveTau);
+        smoothGoalYaw   += MathHelper.wrapDegrees((float)(goalYaw   - smoothGoalYaw))   * alpha;
+        smoothGoalPitch += (goalPitch - smoothGoalPitch) * alpha;
+        // Re-center smoothGoalYaw near goalYaw to prevent numeric drift
+        // (both values accumulate wraps; keep them within 180° of each other)
+        double yawDrift = smoothGoalYaw - goalYaw;
+        if (Math.abs(yawDrift) > 360.0) {
+            smoothGoalYaw -= Math.round(yawDrift / 360.0) * 360.0;
         }
-        // Smooth transition between zones (no hard boundary)
-        // Already handled: flick/hold only at extremes, middle = base omega
 
-        // ── Slow speed modulation (quasi-random pace variation) ──
-        double speedMod = 1.0
-            + SPEED_MOD_AMP1 * Math.sin(timeS * SPEED_MOD_FREQ1)
-            + SPEED_MOD_AMP2 * Math.sin(timeS * SPEED_MOD_FREQ2);
-        yawOmega *= speedMod;
-        double pitchOmega = basePitchOmega * speedMod;
+        // ══ Layer 2: Movement execution ══════════════════════════
 
-        // ── Damping: under-damp large moves for natural overshoot ─
-        //    Standard: accel = ω²·error − 2ζω·vel  (ζ=1 → critical)
-        //    Under-damp: ζ=0.82 → ~5% overshoot on flick, then settle
-        double yawZeta  = (absYawError > UNDERDAMP_THRESHOLD) ? UNDERDAMP_ZETA : 1.0;
-        double pitchZeta = 1.0; // pitch always critically damped
+        // Measure current error to smoothed goal
+        double yawToGo   = MathHelper.wrapDegrees((float)(smoothGoalYaw - springYawPos));
+        double pitchToGo = smoothGoalPitch - springPitchPos;
+        double totalError = Math.sqrt(yawToGo * yawToGo + pitchToGo * pitchToGo);
 
-        // ── Step yaw spring ─────────────────────────────────────
-        double yawAccel = yawOmega * yawOmega * yawError
-                        - 2.0 * yawZeta * yawOmega * springYawVel;
-        springYawVel += yawAccel * dt;
-        springYawPos += springYawVel * dt;
+        // ── Saccade detection ─────────────────────────────────────
+        //    When error exceeds threshold, switch to minimum-jerk
+        //    trajectory. This produces the characteristic bell-shaped
+        //    velocity profile of real human reaching movements,
+        //    instead of the exponential decay of a spring.
+        if (!inSaccade && totalError > SACCADE_THRESHOLD) {
+            inSaccade         = true;
+            saccadeStartYaw   = springYawPos;
+            saccadeStartPitch = springPitchPos;
 
-        // ── Step pitch spring ───────────────────────────────────
-        double pitchError = goalPitch - springPitchPos;
-        double pitchAccel = pitchOmega * pitchOmega * pitchError
-                          - 2.0 * pitchZeta * pitchOmega * springPitchVel;
-        springPitchVel += pitchAccel * dt;
-        springPitchPos += springPitchVel * dt;
+            // Asymmetric overshoot: humans tend to overshoot slightly
+            // Nudge target 4% ±3% past the goal along movement direction
+            double overshoot = 1.0 + OVERSHOOT_BIAS
+                + (rng.nextDouble() * 2.0 - 1.0) * OVERSHOOT_VARIANCE;
+            double rawDeltaYaw = MathHelper.wrapDegrees(
+                (float)(smoothGoalYaw - springYawPos));
+            double rawDeltaPitch = smoothGoalPitch - springPitchPos;
+            saccadeTargetYaw   = springYawPos + rawDeltaYaw * overshoot;
+            saccadeTargetPitch = springPitchPos + rawDeltaPitch * overshoot;
+
+            // Fitts' Law: T = a + b × D, with ±20% variability
+            // Attention: high focus → faster; Fatigue: slower over time
+            double baseTime = SACCADE_FITTS_A + SACCADE_FITTS_B * totalError;
+            double timeVar = 1.0 - SACCADE_TIME_VAR
+                + rng.nextDouble() * 2.0 * SACCADE_TIME_VAR;
+            double fatigueMul = 1.0 + fatigue * (1.0 / FATIGUE_OMEGA_MULT - 1.0);
+            saccadeDuration = baseTime * timeVar * fatigueMul
+                / (0.5 + 0.5 * attention);
+            saccadeElapsed = 0;
+
+            // Mouse lift: for very large rotations, plan a mid-saccade pause
+            mouseLiftDone = totalError < MOUSE_LIFT_THRESHOLD;
+            mouseLiftPause = MOUSE_LIFT_PAUSE_MIN
+                + rng.nextDouble() * (MOUSE_LIFT_PAUSE_MAX - MOUSE_LIFT_PAUSE_MIN);
+
+            // Pre-roll omega scale for post-saccade spring phase
+            moveOmegaScale = 0.82 + rng.nextDouble() * 0.36;
+        }
+
+        if (inSaccade) {
+            // ── Saccade execution (minimum-jerk) ──────────────────
+
+            // Mouse lift: pause mid-saccade for physical mouse repositioning
+            double tau = Math.min(1.0, saccadeElapsed / saccadeDuration);
+            if (!mouseLiftDone && tau >= MOUSE_LIFT_TAU_START && tau < MOUSE_LIFT_TAU_END) {
+                mouseLiftPause -= dt;
+                if (mouseLiftPause > 0) {
+                    // Freeze saccade — don't advance elapsed time
+                    // (hand is lifting the mouse, position doesn't change)
+                } else {
+                    mouseLiftDone = true;
+                    saccadeElapsed += dt;
+                }
+            } else {
+                saccadeElapsed += dt;
+            }
+
+            // Update target if goal shifted significantly mid-move
+            double shiftYaw   = MathHelper.wrapDegrees((float)(smoothGoalYaw - saccadeTargetYaw));
+            double shiftPitch = smoothGoalPitch - saccadeTargetPitch;
+            if (Math.abs(shiftYaw) > 8 || Math.abs(shiftPitch) > 8) {
+                saccadeTargetYaw   = smoothGoalYaw;
+                saccadeTargetPitch = smoothGoalPitch;
+            }
+
+            tau = Math.min(1.0, saccadeElapsed / saccadeDuration);
+            double blend = minJerk(tau);
+
+            double deltaYaw   = MathHelper.wrapDegrees(
+                (float)(saccadeTargetYaw - saccadeStartYaw));
+            double deltaPitch = saccadeTargetPitch - saccadeStartPitch;
+
+            springYawPos   = saccadeStartYaw   + deltaYaw   * blend;
+            springPitchPos = saccadeStartPitch + deltaPitch * blend;
+
+            // Track velocity for smooth hand-off to spring
+            // minJerkDeriv gives deg/normalized-time, divide by T for deg/sec
+            double dBlend  = minJerkDeriv(tau) / saccadeDuration;
+            springYawVel   = deltaYaw   * dBlend;
+            springPitchVel = deltaPitch * dBlend;
+
+            if (tau >= 1.0) {
+                // Saccade complete — velocity is zero (minJerk deriv = 0 at τ=1)
+
+                // Post-saccade corrections: 1-3 discrete pauses before smooth tracking
+                // Humans evaluate aim error visually, then make small adjustments
+                postSaccadeDwell = CORRECTION_PAUSE_MIN
+                    + rng.nextDouble() * (CORRECTION_PAUSE_MAX - CORRECTION_PAUSE_MIN);
+                postSaccadeCorrections = 1 + rng.nextInt(2); // 1-2 more pauses
+
+                // Post-saccadic oscillation: wrist resonance after fast flick
+                // Amplitude proportional to how fast the saccade peaked
+                double peakVel = Math.abs(deltaYaw) * 1.875 / saccadeDuration; // minJerk peak
+                postSaccOscAmp = peakVel * POST_SACC_OSC_GAIN;
+                postSaccOscPhase = 0;
+                postSaccOscStartTime = timeS;
+
+                inSaccade      = false;
+                springYawVel   = 0;
+                springPitchVel = 0;
+            }
+        } else {
+            // ── Spring mode (continuous tracking, <18° corrections) ─
+
+            // Post-saccade dwell: discrete pauses simulating visual
+            // evaluation between corrective sub-movements
+            if (postSaccadeDwell > 0) {
+                postSaccadeDwell -= dt;
+                // Heavy damping during dwell (hand is still, eyes evaluate error)
+                springYawVel   *= Math.exp(-CORRECTION_DAMP_RATE * dt);
+                springPitchVel *= Math.exp(-CORRECTION_DAMP_RATE * dt);
+                // Skip spring step — no active correction during pause
+            } else {
+                double baseYawOmega   = inCombat ? COMBAT_YAW_OMEGA : NAV_YAW_OMEGA;
+                double basePitchOmega = inCombat ? COMBAT_PITCH_OMEGA
+                                      : isFallingCamera ? FALL_PITCH_OMEGA
+                                      : NAV_PITCH_OMEGA;
+
+                // Movement-to-movement variability (±18%)
+                baseYawOmega   *= moveOmegaScale;
+                basePitchOmega *= moveOmegaScale;
+
+                // Attention + fatigue modulate spring speed
+                double fatigueOmega = 1.0 + fatigue * (FATIGUE_OMEGA_MULT - 1.0);
+                double attentionOmegaMul = (0.5 + 0.5 * attention) * fatigueOmega;
+                baseYawOmega   *= attentionOmegaMul;
+                basePitchOmega *= attentionOmegaMul;
+
+                // Dynamic omega based on error magnitude
+                double yawError    = MathHelper.wrapDegrees((float)(smoothGoalYaw - springYawPos));
+                double absYawError = Math.abs(yawError);
+
+                double yawOmega = baseYawOmega;
+                if (absYawError > FLICK_THRESHOLD) {
+                    yawOmega *= FLICK_OMEGA_MULT;
+                } else if (absYawError < HOLD_THRESHOLD) {
+                    yawOmega *= HOLD_OMEGA_MULT;
+                }
+
+                // Re-roll omega scale when starting a new correction
+                boolean nowInHoldZone = absYawError < HOLD_THRESHOLD;
+                if (wasInHoldZone && !nowInHoldZone) {
+                    moveOmegaScale = 0.82 + rng.nextDouble() * 0.36;
+                }
+                wasInHoldZone = nowInHoldZone;
+
+                // Trigger next post-saccade pause when error drops below threshold
+                if (postSaccadeCorrections > 0 && absYawError < CORRECTION_THRESH) {
+                    postSaccadeCorrections--;
+                    postSaccadeDwell = CORRECTION_INTER_MIN
+                        + rng.nextDouble() * (CORRECTION_INTER_MAX - CORRECTION_INTER_MIN);
+                }
+
+                // Speed modulation: value noise (aperiodic 1/f spectrum)
+                double speedMod = 1.0
+                    + SPEED_NOISE_AMP1 * valueNoise(timeS * SPEED_NOISE_FREQ1)
+                    + SPEED_NOISE_AMP2 * valueNoise(timeS * SPEED_NOISE_FREQ2 + 137.0);
+                yawOmega *= speedMod;
+                double pitchOmega = basePitchOmega * speedMod;
+
+                // Damping ratios
+                double yawZeta   = (absYawError > UNDERDAMP_THRESHOLD) ? UNDERDAMP_ZETA : 1.0;
+                double pitchZeta = isFallingCamera ? FALL_PITCH_ZETA : 1.0;
+
+                // Step yaw spring — with acceleration limiter to prevent jerks
+                double yawAccel = yawOmega * yawOmega * yawError
+                                - 2.0 * yawZeta * yawOmega * springYawVel;
+                // Soft-limit acceleration: human arms have max force
+                double maxAccel = 2500.0; // deg/s² — reasonable for wrist flick
+                if (Math.abs(yawAccel) > maxAccel) {
+                    yawAccel = Math.signum(yawAccel) * maxAccel
+                        * Math.tanh(Math.abs(yawAccel) / maxAccel);
+                }
+                springYawVel += yawAccel * dt;
+                springYawPos += springYawVel * dt;
+
+                // Step pitch spring
+                double pitchError = smoothGoalPitch - springPitchPos;
+                double pitchAccel = pitchOmega * pitchOmega * pitchError
+                                  - 2.0 * pitchZeta * pitchOmega * springPitchVel;
+                if (Math.abs(pitchAccel) > maxAccel) {
+                    pitchAccel = Math.signum(pitchAccel) * maxAccel
+                        * Math.tanh(Math.abs(pitchAccel) / maxAccel);
+                }
+                springPitchVel += pitchAccel * dt;
+                springPitchPos += springPitchVel * dt;
+            }
+        }
+
         springPitchPos = Math.max(-90, Math.min(90, springPitchPos));
 
-        // ── Micro-impulses (rare hand tremor) ───────────────────
-        //    Probability per frame = chance_per_sec × dt
-        //    Spring damping absorbs the kick within ~0.3s
-        if (rng.nextDouble() < IMPULSE_CHANCE_PER_SEC * dt) {
-            springYawVel   += rng.nextGaussian() * IMPULSE_YAW_STRENGTH;
-            springPitchVel += rng.nextGaussian() * IMPULSE_PITCH_STRENGTH;
+        // ══ Layer 3: Physiological tremor ════════════════════════
+        //    Continuous narrow-band ~10Hz oscillation overlaid on output.
+        //    NOT random impulses — real hand tremor is autocorrelated
+        //    with slowly drifting frequency and amplitude.
+        //
+        //    Frequency drift: ±1.5Hz slow sine modulation prevents
+        //    exact periodicity that spectral analysis would detect.
+        //    Amplitude modulation: value noise produces natural
+        //    1/f-like variation in tremor intensity.
+        tremorYawPhase   += dt * 2.0 * Math.PI
+            * (TREMOR_YAW_FREQ   + 1.5 * Math.sin(timeS * 0.7));
+        tremorPitchPhase += dt * 2.0 * Math.PI
+            * (TREMOR_PITCH_FREQ + 1.2 * Math.sin(timeS * 0.5 + 2.0));
+
+        // Attention + fatigue modulate tremor
+        double tremorScale = isFallingCamera ? FALL_TREMOR_MULT : 1.0;
+        tremorScale *= (2.0 - attention); // low focus → more tremor
+        tremorScale *= (1.0 + fatigue * (FATIGUE_TREMOR_MULT - 1.0)); // fatigue → more tremor
+        double tyAmp = TREMOR_YAW_AMP   * tremorScale
+            * (1.0 + 0.35 * valueNoise(timeS * 0.2));
+        double tpAmp = TREMOR_PITCH_AMP * tremorScale
+            * (1.0 + 0.35 * valueNoise(timeS * 0.15 + 50.0));
+
+        double rawTremorYaw   = tyAmp * Math.sin(tremorYawPhase);
+        double rawTremorPitch = tpAmp * Math.sin(tremorPitchPhase);
+
+        // Correlated tremor: real hand movement has diagonal coupling.
+        // When yaw trembles, pitch moves too (~35% cross-axis).
+        double pureTremorYaw   = rawTremorYaw   + rawTremorPitch * TREMOR_CORRELATION;
+        double pureTremorPitch = rawTremorPitch + rawTremorYaw   * TREMOR_CORRELATION;
+
+        // Start composite overlay with pure tremor, then add layers
+        double tremorYaw   = pureTremorYaw;
+        double tremorPitch = pureTremorPitch;
+
+        // ══ Layer 4: Breathing rhythm ════════════════════════════
+        //    Ultra-subtle ~0.25Hz pitch oscillation from chest movement.
+        //    Always present. Amplitude varies with breathing depth.
+        breathPhase += dt * 2.0 * Math.PI
+            * (BREATH_FREQ + BREATH_FREQ_DRIFT * Math.sin(timeS * 0.08));
+        double breathAmp = BREATH_AMP * (1.0 + 0.2 * valueNoise(timeS * 0.1 + 200.0));
+        tremorPitch += breathAmp * Math.sin(breathPhase);
+
+        // ══ Layer 4b: Walking head-bob ═════════════════════════════
+        //    Subtle pitch oscillation from footstep cadence. Only active
+        //    when player is moving on ground. Prevents pitch from being
+        //    suspiciously static (87% zero-delta without this).
+        double hSpeedNow = player.getVelocity().horizontalLength();
+        if (player.isOnGround() && hSpeedNow > 0.05) {
+            headBobPhase += dt * 2.0 * Math.PI * HEAD_BOB_FREQ;
+            double bobScale = Math.min(1.0, hSpeedNow / 0.2); // ramp with speed
+            tremorPitch += HEAD_BOB_AMP  * bobScale * Math.sin(headBobPhase);
+            tremorPitch += HEAD_BOB_AMP2 * bobScale * Math.sin(headBobPhase * 0.5 + 0.8);
+            // Tiny yaw bob too (body sway)
+            tremorYaw   += HEAD_BOB_AMP2 * 0.5 * bobScale * Math.sin(headBobPhase * 0.5 + 2.0);
         }
 
-        // ── Hard cap turn rate ──────────────────────────────────
-        double maxDeg = MAX_TURN_DEG_PER_SEC * dt;
-        double yawDelta = MathHelper.wrapDegrees((float)(springYawPos - player.getYaw()));
-        if (Math.abs(yawDelta) > maxDeg) {
-            yawDelta = Math.signum(yawDelta) * maxDeg;
-            springYawPos = player.getYaw() + yawDelta;
-            springYawVel = Math.signum(springYawVel)
-                * Math.min(Math.abs(springYawVel), MAX_TURN_DEG_PER_SEC);
+        // ══ Layer 5: Post-saccadic oscillation ═══════════════════
+        //    Transient damped ~3Hz wrist resonance after fast flicks.
+        //    Decays exponentially over ~250ms. Distinct from tremor.
+        double oscAge = timeS - postSaccOscStartTime;
+        if (postSaccOscAmp > 0.01 && oscAge < 0.4) {
+            postSaccOscPhase += dt * 2.0 * Math.PI * POST_SACC_OSC_FREQ;
+            double oscDecay = Math.exp(-oscAge * POST_SACC_OSC_DECAY);
+            double osc = postSaccOscAmp * oscDecay * Math.sin(postSaccOscPhase);
+            tremorYaw += osc; // rides on top of tremor overlay
         }
 
-        // ── Apply ───────────────────────────────────────────────
-        player.setYaw((float) springYawPos);
-        player.headYaw = (float) springYawPos;
-        player.setPitch(MathHelper.clamp((float) springPitchPos, -90f, 90f));
+        // ══ Soft cap turn rate ══════════════════════════════════
+        //    Tanh soft-clamp only near limit — passes through small/medium
+        //    velocities unchanged to prevent systematic drag and jitter.
+        double finalYaw = springYawPos + tremorYaw;
+        // Use trackedYaw (double) instead of player.getYaw() (float) to avoid
+        // precision loss that puts ~20% of deltas off the mouse sensitivity grid.
+        double yawDelta = MathHelper.wrapDegrees((float)(finalYaw - trackedYaw));
+        double maxDeg   = MAX_TURN_DEG_PER_SEC * dt;
+        if (maxDeg > 0) {
+            double absRatio = Math.abs(yawDelta) / maxDeg;
+            if (absRatio > 0.7) {
+                yawDelta = Math.signum(yawDelta) * maxDeg * Math.tanh(absRatio);
+            }
+            // Update spring position to reflect clamped delta (double precision)
+            // This keeps spring velocity consistent with actual movement.
+            springYawPos = trackedYaw + yawDelta - tremorYaw;
+            // Soft-clamp velocity only when near limit
+            double absVelRatio = Math.abs(springYawVel) / MAX_TURN_DEG_PER_SEC;
+            if (absVelRatio > 0.7) {
+                springYawVel = Math.signum(springYawVel)
+                    * MAX_TURN_DEG_PER_SEC * Math.tanh(absVelRatio);
+            }
+        }
+
+        // ══ Mouse sensitivity quantization ═════════════════════════
+        //    Real mouse input is discrete: each pixel = step degrees.
+        //    Step = (sens*0.6+0.2)³ × 8.0 × 0.15
+        //    We quantize deltas to this grid + carry sub-pixel error
+        //    to the next frame (error diffusion / 1D dithering).
+        //    This prevents anticheat detecting non-grid angle deltas.
+        MinecraftClient mc = MinecraftClient.getInstance();
+        double sens = mc.options.getMouseSensitivity().getValue(); // 0..1 (0.5 = 100%)
+        double f = sens * 0.6 + 0.2;
+        double mouseStep = f * f * f * 8.0 * 0.15; // deg per pixel
+
+        double desiredPitch = MathHelper.clamp(
+            (float)(springPitchPos + tremorPitch), -90f, 90f);
+
+        // Add accumulated sub-pixel error from previous frames
+        double rawDeltaYaw   = yawDelta + quantErrorYaw;   // yawDelta already computed above
+        double rawDeltaPitch = (desiredPitch - trackedPitch) + quantErrorPitch;
+
+        // Quantize to mouse pixel grid
+        long pixelsYaw   = Math.round(rawDeltaYaw   / mouseStep);
+        long pixelsPitch = Math.round(rawDeltaPitch / mouseStep);
+
+        // Pitch hysteresis: suppress ±1px alternation from tremor/bob dithering.
+        // If this would reverse direction with only 1px, require stronger error.
+        // This turns rapid +1/-1 jitter into smoother hold-then-step behavior.
+        if (pixelsPitch != 0 && lastPitchDir != 0
+            && Long.signum(pixelsPitch) != lastPitchDir
+            && Math.abs(pixelsPitch) == 1) {
+            // Only allow reversal if raw delta exceeds 0.65 pixels (not just 0.5)
+            if (Math.abs(rawDeltaPitch) < mouseStep * 0.65) {
+                pixelsPitch = 0; // suppress — hold current position
+            }
+        }
+        if (pixelsPitch != 0) {
+            lastPitchDir = Long.signum(pixelsPitch);
+        }
+
+        double quantizedDeltaYaw   = pixelsYaw   * mouseStep;
+        double quantizedDeltaPitch = pixelsPitch * mouseStep;
+
+        // Store remainder for next frame (sub-pixel error diffusion)
+        quantErrorYaw   = rawDeltaYaw   - quantizedDeltaYaw;
+        quantErrorPitch = rawDeltaPitch - quantizedDeltaPitch;
+
+        // Update double-precision tracked angles (never loses precision)
+        trackedYaw   += quantizedDeltaYaw;
+        trackedPitch  = Math.max(-90, Math.min(90, trackedPitch + quantizedDeltaPitch));
+
+        // Apply to player (float cast here is unavoidable but doesn't feed back)
+        player.setYaw((float) trackedYaw);
+        player.headYaw = (float) trackedYaw;
+        player.setPitch((float) trackedPitch);
+
+        // Sync spring position from double-precision tracked values
+        springYawPos   = trackedYaw   - tremorYaw;
+        springPitchPos = trackedPitch - tremorPitch;
+
+        // ══ Update debug telemetry ═══════════════════════════════
+        dbg_saccadeActive  = inSaccade;
+        dbg_saccadeTau     = inSaccade ? Math.min(1.0, saccadeElapsed / saccadeDuration) : 0;
+        dbg_yawVel         = springYawVel;
+        dbg_pitchVel       = springPitchVel;
+        dbg_goalYawRaw     = goalYaw;
+        dbg_goalPitchRaw   = goalPitch;
+        dbg_goalYawSmooth  = smoothGoalYaw;
+        dbg_goalPitchSmooth = smoothGoalPitch;
+        dbg_springYaw      = trackedYaw;
+        dbg_springPitch    = trackedPitch;
+        dbg_tremorYaw      = pureTremorYaw;
+        dbg_tremorPitch    = pureTremorPitch;
+        dbg_omegaScale     = moveOmegaScale;
+        dbg_falling        = isFallingCamera;
+        dbg_totalError     = totalError;
+        dbg_attention      = attention;
+        dbg_inDwell        = postSaccadeDwell > 0;
+        dbg_correctionsLeft = postSaccadeCorrections;
+        dbg_fatigue        = fatigue;
+        dbg_breathOffset   = BREATH_AMP * Math.sin(breathPhase);
+        dbg_mouseLift      = mouseLiftPause > 0 && !mouseLiftDone;
+        dbg_preEdge        = preEdgeActive && !preEdgeSkip && preEdgePeekStrength > 0;
+        dbg_preEdgeStrength = preEdgePeekStrength;
+        dbg_preEdgeDist    = (preEdgeActive && preEdgePos != null)
+            ? Math.sqrt(sq(preEdgePos.x - player.getX()) + sq(preEdgePos.z - player.getZ()))
+            : -1;
     }
 
     /* ══════════════════════════════════════════════════════════════
@@ -671,6 +1465,92 @@ public final class Autopilot {
         return from + MathHelper.wrapDegrees((float)(to - from)) * t;
     }
 
+    // ── Minimum-jerk trajectory (Flash & Hogan 1985) ──────────
+    //    Position: 10τ³ − 15τ⁴ + 6τ⁵   (S-curve, smooth 0→1)
+    //    Velocity: 30τ² − 60τ³ + 30τ⁴   (bell-shape, peak at τ=0.5)
+    //    This is the mathematically optimal trajectory that minimizes
+    //    the integral of squared jerk — which is what the human motor
+    //    cortex actually optimizes for reaching movements.
+    private static double minJerk(double tau) {
+        double t2 = tau * tau;
+        return t2 * tau * (10.0 - 15.0 * tau + 6.0 * t2);
+    }
+
+    private static double minJerkDeriv(double tau) {
+        double t2 = tau * tau;
+        return 30.0 * t2 * (1.0 - 2.0 * tau + t2);
+    }
+
+    // ── Value noise (aperiodic 1/f-like variation) ─────────────
+    //    Hash-based interpolated noise. Two octaves give biological
+    //    variation without the frequency peaks of periodic sines.
+    private static double valueNoise(double x) {
+        long ix = (long) Math.floor(x);
+        double fx = x - Math.floor(x);
+        fx = fx * fx * (3.0 - 2.0 * fx); // smoothstep
+        return hash1D(ix) * (1.0 - fx) + hash1D(ix + 1) * fx;
+    }
+
+    private static double hash1D(long n) {
+        n = ((n >> 16) ^ n) * 0x45d9f3bL;
+        n = ((n >> 16) ^ n) * 0x45d9f3bL;
+        n = (n >> 16) ^ n;
+        return ((n & 0x7fffffffL) / (double) 0x7fffffffL) * 2.0 - 1.0;
+    }
+
+    /**
+     * Scan path ahead to find landing position after a fall.
+     * Looks for where Y stops decreasing (= landed). Returns a point
+     * slightly past landing (human anticipation — looking where to go next).
+     */
+    private static Vec3d findLandingFromPath(List<BlockPos> path, int wpIdx, Vec3d playerPos) {
+        if (path == null || wpIdx >= path.size()) return null;
+
+        boolean foundDrop = false;
+        int landingIdx = -1;
+
+        for (int i = wpIdx; i + 1 < path.size() && i < wpIdx + 50; i++) {
+            int curY  = path.get(i).getY();
+            int nextY = path.get(i + 1).getY();
+
+            if (nextY < curY) {
+                foundDrop = true;
+            } else if (foundDrop && nextY >= curY) {
+                landingIdx = i + 1;
+                break;
+            }
+        }
+
+        if (landingIdx < 0) {
+            // No clear landing in path — fall may be ongoing, use deepest point
+            if (foundDrop) {
+                int deepIdx = wpIdx;
+                int minY = Integer.MAX_VALUE;
+                for (int i = wpIdx; i < Math.min(wpIdx + 50, path.size()); i++) {
+                    if (path.get(i).getY() < minY) {
+                        minY = path.get(i).getY();
+                        deepIdx = i;
+                    }
+                }
+                landingIdx = deepIdx;
+            } else {
+                return null;
+            }
+        }
+
+        Vec3d landing = Vec3d.ofCenter(path.get(landingIdx));
+
+        // Human anticipation: look slightly PAST landing along path direction
+        int aheadIdx = Math.min(landingIdx + 2, path.size() - 1);
+        if (aheadIdx > landingIdx) {
+            Vec3d ahead = Vec3d.ofCenter(path.get(aheadIdx));
+            // Blend: 70% landing pos, 30% ahead pos (look where you'll go next)
+            landing = landing.add(ahead.subtract(landing).multiply(0.3));
+        }
+
+        return landing;
+    }
+
     private static double horizontalDist(BlockPos a, BlockPos b) {
         double dx = b.getX() - a.getX();
         double dz = b.getZ() - a.getZ();
@@ -712,5 +1592,50 @@ public final class Autopilot {
         lowErrorTicks          = 0;
         lastCombatTargetId     = null;
         combatReactionRemaining = 0;
+        // Fall camera
+        isFallingCamera     = false;
+        fallingCameraTicks  = 0;
+        fallReactionDelay   = 0;
+        fallLandingPos      = null;
+        // Pre-edge peek
+        preEdgeActive       = false;
+        preEdgePos          = null;
+        preEdgeStartDist    = 0;
+        preEdgeSkip         = false;
+        preEdgePeekStrength = 0;
+        // Motor control state
+        inSaccade        = false;
+        saccadeElapsed   = 0;
+        smoothGoalYaw    = 0;
+        smoothGoalPitch  = 0;
+        tremorYawPhase   = rng.nextDouble() * 2 * Math.PI;
+        tremorPitchPhase = rng.nextDouble() * 2 * Math.PI;
+        moveOmegaScale   = 1.0;
+        wasInHoldZone    = false;
+        // Tier 2 state
+        postSaccadeDwell       = 0;
+        postSaccadeCorrections = 0;
+        postSaccOscPhase       = 0;
+        postSaccOscAmp         = 0;
+        postSaccOscStartTime   = 0;
+        attention              = 1.0;
+        attentionTarget        = 1.0;
+        nextAttentionChangeTick = 0;
+        tickCounter            = 0;
+        aimScatterYaw          = 0;
+        aimScatterPitch        = 0;
+        // Tier 3 state
+        mouseLiftPause         = 0;
+        mouseLiftDone          = false;
+        breathPhase            = rng.nextDouble() * 2 * Math.PI;
+        sessionStartNano       = System.nanoTime();
+        fatigue                = 0;
+        // Quantization
+        quantErrorYaw          = 0;
+        quantErrorPitch        = 0;
+        trackedYaw             = 0;
+        trackedPitch           = 0;
+        headBobPhase           = 0;
+        lastPitchDir           = 0;
     }
 }

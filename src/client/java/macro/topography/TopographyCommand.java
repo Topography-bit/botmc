@@ -13,6 +13,13 @@ public final class TopographyCommand {
     private TopographyCommand() {
     }
 
+    private static void msg(String text) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc != null && mc.player != null) {
+            mc.player.sendMessage(Text.literal("§a[Topography] §r" + text), false);
+        }
+    }
+
     public static void register() {
         ClientSendMessageEvents.ALLOW_COMMAND.register(command -> {
             String normalized = command == null ? "" : command.trim().toLowerCase();
@@ -43,7 +50,36 @@ public final class TopographyCommand {
                                     .disconnect(Text.literal("Fake kick for reconnect test"));
                         }
                         return 1;
-                    })))
+                    }))
+                .then(literal("path")
+                    .then(literal("zealots")
+                        .executes(context -> {
+                            if (Autopilot.isEnabled()) {
+                                Autopilot.stop();
+                                msg("Path-only stopped.");
+                            } else {
+                                Autopilot.startPathOnly(1);
+                                msg("Path-only started (zealots).");
+                            }
+                            return 1;
+                        }))
+                    .then(literal("bruisers")
+                        .executes(context -> {
+                            if (Autopilot.isEnabled()) {
+                                Autopilot.stop();
+                                msg("Path-only stopped.");
+                            } else {
+                                Autopilot.startPathOnly(2);
+                                msg("Path-only started (bruisers).");
+                            }
+                            return 1;
+                        }))
+                    .then(literal("stop")
+                        .executes(context -> {
+                            Autopilot.stop();
+                            msg("Path-only stopped.");
+                            return 1;
+                        }))))
         );
     }
 }

@@ -156,6 +156,14 @@ public final class Autopilot {
     //    pitch moves too (and vice versa). Correlation ~0.3-0.5.
     private static final double TREMOR_CORRELATION    = 0.35;   // cross-axis coupling factor
 
+    // ── Yaw-pitch wrist coupling (diagonal mouse swipe tendency) ──
+    //    When swiping mouse horizontally, wrist arc creates slight
+    //    vertical component. Human data shows correlation ~ -0.6.
+    //    Applied as velocity-proportional offset to pitch GOAL so it
+    //    goes through the spring (smooth) and doesn't trigger hysteresis.
+    //    Units: degrees of pitch goal shift per deg/s of yaw velocity.
+    private static final double YAW_PITCH_COUPLING_VEL = -0.004;
+
     // ── Breathing rhythm (chest movement → pitch) ─────────────
     //    Ultra-subtle ~0.25Hz pitch oscillation. Always present.
     //    Amplitude varies with breathing depth (slow noise modulation).
@@ -229,16 +237,16 @@ public final class Autopilot {
     //    5 phases: pre-edge peek → reaction delay → active tracking →
     //    pre-landing brace → post-landing bounce.
     private static final double FALL_VELOCITY_THRESH  = -0.18;  // y vel to detect falling (bl/tick) — ignore stairs/slopes (~0.08)
-    private static final int    FALL_REACTION_MIN     = 3;      // ticks before camera reacts (150ms)
-    private static final int    FALL_REACTION_MAX     = 7;      // max reaction delay (350ms)
+    private static final int    FALL_REACTION_MIN     = 1;      // ticks before camera reacts (50ms)
+    private static final int    FALL_REACTION_MAX     = 3;      // max reaction delay (150ms)
     private static final double FALL_MAX_PITCH        = 62.0;   // max downward pitch (humans don't look 90° down)
-    private static final double FALL_RAMP_TICKS       = 8.0;    // ticks to smoothly ramp in fall-look
+    private static final double FALL_RAMP_TICKS       = 3.0;    // ticks to smoothly ramp in fall-look
     private static final double FALL_BRACE_SECONDS    = 0.35;   // seconds before landing to start recovering
-    private static final double FALL_BRACE_RECOVERY   = 0.55;   // how much pitch recovers before landing (0-1)
+    private static final double FALL_BRACE_RECOVERY   = 0.20;   // how much pitch recovers before landing (0-1)
     private static final double FALL_PITCH_OMEGA      = 5.5;    // pitch spring ω during fall (faster than nav)
     private static final double FALL_PITCH_ZETA       = 0.92;   // slight underdamp for natural fall tracking
     private static final double FALL_TREMOR_MULT      = 2.2;    // hand tremor multiplier during falls (anxiety)
-    private static final double FALL_BOUNCE_STRENGTH  = 8.0;    // pitch velocity kick on landing (impact feel)
+    private static final double FALL_BOUNCE_STRENGTH  = 2.0;    // pitch velocity kick on landing (reduced — camera stays down longer)
     private static final double FALL_LOOKAHEAD_MULT   = 1.5;    // yaw lookahead boost during long falls
     // ── Pre-edge peek: look at the EDGE, not through the floor ──
     private static final int    PRE_PEEK_SCAN_WPS     = 20;     // waypoints ahead to scan for edges
@@ -254,6 +262,7 @@ public final class Autopilot {
      * ══════════════════════════════════════════════════════════════ */
 
     private static boolean enabled = false;
+    private static boolean pathfinderOnly = false;
     private static int     targetMode = 0;
     private static volatile boolean limboDetected = false;
     private static final Random rng = new Random();
@@ -333,6 +342,7 @@ public final class Autopilot {
     // creates rapid +1/-1 alternation that looks robotic. This tracks the
     // last non-zero pitch direction to add a small hysteresis band.
     private static long lastPitchDir = 0; // +1 or -1, direction of last pitch step
+    private static long lastYawDir   = 0; // +1 or -1, direction of last yaw step
 
     // Combat
     private static int attackCooldown = 0;
@@ -370,6 +380,13 @@ public final class Autopilot {
     private static int fallingCameraTicks = 0;
     private static int fallReactionDelay = 0;
     private static Vec3d fallLandingPos = null;
+    private static double fallBasePitch = 0;       // frozen base pitch at fall start
+    private static double fallSmoothedPitch = 0;   // smoothed fall target (prevents jumps)
+
+    // Post-fall recovery: after landing, camera stays somewhat down and gradually returns
+    private static int postFallRecoveryTicks = 0;
+    private static double postFallPitch = 0;        // pitch at moment of landing
+    private static final int POST_FALL_RECOVERY_TICKS = 25; // ~1.25s to fully straighten
 
     // Pre-edge peek state
     private static boolean preEdgeActive = false;   // currently peeking toward edge
@@ -383,6 +400,7 @@ public final class Autopilot {
      * ══════════════════════════════════════════════════════════════ */
 
     public static boolean isEnabled()      { return enabled; }
+    public static boolean isPathOnly()     { return pathfinderOnly; }
     public static int     getTargetMode()  { return targetMode; }
 
     // ── Debug data (read by CameraDebugHud) ───────────────────
@@ -418,6 +436,7 @@ public final class Autopilot {
 
     public static void start(int mode) {
         targetMode = mode;
+        pathfinderOnly = false;
         reset();
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc != null && mc.player != null) {
@@ -440,8 +459,18 @@ public final class Autopilot {
         System.out.println("[Autopilot] Started (mode " + mode + ")");
     }
 
+    /** Start pathfinder only — path is computed & rendered, but bot doesn't control player. */
+    public static void startPathOnly(int mode) {
+        targetMode = mode;
+        pathfinderOnly = true;
+        Pathfinder.reset();
+        enabled = true;
+        System.out.println("[Autopilot] Path-only started (mode " + mode + ")");
+    }
+
     public static void stop() {
         enabled = false;
+        pathfinderOnly = false;
         limboDetected = false;
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc != null) releaseAllKeys(mc);
@@ -458,7 +487,7 @@ public final class Autopilot {
 
     /** Called every frame from GameRendererMixin — this is where rotation happens. */
     public static void onFrameRender() {
-        if (!enabled) return;
+        if (!enabled || pathfinderOnly) return;
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player != null) onFrame(mc.player);
     }
@@ -470,6 +499,13 @@ public final class Autopilot {
     private static void onTick(MinecraftClient client) {
         ClientPlayerEntity player = client.player;
         if (player == null || client.world == null) return;
+
+        // Path-only mode: just update pathfinder, don't control player
+        if (pathfinderOnly) {
+            Pathfinder.update(client, player, targetMode, targetMode,
+                1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+            return;
+        }
 
         // Limbo detection: chat message or sudden location change
         if (limboDetected) {
@@ -592,6 +628,9 @@ public final class Autopilot {
             // Phase 2 start: just went airborne — roll reaction delay
             isFallingCamera = true;
             fallingCameraTicks = 0;
+            postFallRecoveryTicks = 0; // cancel any post-fall recovery — we're falling again
+            fallBasePitch = newGoalPitch; // freeze base pitch — don't let pathfinder changes jerk camera
+            fallSmoothedPitch = springPitchPos; // start smoothed target at where camera actually IS
             // If pre-edge was active, player expected this drop → normal reaction
             // If no pre-edge, it's a surprise → shorter startle reaction (1-3 ticks)
             if (preEdgeActive && preEdgePeekStrength > 0.3) {
@@ -640,6 +679,12 @@ public final class Autopilot {
                 }
                 fallPitch = Math.min(fallPitch, FALL_MAX_PITCH);
 
+                // Smooth the fall target to prevent jerks from landing pos updates.
+                // Exponential smoothing with ~200ms time constant — fast enough to
+                // track real falls but absorbs pathfinder recalculation jumps.
+                double fallSmoothAlpha = 1.0 - Math.exp(-0.05 / 0.08); // ~0.05s per tick / 0.08s tau (fast tracking)
+                fallSmoothedPitch += (fallPitch - fallSmoothedPitch) * fallSmoothAlpha;
+
                 // Smooth ramp-in (smoothstep curve, not linear)
                 int activeTicks = fallingCameraTicks - fallReactionDelay;
                 double rampIn = Math.min(1.0, activeTicks / FALL_RAMP_TICKS);
@@ -658,15 +703,23 @@ public final class Autopilot {
                     }
                 }
 
-                double effectiveFallPitch = fallPitch * (1.0 - recovery * FALL_BRACE_RECOVERY);
+                double effectiveFallPitch = fallSmoothedPitch * (1.0 - recovery * FALL_BRACE_RECOVERY);
 
-                // Blend fall pitch over base path pitch
-                newGoalPitch = newGoalPitch * (1.0 - rampIn) + effectiveFallPitch * rampIn;
+                // Blend over FROZEN base pitch — not live pathfinder pitch.
+                // This prevents path recalculations from jerking camera mid-fall.
+                newGoalPitch = fallBasePitch * (1.0 - rampIn) + effectiveFallPitch * rampIn;
+            } else {
+                // During reaction delay: hold frozen pitch
+                newGoalPitch = fallBasePitch;
             }
         } else {
             if (isFallingCamera) {
-                // Phase 5: just landed — pitch bounce (impact feel)
+                // Phase 5: just landed — start post-fall recovery
+                // Camera stays somewhat down and gradually straightens,
+                // so consecutive falls don't snap up between drops.
                 springPitchVel += FALL_BOUNCE_STRENGTH;
+                postFallRecoveryTicks = POST_FALL_RECOVERY_TICKS;
+                postFallPitch = springPitchPos; // remember how far down we were looking
             }
             isFallingCamera = false;
             fallingCameraTicks = 0;
@@ -786,12 +839,31 @@ public final class Autopilot {
 
         goalPitch = newGoalPitch;
 
+        // Post-fall recovery: after landing, gradually blend from fall pitch
+        // back to normal. Prevents camera from snapping upward between
+        // consecutive falls (e.g. staircase drops).
+        if (postFallRecoveryTicks > 0 && !isFallingCamera) {
+            postFallRecoveryTicks--;
+            double recoveryT = 1.0 - (double) postFallRecoveryTicks / POST_FALL_RECOVERY_TICKS;
+            recoveryT = recoveryT * recoveryT; // ease-in: slow at first, faster at end
+            // Blend between remembered fall pitch and current goal
+            goalPitch = postFallPitch * (1.0 - recoveryT) + goalPitch * recoveryT;
+        }
+
         // Subtle pitch wander while running straight (humans glance up/down)
         if (lowErrorTicks > IDLE_SCAN_AFTER && !inCombat) {
             double t = lowErrorTicks / 20.0;
             double pitchDrift = IDLE_SCAN_AMP * 0.35 * Math.sin(t * 0.8 + 1.3)
                               + IDLE_SCAN_AMP * 0.2  * Math.sin(t * 2.1 + 0.7);
             goalPitch += pitchDrift;
+        }
+
+        // Slow body sway (0.6Hz) applied to goal — spring tracks it with
+        // momentum, producing smooth multi-pixel sweeps. The fast stride
+        // component (1.7Hz) is applied post-spring in onFrame as overlay.
+        if (!isFallingCamera && !inCombat && player.isOnGround() && hSpeed > 0.05) {
+            double bobScale = Math.min(1.0, hSpeed / 0.2);
+            goalPitch += HEAD_BOB_AMP2 * bobScale * Math.sin(headBobPhase * 0.5 + 0.8);
         }
 
         /* ── Sprint control (uses spring state, not frame interpolation) ── */
@@ -1042,7 +1114,11 @@ public final class Autopilot {
         //    trajectory. This produces the characteristic bell-shaped
         //    velocity profile of real human reaching movements,
         //    instead of the exponential decay of a spring.
-        if (!inSaccade && totalError > SACCADE_THRESHOLD) {
+        // During active fall camera (after reaction delay), suppress new saccades.
+        // The spring handles fall pitch tracking smoothly; saccades during falls
+        // cause huge acceleration spikes as the pathfinder recalculates.
+        boolean suppressSaccade = isFallingCamera && fallingCameraTicks > fallReactionDelay;
+        if (!inSaccade && !suppressSaccade && totalError > SACCADE_THRESHOLD) {
             inSaccade         = true;
             saccadeStartYaw   = springYawPos;
             saccadeStartPitch = springPitchPos;
@@ -1214,7 +1290,12 @@ public final class Autopilot {
                 springYawPos += springYawVel * dt;
 
                 // Step pitch spring
-                double pitchError = smoothGoalPitch - springPitchPos;
+                // Yaw-pitch wrist coupling: when turning, wrist arc creates
+                // a slight vertical component. Applied as velocity-proportional
+                // offset to pitch goal — goes through spring for smooth output.
+                double coupledGoalPitch = smoothGoalPitch
+                    + springYawVel * YAW_PITCH_COUPLING_VEL;
+                double pitchError = coupledGoalPitch - springPitchPos;
                 double pitchAccel = pitchOmega * pitchOmega * pitchError
                                   - 2.0 * pitchZeta * pitchOmega * springPitchVel;
                 if (Math.abs(pitchAccel) > maxAccel) {
@@ -1271,18 +1352,17 @@ public final class Autopilot {
         double breathAmp = BREATH_AMP * (1.0 + 0.2 * valueNoise(timeS * 0.1 + 200.0));
         tremorPitch += breathAmp * Math.sin(breathPhase);
 
-        // ══ Layer 4b: Walking head-bob ═════════════════════════════
-        //    Subtle pitch oscillation from footstep cadence. Only active
-        //    when player is moving on ground. Prevents pitch from being
-        //    suspiciously static (87% zero-delta without this).
+        // Head-bob: fast component (1.7Hz) applied here as overlay — bypasses
+        // the spring which would filter it (spring cutoff ~0.6Hz). Slow component
+        // (0.6Hz) is in goalPitch so the spring tracks it with momentum.
         double hSpeedNow = player.getVelocity().horizontalLength();
         if (player.isOnGround() && hSpeedNow > 0.05) {
             headBobPhase += dt * 2.0 * Math.PI * HEAD_BOB_FREQ;
-            double bobScale = Math.min(1.0, hSpeedNow / 0.2); // ramp with speed
+            double bobScale = Math.min(1.0, hSpeedNow / 0.2);
+            // Fast stride rhythm — applied post-spring so it's not filtered out
             tremorPitch += HEAD_BOB_AMP  * bobScale * Math.sin(headBobPhase);
-            tremorPitch += HEAD_BOB_AMP2 * bobScale * Math.sin(headBobPhase * 0.5 + 0.8);
-            // Tiny yaw bob too (body sway)
-            tremorYaw   += HEAD_BOB_AMP2 * 0.5 * bobScale * Math.sin(headBobPhase * 0.5 + 2.0);
+            // Tiny yaw bob (body sway)
+            tremorYaw   += HEAD_BOB_AMP2 * 0.3 * bobScale * Math.sin(headBobPhase * 0.5 + 2.0);
         }
 
         // ══ Layer 5: Post-saccadic oscillation ═══════════════════
@@ -1294,6 +1374,25 @@ public final class Autopilot {
             double oscDecay = Math.exp(-oscAge * POST_SACC_OSC_DECAY);
             double osc = postSaccOscAmp * oscDecay * Math.sin(postSaccOscPhase);
             tremorYaw += osc; // rides on top of tremor overlay
+        }
+
+        // ══ Rest-state overlay attenuation ═══════════════════════
+        //    When the spring is settled (low velocity, low error), fade
+        //    out yaw overlays. This creates natural dead zones where the
+        //    camera is truly still — matching human behavior where the
+        //    mouse is physically stationary between discrete swipes.
+        //    Human data: yaw static runs avg 7.6 frames vs bot 2.9.
+        //    Without this, tremor keeps yaw permanently moving.
+        {
+            double yawErr = Math.abs(MathHelper.wrapDegrees(
+                (float)(smoothGoalYaw - springYawPos)));
+            double yawRestFactor = clamp01(Math.max(
+                Math.abs(springYawVel) / 15.0,  // >15 deg/s: full overlay
+                yawErr / 2.5                      // >2.5° error: full overlay
+            ));
+            tremorYaw *= yawRestFactor;
+            // Pitch: leave at full — pitch static % already matches human (62% vs 60%).
+            // Pitch issues (reversals, autocorr) are fixed by hysteresis below.
         }
 
         // ══ Soft cap turn rate ══════════════════════════════════
@@ -1342,22 +1441,40 @@ public final class Autopilot {
         long pixelsYaw   = Math.round(rawDeltaYaw   / mouseStep);
         long pixelsPitch = Math.round(rawDeltaPitch / mouseStep);
 
-        // Pitch hysteresis: suppress ±1px alternation from tremor/bob dithering.
-        // If this would reverse direction with only 1px, require stronger error.
-        // This turns rapid +1/-1 jitter into smoother hold-then-step behavior.
+        // ── Reversal hysteresis (BOTH axes) ─────────────────────
+        //    Human data shows 0% frame-to-frame reversals at 300+ FPS.
+        //    Real mouse can't physically reverse direction in 3ms.
+        //    Error diffusion + tremor + breathing create artificial
+        //    reversals that are a dead giveaway for bot detection.
+        //
+        //    Fix: suppress ANY direction reversal unless the raw delta
+        //    exceeds a generous threshold — meaning genuine intent.
+        //    Yaw: 3.0 mouseSteps (~0.25°). Pitch: 4.0 mouseSteps (~0.34°).
+        //    Suppressed energy accumulates in quantError and fires later.
+        if (pixelsYaw != 0 && lastYawDir != 0
+            && Long.signum(pixelsYaw) != lastYawDir) {
+            if (Math.abs(rawDeltaYaw) < mouseStep * 3.0) {
+                pixelsYaw = 0;
+            }
+        }
+        if (pixelsYaw != 0) {
+            lastYawDir = Long.signum(pixelsYaw);
+        }
+
+        double quantizedDeltaYaw = pixelsYaw * mouseStep;
+
+        // Pitch hysteresis: stronger than yaw — pitch has more overlays
+        // (tremor + breathing + head-bob) that all create reversal pressure.
         if (pixelsPitch != 0 && lastPitchDir != 0
-            && Long.signum(pixelsPitch) != lastPitchDir
-            && Math.abs(pixelsPitch) == 1) {
-            // Only allow reversal if raw delta exceeds 0.65 pixels (not just 0.5)
-            if (Math.abs(rawDeltaPitch) < mouseStep * 0.65) {
-                pixelsPitch = 0; // suppress — hold current position
+            && Long.signum(pixelsPitch) != lastPitchDir) {
+            if (Math.abs(rawDeltaPitch) < mouseStep * 4.0) {
+                pixelsPitch = 0;
             }
         }
         if (pixelsPitch != 0) {
             lastPitchDir = Long.signum(pixelsPitch);
         }
 
-        double quantizedDeltaYaw   = pixelsYaw   * mouseStep;
         double quantizedDeltaPitch = pixelsPitch * mouseStep;
 
         // Store remainder for next frame (sub-pixel error diffusion)
@@ -1597,6 +1714,10 @@ public final class Autopilot {
         fallingCameraTicks  = 0;
         fallReactionDelay   = 0;
         fallLandingPos      = null;
+        fallBasePitch       = 0;
+        fallSmoothedPitch   = 0;
+        postFallRecoveryTicks = 0;
+        postFallPitch       = 0;
         // Pre-edge peek
         preEdgeActive       = false;
         preEdgePos          = null;
@@ -1637,5 +1758,6 @@ public final class Autopilot {
         trackedPitch           = 0;
         headBobPhase           = 0;
         lastPitchDir           = 0;
+        lastYawDir             = 0;
     }
 }

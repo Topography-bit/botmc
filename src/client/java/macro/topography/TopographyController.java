@@ -16,6 +16,7 @@ public final class TopographyController {
     private static final Map<Integer, Boolean> keyWasPressed = new HashMap<>();
     private static boolean rshiftWasPressed;
     private static boolean f7WasPressed;
+    private static boolean f8WasPressed;
 
     // Zone transition tracking
     private static final Map<Integer, Boolean> wasInZone = new HashMap<>();
@@ -112,13 +113,17 @@ public final class TopographyController {
 
         checkZoneTransitions(client);
 
-        // F7 = camera debug HUD, Shift+F7 = CSV toggle
+        // F7 = camera debug HUD, Shift+F7 = CSV toggle, Ctrl+F7 = human CSV toggle
         long window = client.getWindow().getHandle();
         {
             boolean f7Down = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_F7) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
             boolean shiftDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_SHIFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            boolean ctrlDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_CONTROL) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
             if (f7Down && !f7WasPressed) {
-                if (shiftDown) {
+                if (ctrlDown) {
+                    CameraDebugHud.toggleHumanCsv();
+                    notify("Human CSV " + (CameraDebugHud.isHumanCsvEnabled() ? "started" : "stopped"));
+                } else if (shiftDown) {
                     CameraDebugHud.toggleCsv();
                     notify("Camera CSV " + (CameraDebugHud.isCsvEnabled() ? "started" : "stopped"));
                 } else {
@@ -126,6 +131,17 @@ public final class TopographyController {
                 }
             }
             f7WasPressed = f7Down;
+        }
+
+        // Shift+F8 = human CSV toggle
+        {
+            boolean f8Down = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_F8) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            boolean shiftDown = org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_SHIFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
+            if (f8Down && !f8WasPressed && shiftDown) {
+                CameraDebugHud.toggleHumanCsv();
+                notify("Human CSV " + (CameraDebugHud.isHumanCsvEnabled() ? "started" : "stopped"));
+            }
+            f8WasPressed = f8Down;
         }
 
         // RSHIFT opens menu

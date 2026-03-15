@@ -11,23 +11,40 @@ import java.io.FileWriter;
 import java.io.PrintWriter;
 
 /**
- * Camera debug tools: HUD overlay + CSV logger.
+ * Camera debug tools: HUD overlay + CSV loggers.
  *
  * HUD overlay (F7):  Shows real-time motor control state —
  *   saccade/spring mode, velocity, tremor, goal lag, etc.
  *
  * CSV logger (Shift+F7):  Per-frame telemetry to camera_debug.csv
  *   for offline analysis in Python (velocity profiles, FFT, etc.)
+ *
+ * Human logger (Ctrl+F7):  Records camera_human.csv with the same
+ *   columns but from YOUR real mouse input. Run the same route
+ *   manually, then compare the two CSVs to validate humanness.
  */
 public final class CameraDebugHud {
 
     private CameraDebugHud() {}
 
     private static boolean hudEnabled = false;
+
+    // ── Bot CSV logger ──
     private static boolean csvEnabled = false;
     private static PrintWriter csvWriter = null;
     private static long csvFrameCount = 0;
     private static long csvStartNano = 0;
+
+    // ── Human CSV logger ──
+    private static boolean humanCsvEnabled = false;
+    private static PrintWriter humanCsvWriter = null;
+    private static long humanCsvFrameCount = 0;
+    private static long humanCsvStartNano = 0;
+    private static float humanPrevYaw = 0;
+    private static float humanPrevPitch = 0;
+    private static float humanPrevYawVel = 0;
+    private static float humanPrevPitchVel = 0;
+    private static long  humanPrevNano = 0;
 
     // ── Public API ────────────────────────────────────────────────
 
@@ -43,8 +60,17 @@ public final class CameraDebugHud {
         }
     }
 
+    public static void toggleHumanCsv() {
+        if (humanCsvEnabled) {
+            stopHumanCsv();
+        } else {
+            startHumanCsv();
+        }
+    }
+
     public static boolean isHudEnabled() { return hudEnabled; }
     public static boolean isCsvEnabled() { return csvEnabled; }
+    public static boolean isHumanCsvEnabled() { return humanCsvEnabled; }
 
     public static void register() {
         HudRenderCallback.EVENT.register(CameraDebugHud::render);
@@ -54,11 +80,29 @@ public final class CameraDebugHud {
 
     @SuppressWarnings("deprecation")
     private static void render(DrawContext ctx, RenderTickCounter tickCounter) {
-        if (!Autopilot.isEnabled()) return;
+        // Human CSV runs regardless of autopilot
+        if (humanCsvEnabled) {
+            writeHumanCsvFrame();
+        }
 
-        // CSV logging runs every frame regardless of HUD visibility
-        if (csvEnabled) {
+        // Bot CSV only when autopilot is active
+        if (Autopilot.isEnabled() && csvEnabled) {
             writeCsvFrame();
+        }
+
+        // HUD only when autopilot is active
+        if (!Autopilot.isEnabled()) {
+            // Show human CSV status even without autopilot
+            if (humanCsvEnabled) {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                if (mc != null && mc.textRenderer != null) {
+                    ctx.drawText(mc.textRenderer,
+                        String.format("[Human CSV] recording (%d frames) - Ctrl+F7 to stop",
+                            humanCsvFrameCount),
+                        4, 4, 0xFF55FF55, true);
+                }
+            }
+            return;
         }
 
         if (!hudEnabled) return;
@@ -151,9 +195,19 @@ public final class CameraDebugHud {
         } else {
             ctx.drawText(font, "CSV: off (Shift+F7 to start)", x, y, gray, true);
         }
+        y += lineH;
+
+        // ── Human CSV status ──
+        if (humanCsvEnabled) {
+            ctx.drawText(font,
+                String.format("Human CSV: recording (%d frames)", humanCsvFrameCount),
+                x, y, green, true);
+        } else {
+            ctx.drawText(font, "Human CSV: off (Ctrl+F7 to start)", x, y, gray, true);
+        }
     }
 
-    // ── CSV Logger ───────────────────────────────────────────────
+    // ── Bot CSV Logger ──────────────────────────────────────────
 
     private static void startCsv() {
         try {
@@ -215,9 +269,112 @@ public final class CameraDebugHud {
             Autopilot.dbg_preEdgeStrength,
             Autopilot.dbg_preEdgeDist);
         csvFrameCount++;
-        // Flush every 500 frames to avoid data loss
         if (csvFrameCount % 500 == 0) {
             csvWriter.flush();
+        }
+    }
+
+    // ── Human CSV Logger ────────────────────────────────────────
+    //    Records the same format from YOUR real mouse input.
+    //    Columns that don't apply to human (tremor, saccade, etc.)
+    //    are filled with 0. This lets the same analysis scripts
+    //    compare bot vs human side-by-side.
+
+    private static void startHumanCsv() {
+        try {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc == null || mc.player == null) return;
+            File dir = mc.runDirectory;
+            File file = new File(dir, "camera_human.csv");
+            humanCsvWriter = new PrintWriter(new FileWriter(file, false));
+            humanCsvWriter.println("time_ms,yaw,pitch,goal_yaw_raw,goal_pitch_raw,"
+                + "goal_yaw_smooth,goal_pitch_smooth,yaw_vel,pitch_vel,"
+                + "saccade,saccade_tau,tremor_yaw,tremor_pitch,"
+                + "omega_scale,falling,error,attention,dwell,"
+                + "fatigue,breath_offset,mouse_lift,"
+                + "pre_edge,pre_edge_strength,pre_edge_dist");
+            humanCsvEnabled = true;
+            humanCsvFrameCount = 0;
+            humanCsvStartNano = System.nanoTime();
+            humanPrevYaw = mc.player.getYaw();
+            humanPrevPitch = mc.player.getPitch();
+            humanPrevYawVel = 0;
+            humanPrevPitchVel = 0;
+            humanPrevNano = humanCsvStartNano;
+            System.out.println("[CameraDebug] Human CSV started: " + file.getAbsolutePath());
+        } catch (Exception e) {
+            System.err.println("[CameraDebug] Failed to start human CSV: " + e.getMessage());
+        }
+    }
+
+    private static void stopHumanCsv() {
+        humanCsvEnabled = false;
+        if (humanCsvWriter != null) {
+            humanCsvWriter.flush();
+            humanCsvWriter.close();
+            humanCsvWriter = null;
+            System.out.println("[CameraDebug] Human CSV stopped. " + humanCsvFrameCount + " frames written.");
+        }
+    }
+
+    private static void writeHumanCsvFrame() {
+        if (humanCsvWriter == null) return;
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null) return;
+
+        long now = System.nanoTime();
+        double timeMs = (now - humanCsvStartNano) / 1_000_000.0;
+        double dtSec = (now - humanPrevNano) / 1_000_000_000.0;
+        humanPrevNano = now;
+
+        float yaw = mc.player.getYaw();
+        float pitch = mc.player.getPitch();
+
+        // Compute velocity from deltas
+        float dyaw = yaw - humanPrevYaw;
+        // Wrap yaw delta
+        while (dyaw > 180) dyaw -= 360;
+        while (dyaw < -180) dyaw += 360;
+        float dpitch = pitch - humanPrevPitch;
+
+        float yawVel = (dtSec > 0.0001) ? (float)(dyaw / dtSec) : humanPrevYawVel;
+        float pitchVel = (dtSec > 0.0001) ? (float)(dpitch / dtSec) : humanPrevPitchVel;
+
+        // Detect falling (same threshold as bot)
+        boolean falling = !mc.player.isOnGround() && mc.player.getVelocity().y < -0.18;
+
+        // Write same format — bot-specific columns filled with 0
+        humanCsvWriter.printf("%.2f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%d,%.4f,%.6f,%.6f,%.3f,%d,%.4f,%.3f,%d,%.4f,%.4f,%d,%d,%.4f,%.2f%n",
+            timeMs,
+            (double) yaw,           // yaw
+            (double) pitch,         // pitch
+            (double) yaw,           // goal_yaw_raw = actual yaw (human IS the goal)
+            (double) pitch,         // goal_pitch_raw
+            (double) yaw,           // goal_yaw_smooth
+            (double) pitch,         // goal_pitch_smooth
+            (double) yawVel,        // yaw_vel
+            (double) pitchVel,      // pitch_vel
+            0,                      // saccade (not applicable)
+            0.0,                    // saccade_tau
+            0.0, 0.0,              // tremor_yaw, tremor_pitch
+            1.0,                    // omega_scale
+            falling ? 1 : 0,        // falling
+            0.0,                    // error (always 0 for human)
+            1.0,                    // attention
+            0,                      // dwell
+            0.0,                    // fatigue
+            0.0,                    // breath_offset
+            0,                      // mouse_lift
+            0, 0.0, -1.0);         // pre_edge, strength, dist
+
+        humanCsvFrameCount++;
+        humanPrevYaw = yaw;
+        humanPrevPitch = pitch;
+        humanPrevYawVel = yawVel;
+        humanPrevPitchVel = pitchVel;
+
+        if (humanCsvFrameCount % 500 == 0) {
+            humanCsvWriter.flush();
         }
     }
 }

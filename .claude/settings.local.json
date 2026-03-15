@@ -63,7 +63,9 @@
       "Bash(powershell.exe -Command \"[System.IO.Compression.ZipFile]::OpenRead\\('C:\\\\Users\\\\Ghost\\\\.gradle\\\\caches\\\\modules-2\\\\files-2.1\\\\net.fabricmc.fabric-api\\\\fabric-rendering-v1\\\\16.2.0+bee81f016f\\\\1d608c18452c2bbf66334e7e185237fcffdf89af\\\\fabric-rendering-v1-16.2.0+bee81f016f-sources.jar'\\).Entries | Where-Object { \\\\$_.Name -eq 'HudRenderCallback.java' } | ForEach-Object { \\\\$stream = \\\\$_.Open\\(\\); \\\\$reader = [System.IO.StreamReader]::new\\(\\\\$stream\\); \\\\$reader.ReadToEnd\\(\\); \\\\$reader.Close\\(\\); \\\\$stream.Close\\(\\) }\")",
       "Bash(powershell.exe -Command \"Add-Type -AssemblyName System.IO.Compression.FileSystem; \\\\$z = [System.IO.Compression.ZipFile]::OpenRead\\('C:\\\\Users\\\\Ghost\\\\.gradle\\\\caches\\\\modules-2\\\\files-2.1\\\\net.fabricmc.fabric-api\\\\fabric-rendering-v1\\\\16.2.0+bee81f016f\\\\1d608c18452c2bbf66334e7e185237fcffdf89af\\\\fabric-rendering-v1-16.2.0+bee81f016f-sources.jar'\\); \\\\$e = \\\\$z.Entries | Where-Object { \\\\$_.Name -eq 'HudRenderCallback.java' }; \\\\$s = \\\\$e.Open\\(\\); \\\\$r = [System.IO.StreamReader]::new\\(\\\\$s\\); \\\\$r.ReadToEnd\\(\\); \\\\$r.Close\\(\\); \\\\$s.Close\\(\\); \\\\$z.Dispose\\(\\)\")",
       "Bash(ls:*)",
-      "Bash(./gradlew clean:*)"
+      "Bash(./gradlew clean:*)",
+      "Bash(./gradlew classes:*)",
+      "Bash(set:*)"
     ]
   }
 }

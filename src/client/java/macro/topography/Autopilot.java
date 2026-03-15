@@ -1215,12 +1215,14 @@ public final class Autopilot {
         }
 
         // ── Normalize yaw accumulators ──────────────────────────────
-        // goalYaw is near [-180,180]. Spring/smooth/tracked accumulate
-        // unbounded. Normalize them INDEPENDENTLY against goalYaw so
-        // that shifting one group doesn't break the other.
+        // goalYaw is near [-180,180]. Spring/tracked accumulate unbounded.
+        // Re-center spring group near goalYaw each tick.
+        // smoothGoalYaw is NOT normalized here — it is re-centered near
+        // springYawPos every frame in onFrame (single source of truth).
+        // Having two normalizers (tick + frame) caused catastrophic conflicts
+        // where they pulled smoothGoalYaw in opposite directions.
         {
             double base = goalYaw;
-            // Group 1: spring + tracked + saccade state
             double c1 = Math.round((springYawPos - base) / 360.0) * 360.0;
             if (c1 != 0) {
                 springYawPos -= c1;
@@ -1230,9 +1232,6 @@ public final class Autopilot {
                     saccadeTargetYaw -= c1;
                 }
             }
-            // Group 2: smoothGoalYaw (independently)
-            double c2 = Math.round((smoothGoalYaw - base) / 360.0) * 360.0;
-            if (c2 != 0) smoothGoalYaw -= c2;
         }
 
         // ── Fill debug fields for AutopilotDebugHud ──
@@ -1326,13 +1325,22 @@ public final class Autopilot {
         double alpha = 1.0 - Math.exp(-dt / effectiveTau);
         smoothGoalYaw   += MathHelper.wrapDegrees((float)(goalYaw   - smoothGoalYaw))   * alpha;
         smoothGoalPitch += (goalPitch - smoothGoalPitch) * alpha;
-        // Re-center smoothGoalYaw near springYawPos so the spring never
-        // sees a >180° ambiguity (which causes wrong-direction rotation).
-        // Old code centered near goalYaw with a 360° threshold — too loose,
-        // allowing smoothGoalYaw to drift 200°+ from springYawPos.
-        double smoothSpringDrift = smoothGoalYaw - springYawPos;
-        if (Math.abs(smoothSpringDrift) > 180.0) {
-            smoothGoalYaw -= Math.round(smoothSpringDrift / 360.0) * 360.0;
+        // Re-center smoothGoalYaw near springYawPos — sole normalization
+        // point for smooth (tick normalization was removed to prevent conflicts).
+        {
+            double drift = smoothGoalYaw - springYawPos;
+            if (Math.abs(drift) > 180.0) {
+                smoothGoalYaw -= Math.round(drift / 360.0) * 360.0;
+            }
+        }
+        // Also keep saccade target in the same domain as spring
+        if (inSaccade) {
+            double tgtDrift = saccadeTargetYaw - springYawPos;
+            if (Math.abs(tgtDrift) > 180.0) {
+                double c = Math.round(tgtDrift / 360.0) * 360.0;
+                saccadeTargetYaw -= c;
+                saccadeStartYaw  -= c;
+            }
         }
 
         // ══ Layer 2: Movement execution ══════════════════════════
@@ -1362,6 +1370,10 @@ public final class Autopilot {
             inSaccade         = true;
             saccadeStartYaw   = springYawPos;
             saccadeStartPitch = springPitchPos;
+            // Clear dwell from previous saccade — without this, dwell freezes
+            // indefinitely (it only decrements in spring mode, never during saccade)
+            postSaccadeDwell = 0;
+            postSaccadeCorrections = 0;
 
             // Asymmetric overshoot: humans tend to overshoot slightly
             // Nudge target 4% ±3% past the goal along movement direction
@@ -1412,68 +1424,68 @@ public final class Autopilot {
                 saccadeElapsed += dt;
             }
 
-            // Update target if goal shifted significantly mid-move
-            // Also update start position to current spring pos to prevent jumps
+            // If goal shifted significantly mid-saccade, cancel and hand off
+            // to spring. Saccades are ballistic (fixed trajectory) — they can't
+            // track moving targets. The spring is adaptive and actually faster
+            // (84°/s avg vs 54°/s for restart-plagued saccades).
             double shiftYaw   = MathHelper.wrapDegrees((float)(smoothGoalYaw - saccadeTargetYaw));
             double shiftPitch = smoothGoalPitch - saccadeTargetPitch;
-            if (Math.abs(shiftYaw) > 25 || Math.abs(shiftPitch) > 25) {
-                saccadeStartYaw    = springYawPos;
-                saccadeStartPitch  = springPitchPos;
-                saccadeTargetYaw   = smoothGoalYaw;
-                saccadeTargetPitch = smoothGoalPitch;
-                // Recalculate duration for remaining distance
-                double newDeltaYaw = MathHelper.wrapDegrees(
-                    (float)(saccadeTargetYaw - saccadeStartYaw));
-                double newDeltaPitch = saccadeTargetPitch - saccadeStartPitch;
-                double newTotalError = Math.sqrt(newDeltaYaw * newDeltaYaw
-                    + newDeltaPitch * newDeltaPitch);
-                saccadeDuration = SACCADE_FITTS_A + SACCADE_FITTS_B * newTotalError;
-                // Keep 15% progress so velocity isn't zeroed (prevents stall)
-                saccadeElapsed = saccadeDuration * 0.15;
+            if (Math.abs(shiftYaw) > 30 || Math.abs(shiftPitch) > 30) {
+                inSaccade = false;
+                // Keep current velocity for smooth hand-off to spring
+                // (spring picks up from springYawVel/springPitchVel)
             }
 
-            tau = Math.min(1.0, saccadeElapsed / saccadeDuration);
-            double blend = minJerk(tau);
+            if (inSaccade) {
+                // ── Continue saccade trajectory ─────────────────────
+                tau = Math.min(1.0, saccadeElapsed / saccadeDuration);
+                double blend = minJerk(tau);
 
-            double deltaYaw   = MathHelper.wrapDegrees(
-                (float)(saccadeTargetYaw - saccadeStartYaw));
-            double deltaPitch = saccadeTargetPitch - saccadeStartPitch;
+                double deltaYaw   = MathHelper.wrapDegrees(
+                    (float)(saccadeTargetYaw - saccadeStartYaw));
+                double deltaPitch = saccadeTargetPitch - saccadeStartPitch;
 
-            springYawPos   = saccadeStartYaw   + deltaYaw   * blend;
-            springPitchPos = saccadeStartPitch + deltaPitch * blend;
+                springYawPos   = saccadeStartYaw   + deltaYaw   * blend;
+                springPitchPos = saccadeStartPitch + deltaPitch * blend;
 
-            // Track velocity for smooth hand-off to spring
-            // minJerkDeriv gives deg/normalized-time, divide by T for deg/sec
-            double dBlend  = minJerkDeriv(tau) / saccadeDuration;
-            springYawVel   = deltaYaw   * dBlend;
-            springPitchVel = deltaPitch * dBlend;
+                // Track velocity for smooth hand-off to spring
+                // minJerkDeriv gives deg/normalized-time, divide by T for deg/sec
+                double dBlend  = minJerkDeriv(tau) / saccadeDuration;
+                springYawVel   = deltaYaw   * dBlend;
+                springPitchVel = deltaPitch * dBlend;
 
-            if (tau >= 1.0) {
-                // Saccade complete — velocity is zero (minJerk deriv = 0 at τ=1)
+                if (tau >= 1.0) {
+                    // Saccade complete — velocity is zero (minJerk deriv = 0 at τ=1)
 
-                // Post-saccade corrections: discrete pauses before smooth tracking.
-                // Only in combat/pursuit — humans evaluate aim visually.
-                // During navigation, mouse moves continuously (no "evaluate aim" pause).
-                boolean needsAimEval = dbg_inCombat || dbg_directPursuit;
-                if (needsAimEval) {
-                    postSaccadeDwell = CORRECTION_PAUSE_MIN
-                        + rng.nextDouble() * (CORRECTION_PAUSE_MAX - CORRECTION_PAUSE_MIN);
-                    postSaccadeCorrections = 1 + rng.nextInt(2); // 1-2 more pauses
-                } else {
-                    postSaccadeDwell = 0;
-                    postSaccadeCorrections = 0;
+                    // Post-saccade corrections: discrete pauses before smooth tracking.
+                    // Only in combat/pursuit — humans evaluate aim visually.
+                    // During navigation, mouse moves continuously (no "evaluate aim" pause).
+                    // Only dwell if we actually landed close to target — no point
+                    // pausing to "evaluate" when aim is still way off.
+                    double postErr = Math.sqrt(
+                        sq(MathHelper.wrapDegrees((float)(smoothGoalYaw - springYawPos)))
+                        + sq(smoothGoalPitch - springPitchPos));
+                    boolean needsAimEval = (dbg_inCombat || dbg_directPursuit) && postErr < 15;
+                    if (needsAimEval) {
+                        postSaccadeDwell = CORRECTION_PAUSE_MIN
+                            + rng.nextDouble() * (CORRECTION_PAUSE_MAX - CORRECTION_PAUSE_MIN);
+                        postSaccadeCorrections = 1 + rng.nextInt(2); // 1-2 more pauses
+                    } else {
+                        postSaccadeDwell = 0;
+                        postSaccadeCorrections = 0;
+                    }
+
+                    // Post-saccadic oscillation: wrist resonance after fast flick
+                    // Amplitude proportional to how fast the saccade peaked
+                    double peakVel = Math.abs(deltaYaw) * 1.875 / saccadeDuration; // minJerk peak
+                    postSaccOscAmp = peakVel * POST_SACC_OSC_GAIN;
+                    postSaccOscPhase = 0;
+                    postSaccOscStartTime = timeS;
+
+                    inSaccade      = false;
+                    springYawVel   = 0;
+                    springPitchVel = 0;
                 }
-
-                // Post-saccadic oscillation: wrist resonance after fast flick
-                // Amplitude proportional to how fast the saccade peaked
-                double peakVel = Math.abs(deltaYaw) * 1.875 / saccadeDuration; // minJerk peak
-                postSaccOscAmp = peakVel * POST_SACC_OSC_GAIN;
-                postSaccOscPhase = 0;
-                postSaccOscStartTime = timeS;
-
-                inSaccade      = false;
-                springYawVel   = 0;
-                springPitchVel = 0;
             }
         } else {
             // ── Spring mode (continuous tracking, <18° corrections) ─

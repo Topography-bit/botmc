@@ -243,7 +243,7 @@ public final class Autopilot {
     private static final double FALL_RAMP_TICKS       = 3.0;    // ticks to smoothly ramp in fall-look
     private static final double FALL_BRACE_SECONDS    = 0.35;   // seconds before landing to start recovering
     private static final double FALL_BRACE_RECOVERY   = 0.20;   // how much pitch recovers before landing (0-1)
-    private static final double FALL_PITCH_OMEGA      = 5.5;    // pitch spring ω during fall (faster than nav)
+    private static final double FALL_PITCH_OMEGA      = 5.5;    // pitch spring ω during fall (fast tracking)
     private static final double FALL_PITCH_ZETA       = 0.92;   // slight underdamp for natural fall tracking
     private static final double FALL_TREMOR_MULT      = 2.2;    // hand tremor multiplier during falls (anxiety)
     private static final double FALL_BOUNCE_STRENGTH  = 2.0;    // pitch velocity kick on landing (reduced — camera stays down longer)
@@ -682,7 +682,7 @@ public final class Autopilot {
                 // Smooth the fall target to prevent jerks from landing pos updates.
                 // Exponential smoothing with ~200ms time constant — fast enough to
                 // track real falls but absorbs pathfinder recalculation jumps.
-                double fallSmoothAlpha = 1.0 - Math.exp(-0.05 / 0.08); // ~0.05s per tick / 0.08s tau (fast tracking)
+                double fallSmoothAlpha = 1.0 - Math.exp(-0.05 / 0.12); // ~0.05s per tick / 0.12s tau
                 fallSmoothedPitch += (fallPitch - fallSmoothedPitch) * fallSmoothAlpha;
 
                 // Smooth ramp-in (smoothstep curve, not linear)
@@ -1114,10 +1114,17 @@ public final class Autopilot {
         //    trajectory. This produces the characteristic bell-shaped
         //    velocity profile of real human reaching movements,
         //    instead of the exponential decay of a spring.
-        // During active fall camera (after reaction delay), suppress new saccades.
-        // The spring handles fall pitch tracking smoothly; saccades during falls
-        // cause huge acceleration spikes as the pathfinder recalculates.
-        boolean suppressSaccade = isFallingCamera && fallingCameraTicks > fallReactionDelay;
+        // Suppress saccades during ALL fall phases (including reaction delay)
+        // AND during post-fall recovery. Without this, a saccade triggers during
+        // the 1-3 tick reaction delay when goalPitch suddenly freezes to fallBasePitch
+        // — producing 8°+ per-frame jumps that are physically impossible for humans.
+        // The spring alone maxes at ~0.3°/frame which matches human data (max 1.44°).
+        boolean suppressSaccade = isFallingCamera || postFallRecoveryTicks > 0;
+        // Cancel running saccade during fall/recovery — spring handles it smoother
+        if (suppressSaccade && inSaccade) {
+            inSaccade = false;
+            // Keep current springYawVel/springPitchVel for smooth hand-off
+        }
         if (!inSaccade && !suppressSaccade && totalError > SACCADE_THRESHOLD) {
             inSaccade         = true;
             saccadeStartYaw   = springYawPos;
@@ -1171,11 +1178,22 @@ public final class Autopilot {
             }
 
             // Update target if goal shifted significantly mid-move
+            // Also update start position to current spring pos to prevent jumps
             double shiftYaw   = MathHelper.wrapDegrees((float)(smoothGoalYaw - saccadeTargetYaw));
             double shiftPitch = smoothGoalPitch - saccadeTargetPitch;
             if (Math.abs(shiftYaw) > 8 || Math.abs(shiftPitch) > 8) {
+                saccadeStartYaw    = springYawPos;
+                saccadeStartPitch  = springPitchPos;
                 saccadeTargetYaw   = smoothGoalYaw;
                 saccadeTargetPitch = smoothGoalPitch;
+                // Recalculate duration for remaining distance
+                double newDeltaYaw = MathHelper.wrapDegrees(
+                    (float)(saccadeTargetYaw - saccadeStartYaw));
+                double newDeltaPitch = saccadeTargetPitch - saccadeStartPitch;
+                double newTotalError = Math.sqrt(newDeltaYaw * newDeltaYaw
+                    + newDeltaPitch * newDeltaPitch);
+                saccadeDuration = SACCADE_FITTS_A + SACCADE_FITTS_B * newTotalError;
+                saccadeElapsed = 0;
             }
 
             tau = Math.min(1.0, saccadeElapsed / saccadeDuration);
@@ -1467,7 +1485,7 @@ public final class Autopilot {
         // (tremor + breathing + head-bob) that all create reversal pressure.
         if (pixelsPitch != 0 && lastPitchDir != 0
             && Long.signum(pixelsPitch) != lastPitchDir) {
-            if (Math.abs(rawDeltaPitch) < mouseStep * 4.0) {
+            if (Math.abs(rawDeltaPitch) < mouseStep * 5.0) {
                 pixelsPitch = 0;
             }
         }
@@ -1477,9 +1495,17 @@ public final class Autopilot {
 
         double quantizedDeltaPitch = pixelsPitch * mouseStep;
 
-        // Store remainder for next frame (sub-pixel error diffusion)
+        // Store remainder for next frame (sub-pixel error diffusion).
+        // CRITICAL: clamp to ±1 mouseStep to prevent accumulation bomb.
+        // When reversal hysteresis blocks deltas, quantError keeps growing
+        // each frame. After 50+ blocked frames, it fires as a 5-8° spike
+        // in a single frame — physically impossible and a detection giveaway.
+        // Clamping to ±1 pixel means max accumulated energy is ~0.085° —
+        // the worst-case spike on release is 2 pixels, matching human data.
         quantErrorYaw   = rawDeltaYaw   - quantizedDeltaYaw;
         quantErrorPitch = rawDeltaPitch - quantizedDeltaPitch;
+        quantErrorYaw   = Math.max(-mouseStep, Math.min(mouseStep, quantErrorYaw));
+        quantErrorPitch = Math.max(-mouseStep, Math.min(mouseStep, quantErrorPitch));
 
         // Update double-precision tracked angles (never loses precision)
         trackedYaw   += quantizedDeltaYaw;

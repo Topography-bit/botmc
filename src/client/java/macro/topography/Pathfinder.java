@@ -81,7 +81,7 @@ public class Pathfinder {
     private static final double PATH_NOISE = 0.3;  // edge cost gaussian noise σ
     private static final long PATH_NOISE_WINDOW_MS = 10_000L; // same seed within this time window
     private static final long REPATH_COOLDOWN_MS = 4000L;    // min time between non-critical replans
-    private static final int INTERMEDIATE_GOAL_MAX_Y_DELTA = 8; // max Y diff for intermediate goal
+    private static final int INTERMEDIATE_GOAL_MAX_Y_DELTA = 20; // max Y diff for intermediate goal
 
     /* ── waypoint management ──────────────────────────────────────── */
     // At speed 500 (~1.4 bl/tick) player moves 1.4 blocks per tick.
@@ -250,6 +250,24 @@ public class Pathfinder {
         if (!forcedRepathReason.contains(reason)) {
             forcedRepathReason = forcedRepathReason + "+" + reason;
         }
+    }
+
+    /** Blacklist current target mob and force target switch. */
+    public static void blacklistCurrentTarget(String reason) {
+        if (targetNameTag != null) {
+            eventLog("target_blacklisted tag=%s reason=%s", shortUuid(targetNameTag.getUuid()), reason);
+            unreachableBlacklist.put(targetNameTag.getUuid(), System.currentTimeMillis());
+            onTargetLost(reason);
+        }
+    }
+
+    /** Distance from player to the current path goal, or -1 if no path. */
+    public static double getDistToGoal() {
+        if (currentPath == null || currentPath.isEmpty() || lastGoal == null) return -1;
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null) return -1;
+        Vec3d pos = mc.player.getEntityPos();
+        return pos.distanceTo(Vec3d.ofCenter(lastGoal));
     }
 
     private static class BlockCache {
@@ -1153,16 +1171,33 @@ public class Pathfinder {
                     requestImmediateRepath("target_switch");
                 }
 
-                // Use tag position for navigation (it's directly above the mob)
-                BlockPos mobBlock = BlockPos.ofFloored(tagPos.x, tagPos.y, tagPos.z);
+                // Prefer real mob's feet position (stands ON the platform) over
+                // ArmorStand tag (floats above mob — searching down finds cliff base
+                // instead of the actual platform, causing bot to walk into walls).
+                Vec3d navPos = (targetMob != null && targetMob.isAlive())
+                    ? targetMob.getEntityPos()
+                    : tagPos;
+                BlockPos mobBlock = BlockPos.ofFloored(navPos.x, navPos.y, navPos.z);
 
-                // Path to mob position. Tag floats above mob — search down for ground.
-                for (int dy = 0; dy >= -15; dy--) {
+                // Search down for standable ground under the mob
+                for (int dy = 0; dy >= -5; dy--) {
                     if (isStandableWorld(client.world, mobBlock.getX(), mobBlock.getY() + dy, mobBlock.getZ())) {
                         return new BlockPos(mobBlock.getX(), mobBlock.getY() + dy, mobBlock.getZ());
                     }
                 }
-                return findNearestStandable(client.world, mobBlock);
+                // Narrow search failed — try wider radius around mob's XZ at mob's Y
+                BlockPos resolved = findNearestStandable(client.world, mobBlock);
+                // Validate: if resolved is too far below mob, it's a cliff base — not useful.
+                // Search wider radius at mob's actual Y level instead.
+                if (mobBlock.getY() - resolved.getY() > 5) {
+                    BlockPos atMobY = findNearestStandable(client.world,
+                        new BlockPos(mobBlock.getX(), mobBlock.getY(), mobBlock.getZ()));
+                    // Use mob-Y result only if it's closer vertically
+                    if (Math.abs(atMobY.getY() - mobBlock.getY()) < Math.abs(resolved.getY() - mobBlock.getY())) {
+                        resolved = atMobY;
+                    }
+                }
+                return resolved;
             }
 
             // No mobs found in farm zone — roam to a random point within the zone

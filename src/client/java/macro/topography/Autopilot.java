@@ -360,6 +360,7 @@ public final class Autopilot {
     private static Vec3d lastPos = null;
     private static int   stuckTicks = 0;
     private static int   stuckKicks = 0;          // how many times stuck-kick fired at same area
+    private static int   verticalStuckTicks = 0;  // ticks near path end but mob far away
     private static final int STUCK_KICKS_REPATH = 2; // after 2 kicks → force repath
 
     // ── Human-like behavioral state ──────────────────────────────
@@ -1083,6 +1084,24 @@ public final class Autopilot {
         }
 
         /* ── Stuck detection ─────────────────────────────────────── */
+        // Vertically unreachable: path ended (near goal) but mob is far away.
+        // pickGoal resolved to cliff base → A* pathed there → bot arrived → mob still above.
+        // Blacklist this mob and move on instead of staring at a wall for 16 seconds.
+        if (hasPath && !inCombat && mob != null && mob.isAlive()) {
+            double distGoalNow = Pathfinder.getDistToGoal();
+            if (distGoalNow >= 0 && distGoalNow < 4.0 && mobDist > 8.0) {
+                verticalStuckTicks++;
+                if (verticalStuckTicks > 40) { // 2 seconds at path end, mob still far
+                    Pathfinder.blacklistCurrentTarget("vertical_unreachable");
+                    verticalStuckTicks = 0;
+                }
+            } else {
+                verticalStuckTicks = 0;
+            }
+        } else {
+            verticalStuckTicks = 0;
+        }
+
         // Use horizontal distance only — jumping in place shouldn't reset stuck
         double hdxSq = lastPos != null ? (sq(pos.x - lastPos.x) + sq(pos.z - lastPos.z)) : 999;
         if (lastPos != null && hdxSq < STUCK_MOVE_SQ && !inCombat) {
@@ -2026,6 +2045,7 @@ public final class Autopilot {
         combatStuckTicks   = 0;
         stuckTicks         = 0;
         stuckKicks         = 0;
+        verticalStuckTicks = 0;
         lastPos            = null;
         inCombat           = false;
         // Human-like behavioral state
